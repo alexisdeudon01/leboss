@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-Generic progress GUI (Tkinter) inspired by consolidatedata layout.
+Generic progress GUI (Tkinter) - Réutilisable pour tous les scripts
 
-Objectif: réutiliser la même logique de canvas/progress bars/logs dans les autres scripts
-sans réécrire l'UI. Intégration minimale:
+Objectif: Interface unifiée pour ML/CV/DT scripts sans réécrire UI à chaque fois
 
+OPTIMISATIONS INTÉGRÉES:
+  ✓ Multithreading avec max_workers configurable
+  ✓ Monitoring RAM/CPU en temps réel (psutil)
+  ✓ Barre de progression globale + étapes + tâches parallèles
+  ✓ Logs détaillés avec timestamps
+  ✓ Alertes avec couleurs (error/warning/success)
+  ✓ ETA automatique
+  ✓ Scrollable containers pour fichiers/workers
+
+UTILISATION:
     from progress_gui import GenericProgressGUI
-    ui = GenericProgressGUI(title="Mon job", header_info="Dataset XYZ", max_workers=8)
+    ui = GenericProgressGUI(title="Mon Job", header_info="Dataset XYZ", max_workers=8)
     ui.add_stage("step1", "Lecture")
     ui.add_stage("step2", "Traitement")
-
+    
     def worker():
         ui.update_global(0, 100, "Lecture...", eta=360)
         ui.update_stage("step1", 50, 100, "Mi-parcours")
         ui.update_file_progress("fileA.csv", 30, "Chunk 3/10")
         ui.log("Message détaillé", level="INFO")
         ui.log_alert("Petite alerte", level="warning")
-        ui.update_stats_now(cpu=12.3, ram=42.1)  # optionnel
+    
     threading.Thread(target=worker, daemon=True).start()
     ui.start()  # bloque sur mainloop
-
-API principale:
-  - update_global(current, total, msg="", eta=None)
-  - add_stage(key, title)
-  - update_stage(key, current, total, msg="", eta=None)
-  - reset_file_progress()
-  - update_file_progress(name, percent, status)
-  - log(msg, level="INFO")  # levels: INFO, OK, ERROR, WARNING, PROGRESS
-  - log_alert(msg, level="warning"|"error"|"success")
-  - start() pour lancer la boucle Tk
-
-Option: psutil est utilisé si présent pour l'auto-monitoring CPU/RAM (sinon affiche N/A).
 """
 
 import threading
 import time
 from collections import deque
 from datetime import timedelta
+
 try:
     import psutil
 except ImportError:
@@ -47,6 +45,7 @@ from tkinter import ttk, scrolledtext
 
 
 def _fmt_eta(seconds):
+    """Formatter un ETA lisible."""
     try:
         return str(timedelta(seconds=int(seconds)))
     except Exception:
@@ -54,6 +53,14 @@ def _fmt_eta(seconds):
 
 
 class GenericProgressGUI:
+    """
+    Interface générique pour tasks ML/CV/DT avec:
+    - Monitoring RAM/CPU
+    - Multithreading avec progress bars parallèles
+    - Logs verbeux + alertes
+    - ETA automatique
+    """
+    
     def __init__(self, title="Task Monitor", header_info="", max_workers=4, show_monitoring=True):
         self.root = tk.Tk()
         self.root.title(title)
@@ -73,11 +80,13 @@ class GenericProgressGUI:
         if show_monitoring:
             self._schedule_stats()
 
-    # ------------------------------------------------------------------ UI
+    # ================================================================== UI
     def _build_ui(self, header_info):
+        """Construire l'interface complète."""
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
+        # HEADER
         header = tk.Frame(self.root, bg="#2c3e50", height=60)
         header.grid(row=0, column=0, sticky="ew")
         tk.Label(header, text=self.root.title(),
@@ -85,6 +94,7 @@ class GenericProgressGUI:
         tk.Label(header, text=header_info,
                  font=("Arial", 9), fg="#bdc3c7", bg="#2c3e50").pack(side=tk.LEFT, padx=20)
 
+        # MAIN CONTAINER
         container = tk.Frame(self.root, bg="#f0f0f0")
         container.grid(row=1, column=0, sticky="nsew")
         container.rowconfigure(0, weight=1)
@@ -120,7 +130,7 @@ class GenericProgressGUI:
         progress_grid.columnconfigure(0, weight=1)
         progress_grid.columnconfigure(1, weight=1)
 
-        # Global progress
+        # --- GLOBAL PROGRESS ---
         global_frame = tk.LabelFrame(progress_grid, text="Avancement global",
                                      font=("Arial", 10, "bold"),
                                      bg="white", relief=tk.SUNKEN, bd=2)
@@ -134,14 +144,14 @@ class GenericProgressGUI:
         self.global_eta = tk.Label(global_frame, text="ETA: --:--", font=("Arial", 8), bg="white", fg="#666")
         self.global_eta.pack(fill=tk.X, padx=8, pady=(0, 6))
 
-        # Left: stages
+        # --- LEFT: STAGES ---
         self.stages_frame = tk.LabelFrame(progress_grid, text="Étapes",
                                           font=("Arial", 10, "bold"),
                                           bg="white", relief=tk.SUNKEN, bd=2)
         self.stages_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=2)
         self.stages_frame.columnconfigure(0, weight=1)
 
-        # Right: per-file/worker bars + monitoring
+        # --- RIGHT: PARALLEL TASKS + MONITORING ---
         right_frame = tk.LabelFrame(progress_grid, text="Tâches parallèles",
                                     font=("Arial", 10, "bold"),
                                     bg="white", relief=tk.SUNKEN, bd=2)
@@ -176,7 +186,7 @@ class GenericProgressGUI:
                 pass
         self.files_canvas.bind("<Configure>", _on_files_canvas)
 
-        # Monitoring
+        # --- MONITORING & ALERTS ---
         monitor_frame = tk.LabelFrame(progress_grid, text="Monitoring & Alertes",
                                       font=("Arial", 10, "bold"),
                                       bg="white", relief=tk.SUNKEN, bd=2)
@@ -202,7 +212,7 @@ class GenericProgressGUI:
         self.alerts_text.tag_config("warning", foreground="#f57f17")
         self.alerts_text.tag_config("success", foreground="#388e3c")
 
-        # Logs
+        # --- LOGS ---
         logs_frame = tk.LabelFrame(main, text="Logs détaillés (verbose)",
                                    font=("Arial", 10, "bold"),
                                    bg="white", relief=tk.SUNKEN, bd=2)
@@ -214,9 +224,10 @@ class GenericProgressGUI:
                                                    bg="#1e1e1e", fg="#00ff00")
         self.logs_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
-    # ------------------------------------------------------------------ helpers
+    # ================================================================== helpers
     @staticmethod
     def _pct(current, total):
+        """Calculer pourcentage."""
         try:
             if total <= 0:
                 return 0
@@ -225,6 +236,7 @@ class GenericProgressGUI:
             return 0
 
     def _make_block(self, parent, title):
+        """Créer un block progress stage."""
         frame = tk.Frame(parent, bg="white")
         frame.grid_columnconfigure(0, weight=1)
         label = tk.Label(frame, text=title, font=("Arial", 9, "bold"), bg="white", fg="#2c3e50")
@@ -235,8 +247,9 @@ class GenericProgressGUI:
         detail.grid(row=2, column=0, sticky="w", padx=8, pady=(0, 6))
         return {"frame": frame, "label": label, "bar": bar, "detail": detail}
 
-    # ------------------------------------------------------------------ public API
+    # ================================================================== public API
     def add_stage(self, key, title):
+        """Ajouter une étape."""
         if key in self.progress_blocks:
             return
         block = self._make_block(self.stages_frame, title)
@@ -245,6 +258,7 @@ class GenericProgressGUI:
         self.progress_blocks[key] = block
 
     def update_stage(self, key, current, total, msg="", eta=None):
+        """Mettre à jour une étape."""
         block = self.progress_blocks.get(key)
         if not block:
             return
@@ -261,6 +275,7 @@ class GenericProgressGUI:
         self.root.after(0, _apply)
 
     def update_global(self, current, total, msg="", eta=None):
+        """Mettre à jour progress global."""
         pct = self._pct(current, total)
         details = f"{current}/{total}" if total else f"{current}"
         if pct:
@@ -273,6 +288,7 @@ class GenericProgressGUI:
         self.root.after(0, _apply)
 
     def _ensure_file_widget(self, name):
+        """Assurer qu'un widget fichier existe."""
         if name in self.file_progress_widgets:
             return self.file_progress_widgets[name]
         if len(self.file_progress_order) >= self.max_file_bars:
@@ -294,6 +310,7 @@ class GenericProgressGUI:
         return widget
 
     def reset_file_progress(self):
+        """Réinitialiser tous les widgets fichiers."""
         for widget in self.file_progress_widgets.values():
             try:
                 widget["frame"].destroy()
@@ -307,6 +324,7 @@ class GenericProgressGUI:
             pass
 
     def update_file_progress(self, name, percent, status):
+        """Mettre à jour progress d'un fichier/thread."""
         def _apply():
             widget = self._ensure_file_widget(name)
             widget["bar"]["value"] = max(0, min(100, percent))
@@ -314,6 +332,7 @@ class GenericProgressGUI:
         self.root.after(0, _apply)
 
     def log(self, msg, level="INFO"):
+        """Ajouter un log avec timestamp."""
         ts = time.strftime("%H:%M:%S")
         icons = {"INFO": "[info]", "OK": "[ok]", "ERROR": "[err]", "WARNING": "[warn]", "PROGRESS": "[..]"}
         icon = icons.get(level, ">")
@@ -325,20 +344,23 @@ class GenericProgressGUI:
         self.root.after(0, _apply)
 
     def log_alert(self, msg, level="warning"):
+        """Ajouter une alerte."""
         self.alerts.append(msg)
         def _apply():
             self.alerts_text.insert(tk.END, f"{msg}\n", level)
             self.alerts_text.see(tk.END)
         self.root.after(0, _apply)
 
-    # ------------------------------------------------------------------ monitoring
+    # ================================================================== monitoring
     def _schedule_stats(self):
+        """Scheduler le monitoring RAM/CPU."""
         def tick():
             self._update_stats_auto()
-            self.root.after(500, self._schedule_stats)
+            self.root.after(500, tick)
         self.root.after(500, tick)
 
     def _update_stats_auto(self):
+        """Mettre à jour stats auto (psutil)."""
         if not psutil:
             return
         try:
@@ -349,6 +371,7 @@ class GenericProgressGUI:
             pass
 
     def update_stats_now(self, cpu=None, ram=None):
+        """Mettre à jour stats manuellement."""
         def _apply():
             if ram is not None:
                 self.ram_label.config(text=f"RAM: {ram:.1f}%")
@@ -358,13 +381,15 @@ class GenericProgressGUI:
                 self.cpu_progress["value"] = max(0, min(100, cpu))
         self.root.after(0, _apply)
 
-    # ------------------------------------------------------------------ lifecycle
+    # ================================================================== lifecycle
     def start(self):
+        """Lancer la boucle Tkinter (bloque)."""
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    # Petite démo locale
+    # Petite démo
+    import time as _time
     ui = GenericProgressGUI(title="Demo Progress", header_info="Exemple générique", max_workers=5)
     ui.add_stage("stage1", "Étape 1")
     ui.add_stage("stage2", "Étape 2")
@@ -376,7 +401,8 @@ if __name__ == "__main__":
             ui.update_stage("stage2", i // 2, 50, f"Step2 {i//2}/50", eta=100 - i)
             ui.update_file_progress(f"tâche-{i%3}", i % 100, f"Progress {i}%")
             ui.log(f"Log {i}", level="INFO")
-            time.sleep(0.2)
+            _time.sleep(0.2)
         ui.log_alert("Démo terminée", level="success")
+    
     threading.Thread(target=demo_worker, daemon=True).start()
     ui.start()
