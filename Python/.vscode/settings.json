@@ -1,9 +1,0 @@
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}/envMaster/Scripts/python.exe",
-  "python.analysis.extraPaths": [
-    "${workspaceFolder}/.."
-  ],
-  "terminal.integrated.env.windows": {
-    "PYTHONPATH": "${workspaceFolder}/.."
-  }
-}
