@@ -1,249 +1,363 @@
 #!/usr/bin/env python3
 """
-Test rapide des splits Decision Tree pour vérifier l'overfitting.
-Charge preprocessed_dataset.npz/tensor_data.npz et évalue F1 sur plusieurs tailles de test.
-Amélioration: multiple runs + std + graphique + comparaison CV
+TEST DECISION TREE SPLITS - DETECTION OVERFITTING
+========================================
+Teste Decision Tree avec 6 tailles de test (5%, 10%, 15%, 20%, 25%, 50%)
+5 runs par taille = 30 évaluations
+Détecte si le modèle surfit les données
+✅ CORRECTION: Utilise MEMES CLASSES que training
+========================================
 """
-import numpy as np
+
 import os
+import sys
 import json
-import time
-from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import f1_score, recall_score, precision_score
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import f1_score, recall_score, precision_score, confusion_matrix
 
-def load_npz():
-    """Charger NPZ avec fallback"""
-    npz_file = "preprocessed_dataset.npz" if os.path.exists("preprocessed_dataset.npz") else "tensor_data.npz"
-    if not os.path.exists(npz_file):
-        print(f"❌ {npz_file} non trouvé!")
-        return None, None
-    print(f"✅ Chargement {npz_file}...")
-    try:
-        data = np.load(npz_file, allow_pickle=True)
-        X = data["X"]
-        y = data["y"]
-        print(f"✅ Données chargées: X={X.shape}, y={y.shape}")
-        return X, y
-    except Exception as e:
-        print(f"❌ Erreur chargement: {e}")
-        return None, None
+try:
+    from progress_gui import GenericProgressGUI
+except ImportError:
+    GenericProgressGUI = None
 
-def load_cv_splits():
-    """Charger les splits optimaux du CV"""
-    fname = "cv_optimal_splits_kfold.json" if os.path.exists("cv_optimal_splits_kfold.json") else "cv_optimal_splits.json"
-    try:
-        with open(fname, 'r', encoding='utf-8') as f:
-            splits = json.load(f)
-        dt_config = splits.get('Decision Tree', {})
-        print(f"✅ CV splits chargés")
-        if dt_config:
-            print(f"   Decision Tree CV: {dt_config['train_size']*100:.0f}% train, F1={dt_config['f1_score']:.4f} ± {dt_config.get('f1_std', 0):.4f}")
-        return dt_config
-    except FileNotFoundError:
-        print(f"⚠️  {fname} non trouvé")
-        return {}
-    except Exception as e:
-        print(f"⚠️  Erreur chargement CV splits: {e}")
-        return {}
+
+class DTSplitsTester:
+    """Test Decision Tree avec différentes tailles de split"""
+    
+    def __init__(self, ui=None):
+        self.ui = ui
+        self.X = None
+        self.y = None
+        self.classes = None
+        self.results = {
+            'test_sizes': [],
+            'f1_means': [],
+            'f1_stds': [],
+            'recall_means': [],
+            'precision_means': [],
+            'all_f1_runs': {}
+        }
+        
+        if self.ui:
+            self.ui.add_stage("load", "Chargement données")
+            self.ui.add_stage("test", "Évaluation DT")
+            self.ui.add_stage("analysis", "Analyse overfitting")
+            self.ui.add_stage("graph", "Graphiques")
+
+    def load_data(self):
+        """Charger les données d'entraînement"""
+        try:
+            if not os.path.exists("preprocessed_dataset.npz"):
+                print("[ERROR] preprocessed_dataset.npz manquant")
+                if self.ui:
+                    self.ui.log_alert("Données manquantes", level="error")
+                return False
+            
+            data = np.load("preprocessed_dataset.npz", allow_pickle=True)
+            self.X = data["X"]
+            self.y = data["y"]
+            # ✅ CORRECTION: Charger les classes du training
+            self.classes = data["classes"]
+            
+            print(f"[OK] Données chargées: X={self.X.shape}, y={len(self.y):,}")
+            print(f"    Classes: {list(self.classes)}")
+            
+            if self.ui:
+                self.ui.log(f"[OK] Données chargées: {len(self.y):,} échantillons", level="OK")
+                self.ui.update_stage("load", 1, 1, "Données chargées")
+                self.ui.update_global(1, 4, "Données chargées")
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Erreur load_data: {e}")
+            if self.ui:
+                self.ui.log_alert(f"Erreur: {e}", level="error")
+            return False
+
+    def test_splits(self):
+        """Tester DT avec différentes tailles de split"""
+        try:
+            test_sizes = [0.05, 0.10, 0.15, 0.20, 0.25, 0.50]
+            num_runs = 5
+            total_tests = len(test_sizes) * num_runs
+            current_test = 0
+            
+            print("\n[TEST] Évaluation Decision Tree avec différentes tailles")
+            print(f"  Test sizes: {test_sizes}")
+            print(f"  Runs par taille: {num_runs}")
+            print(f"  Total: {total_tests} évaluations\n")
+            
+            for test_size in test_sizes:
+                print(f"\n[TEST_SIZE] {test_size*100:.0f}% test")
+                
+                f1_runs = []
+                recall_runs = []
+                precision_runs = []
+                
+                for run in range(num_runs):
+                    current_test += 1
+                    
+                    # Split stratifié
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        self.X, self.y,
+                        test_size=test_size,
+                        random_state=42 + run,
+                        stratify=self.y
+                    )
+                    
+                    # Entraîner DT
+                    model = DecisionTreeClassifier(random_state=42 + run)
+                    model.fit(X_train, y_train)
+                    
+                    # Prédire
+                    y_pred = model.predict(X_test)
+                    
+                    # Métriques
+                    f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+                    recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+                    precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+                    
+                    f1_runs.append(f1)
+                    recall_runs.append(recall)
+                    precision_runs.append(precision)
+                    
+                    print(f"  Run {run+1}: F1={f1:.4f} | Recall={recall:.4f} | Precision={precision:.4f}")
+                    
+                    if self.ui:
+                        self.ui.update_file_progress(
+                            f"{test_size*100:.0f}% test",
+                            int((run+1)/num_runs*100),
+                            f"Run {run+1}/{num_runs}: F1={f1:.4f}"
+                        )
+                        self.ui.update_stage("test", current_test, total_tests,
+                                            f"Test {test_size*100:.0f}% run {run+1}")
+                        self.ui.update_global(1 + current_test/total_tests, 4,
+                                            f"Évaluation {current_test}/{total_tests}")
+                
+                # Statistiques par taille
+                mean_f1 = np.mean(f1_runs)
+                std_f1 = np.std(f1_runs)
+                
+                self.results['test_sizes'].append(test_size)
+                self.results['f1_means'].append(mean_f1)
+                self.results['f1_stds'].append(std_f1)
+                self.results['recall_means'].append(np.mean(recall_runs))
+                self.results['precision_means'].append(np.mean(precision_runs))
+                self.results['all_f1_runs'][f'{test_size*100:.0f}%'] = f1_runs
+                
+                print(f"  ✅ RÉSUMÉ: F1={mean_f1:.4f}±{std_f1:.4f}")
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Erreur test_splits: {e}")
+            if self.ui:
+                self.ui.log_alert(f"Erreur: {e}", level="error")
+            return False
+
+    def analyze_overfitting(self):
+        """Analyser si le modèle surfit"""
+        try:
+            print("\n[ANALYSIS] Détection d'overfitting\n")
+            
+            f1_scores = np.array(self.results['f1_means'])
+            f1_stds = np.array(self.results['f1_stds'])
+            test_sizes = np.array(self.results['test_sizes'])
+            
+            # Analyser la tendance
+            # En général, avec un overfitting:
+            # - F1 train > F1 test (on ne test que test ici, donc on regarde la variance)
+            # - La variabilité augmente avec des test sets plus petits
+            
+            print("F1 Score par taille de test:")
+            for ts, f1, std in zip(test_sizes, f1_scores, f1_stds):
+                print(f"  {ts*100:>5.0f}% test: F1={f1:.4f}±{std:.4f}")
+            
+            # Coefficients de variation
+            cv = f1_stds / f1_scores  # Coefficient de variation
+            print("\nCoefficients de variation:")
+            for ts, c in zip(test_sizes, cv):
+                print(f"  {ts*100:>5.0f}% test: CV={c:.4f}")
+            
+            # Décision
+            mean_cv = np.mean(cv)
+            print(f"\nMoyenne CV: {mean_cv:.4f}")
+            
+            if mean_cv < 0.02:
+                verdict = "✅ EXCELLENT - Très stable (pas d'overfitting)"
+            elif mean_cv < 0.05:
+                verdict = "✅ BON - Stable (peu d'overfitting)"
+            elif mean_cv < 0.10:
+                verdict = "⚠️ ACCEPTABLE - Peu stable (léger overfitting)"
+            else:
+                verdict = "❌ INSTABLE - Très variable (overfitting probable)"
+            
+            print(f"\nVERDICT: {verdict}\n")
+            
+            if self.ui:
+                self.ui.log(f"[ANALYSIS] {verdict}", level="OK")
+                self.ui.update_stage("analysis", 1, 1, "Analyse complète")
+                self.ui.update_global(3, 4, "Analyse")
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Erreur analyze: {e}")
+            if self.ui:
+                self.ui.log_alert(f"Erreur analyse: {e}", level="error")
+            return False
+
+    def generate_graph(self):
+        """Générer graphique F1 vs test size"""
+        try:
+            print("\n[GRAPH] Génération graphique")
+            
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Graphique 1: F1 vs test size
+            test_sizes_pct = np.array(self.results['test_sizes']) * 100
+            f1_means = np.array(self.results['f1_means'])
+            f1_stds = np.array(self.results['f1_stds'])
+            
+            axes[0].plot(test_sizes_pct, f1_means, 'o-', linewidth=2.5, markersize=8, color='#3498db')
+            axes[0].fill_between(test_sizes_pct, f1_means-f1_stds, f1_means+f1_stds, alpha=0.2, color='#3498db')
+            axes[0].set_xlabel('Test Size (%)', fontsize=11)
+            axes[0].set_ylabel('F1 Score', fontsize=11)
+            axes[0].set_title('Decision Tree - Stabilité en fonction de la taille de test', fontsize=12, fontweight='bold')
+            axes[0].set_ylim([0, 1])
+            axes[0].grid(True, alpha=0.3)
+            
+            # Ajouter les valeurs sur les points
+            for x, y, std in zip(test_sizes_pct, f1_means, f1_stds):
+                axes[0].text(x, y+0.03, f'{y:.3f}', ha='center', fontsize=9)
+            
+            # Graphique 2: Coefficient de variation
+            f1_stds_arr = np.array(self.results['f1_stds'])
+            f1_means_arr = np.array(self.results['f1_means'])
+            cv = f1_stds_arr / f1_means_arr
+            
+            colors = ['#27ae60' if c < 0.05 else '#f39c12' if c < 0.10 else '#e74c3c' for c in cv]
+            axes[1].bar(test_sizes_pct, cv, width=3, color=colors, edgecolor='black', linewidth=1.5)
+            axes[1].set_xlabel('Test Size (%)', fontsize=11)
+            axes[1].set_ylabel('Coefficient de Variation', fontsize=11)
+            axes[1].set_title('Stabilité - Coefficient de Variation', fontsize=12, fontweight='bold')
+            axes[1].axhline(y=0.05, color='orange', linestyle='--', linewidth=2, label='Seuil bon')
+            axes[1].axhline(y=0.10, color='red', linestyle='--', linewidth=2, label='Seuil acceptable')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3, axis='y')
+            
+            # Ajouter les valeurs
+            for x, c in zip(test_sizes_pct, cv):
+                axes[1].text(x, c+0.002, f'{c:.4f}', ha='center', fontsize=9)
+            
+            plt.tight_layout()
+            plt.savefig('test_dt_splits.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print("[OK] Graphique sauvegardé: test_dt_splits.png")
+            
+            if self.ui:
+                self.ui.update_stage("graph", 1, 1, "Graphique généré")
+                self.ui.update_global(4, 4, "Terminé")
+                self.ui.log("[OK] Graphique généré", level="OK")
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Erreur graphique: {e}")
+            if self.ui:
+                self.ui.log_alert(f"Erreur graphique: {e}", level="error")
+            return False
+
+    def save_results(self):
+        """Sauvegarder les résultats en JSON"""
+        try:
+            with open('dt_test_results.json', 'w', encoding='utf-8') as f:
+                json.dump(self.results, f, indent=2, ensure_ascii=False, default=float)
+            
+            print("[OK] Résultats sauvegardés: dt_test_results.json")
+            
+            if self.ui:
+                self.ui.log("[OK] Résultats sauvegardés", level="OK")
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Erreur save: {e}")
+            if self.ui:
+                self.ui.log_alert(f"Erreur sauvegarde: {e}", level="error")
+            return False
+
+    def run(self):
+        """Exécuter tous les tests"""
+        if not self.load_data():
+            return False
+        
+        if not self.test_splits():
+            return False
+        
+        if not self.analyze_overfitting():
+            return False
+        
+        if not self.generate_graph():
+            return False
+        
+        if not self.save_results():
+            return False
+        
+        return True
+
+
+def run_with_gui():
+    """Mode avec GUI"""
+    ui = GenericProgressGUI(title="Test Decision Tree Splits",
+                           header_info="Overfitting Detection",
+                           max_workers=2)
+    tester = DTSplitsTester(ui=ui)
+
+    def worker():
+        try:
+            ui.update_global(0, 4, "Initialisation")
+            if tester.run():
+                ui.log_alert("Test DT Splits complété!", level="success")
+            else:
+                ui.log_alert("Erreur pendant les tests", level="error")
+        except Exception as e:
+            ui.log_alert(f"Erreur: {e}", level="error")
+
+    import threading
+    threading.Thread(target=worker, daemon=True).start()
+    ui.start()
+
 
 def main():
-    print("="*70)
-    print("TEST DECISION TREE OVERFITTING DETECTION")
-    print("="*70)
-    print()
+    """Point d'entrée principal"""
+    print("\n" + "="*80)
+    print("TEST DECISION TREE SPLITS - OVERFITTING DETECTION")
+    print("="*80 + "\n")
+
+    tester = DTSplitsTester()
     
-    # Charger données
-    X, y = load_npz()
-    if X is None:
-        return
+    # Mode GUI si disponible
+    if GenericProgressGUI:
+        print("[INFO] Lancement mode GUI...")
+        run_with_gui()
+        return True
+
+    # Mode console
+    success = tester.run()
     
-    print()
-    
-    # Charger CV results
-    cv_dt_config = load_cv_splits()
-    cv_f1 = cv_dt_config.get('f1_score', None)
-    cv_std = cv_dt_config.get('f1_std', None)
-    
-    print()
-    print("="*70)
-    print("TEST SUR DIFFÉRENTS TEST_SIZE (5 runs chacun)")
-    print("="*70)
-    print()
-    
-    test_sizes = [0.05, 0.10, 0.15, 0.20, 0.25, 0.50]
-    results = {
-        'test_size': [],
-        'train_size': [],
-        'f1_mean': [],
-        'f1_std': [],
-        'recall_mean': [],
-        'precision_mean': [],
-        'avt_ms_mean': [],
-    }
-    
-    print(f"{'test_size':>12} | {'train_size':>12} | {'F1 (mean±std)':>18} | {'Recall':>8} | {'Precision':>10}")
-    print("-"*85)
-    
-    for test_size in test_sizes:
-        train_size = 1 - test_size
-        f1_runs = []
-        recall_runs = []
-        precision_runs = []
-        avt_runs = []
-        
-        for run in range(5):
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_size, random_state=42+run, stratify=y
-            )
-            
-            model = DecisionTreeClassifier(random_state=42+run)
-            
-            start = time.time()
-            model.fit(X_train, y_train)
-            
-            start_pred = time.time()
-            y_pred = model.predict(X_test)
-            pred_time = time.time() - start_pred
-            
-            f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-            recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
-            precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
-            avt_ms = (pred_time / len(X_test) * 1000) if len(X_test) > 0 else 0
-            
-            f1_runs.append(f1)
-            recall_runs.append(recall)
-            precision_runs.append(precision)
-            avt_runs.append(avt_ms)
-        
-        f1_mean = np.mean(f1_runs)
-        f1_std = np.std(f1_runs)
-        recall_mean = np.mean(recall_runs)
-        precision_mean = np.mean(precision_runs)
-        avt_mean = np.mean(avt_runs)
-        
-        results['test_size'].append(test_size)
-        results['train_size'].append(train_size)
-        results['f1_mean'].append(f1_mean)
-        results['f1_std'].append(f1_std)
-        results['recall_mean'].append(recall_mean)
-        results['precision_mean'].append(precision_mean)
-        results['avt_ms_mean'].append(avt_mean)
-        
-        print(f"{test_size:>12.2f} | {train_size:>12.2f} | {f1_mean:>7.4f}±{f1_std:>6.4f}  | {recall_mean:>8.4f} | {precision_mean:>10.4f}")
-    
-    print()
-    print("="*70)
-    print("ANALYSE OVERFITTING")
-    print("="*70)
-    print()
-    
-    # Détection overfitting
-    f1_array = np.array(results['f1_mean'])
-    min_idx = np.argmin(f1_array)
-    max_idx = np.argmax(f1_array)
-    f1_min = f1_array[min_idx]
-    f1_max = f1_array[max_idx]
-    f1_drop = f1_max - f1_min
-    
-    print(f"F1 min:     {f1_min:.4f} (test_size={results['test_size'][min_idx]:.2f}, {results['train_size'][min_idx]*100:.0f}% train)")
-    print(f"F1 max:     {f1_max:.4f} (test_size={results['test_size'][max_idx]:.2f}, {results['train_size'][max_idx]*100:.0f}% train)")
-    print(f"F1 drop:    {f1_drop:.4f} ({f1_drop/f1_min*100:.1f}% relative)")
-    print()
-    
-    # Comparaison avec CV si disponible
-    if cv_f1 is not None:
-        print("COMPARAISON AVEC CV RESULTS")
-        print("-"*70)
-        print(f"CV F1:      {cv_f1:.4f} (±{cv_std:.4f})")
-        print(f"Test F1:    {f1_mean:.4f} (meilleur)")
-        print()
-        
-        if f1_drop > 0.10:
-            print("🚨 OVERFITTING DÉTECTÉ!")
-            print(f"   - F1 varie significativement ({f1_drop:.4f})")
-            print(f"   - F1 augmente quand train% augmente (petit test set)")
-            print(f"   - Recommandation: REJETER Decision Tree ou limiter à test_size >= {results['test_size'][min_idx]:.2f}")
-        elif f1_drop > 0.05:
-            print("⚠️  POSSIBLE OVERFITTING")
-            print(f"   - F1 varie modérément ({f1_drop:.4f})")
-            print(f"   - Recommandation: Utiliser avec précaution")
-        else:
-            print("✅ BON GENERALIZATION")
-            print(f"   - F1 varie peu ({f1_drop:.4f})")
-            print(f"   - Recommandation: Decision Tree sûr")
-    
-    print()
-    print("="*70)
-    print("GRAPHIQUE")
-    print("="*70)
-    print()
-    
-    # Créer graphique
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("Decision Tree Overfitting Detection", fontsize=14, fontweight='bold')
-    
-    # F1 vs test_size
-    ax = axes[0]
-    ts_pct = [t*100 for t in results['test_size']]
-    ax.errorbar(ts_pct, results['f1_mean'], yerr=results['f1_std'], 
-                marker='o', markersize=8, linewidth=2, capsize=5, color='#3498db')
-    if cv_f1 is not None:
-        ax.axhline(cv_f1, color='#e74c3c', linestyle='--', linewidth=2, label=f"CV F1={cv_f1:.4f}")
-        ax.fill_between(ts_pct, cv_f1-cv_std, cv_f1+cv_std, alpha=0.2, color='#e74c3c')
-    ax.set_xlabel("Test Size (%)", fontsize=11, fontweight='bold')
-    ax.set_ylabel("F1 Score", fontsize=11, fontweight='bold')
-    ax.set_title("F1 vs Test Size", fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    if cv_f1 is not None:
-        ax.legend()
-    ax.set_ylim([0, 1])
-    
-    # Recall vs test_size
-    ax = axes[1]
-    ax.plot(ts_pct, results['recall_mean'], marker='s', markersize=8, linewidth=2, color='#e74c3c')
-    ax.set_xlabel("Test Size (%)", fontsize=11, fontweight='bold')
-    ax.set_ylabel("Recall Score", fontsize=11, fontweight='bold')
-    ax.set_title("Recall vs Test Size", fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim([0, 1])
-    
-    # Precision vs test_size
-    ax = axes[2]
-    ax.plot(ts_pct, results['precision_mean'], marker='^', markersize=8, linewidth=2, color='#f39c12')
-    ax.set_xlabel("Test Size (%)", fontsize=11, fontweight='bold')
-    ax.set_ylabel("Precision Score", fontsize=11, fontweight='bold')
-    ax.set_title("Precision vs Test Size", fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim([0, 1])
-    
-    plt.tight_layout()
-    plt.savefig("test_dt_splits.png", dpi=150, bbox_inches='tight')
-    print("✅ Graphique sauvegardé: test_dt_splits.png")
-    plt.close()
-    
-    print()
-    print("="*70)
-    print("CONCLUSION")
-    print("="*70)
-    print()
-    
-    if f1_drop > 0.10:
-        print("❌ DECISION TREE EST OVERFIITTED")
-        print(f"   F1 chute de {f1_drop:.4f} quand test_size augmente")
-        print(f"   Avec petit test set (5%): F1={f1_array[0]:.4f}")
-        print(f"   Avec gros test set (50%): F1={f1_array[-1]:.4f}")
-        print()
-        print("   Raison: DT apprend parfaitement le training set")
-        print("           mais génère mal sur données nouvelles")
-        print()
-        print("   Recommandation: REJETER DT ou LIMITER train_size <= 80%")
+    if success:
+        print("\n" + "="*80)
+        print("TEST COMPLETÉ")
+        print("="*80 + "\n")
+        return True
     else:
-        print("✅ DECISION TREE EST OK")
-        print(f"   F1 varie seulement de {f1_drop:.4f}")
-        print("   Généralisation acceptable")
+        print("\n[ERROR] Tests échoués")
+        return False
+
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    sys.exit(0 if success else 1)
