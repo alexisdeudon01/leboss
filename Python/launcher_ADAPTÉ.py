@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DDoS DETECTION PROJECT - LAUNCHER (MISE À JOUR)
-===============================================
-✅ UTILISE LES SCRIPTS ADAPTÉS (progress_gui optionnel)
-✅ Fallback console si progress_gui absent
+DDoS DETECTION PROJECT - LAUNCHER (AMÉLIORÉ)
+=============================================
 ✅ Menu interactif pour choisir mode
+✅ Vérification fichiers
+✅ Pipeline séquentielle
+✅ Scripts ADAPTÉ supportés
+=============================================
 """
 
 import os
@@ -15,39 +17,49 @@ import time
 
 def print_header():
     print("\n" + "="*80)
-    print("DDoS DETECTION PROJECT - LAUNCHER (MISE À JOUR)")
+    print("DDoS DETECTION PROJECT - LAUNCHER (AMÉLIORÉ)")
     print("="*80)
 
 def print_menu():
     print_header()
-    print("\nChoisissez le mode d'execution:\n")
+    print("\nChoisissez le mode d'exécution:\n")
     print("  [1] CONSOLIDATION DATASET")
     print("      └─ GUI Tkinter pour sélection fichiers")
-    print("      └─ Génère fusion_train_smart4.csv + fusion_test_smart4.csv\n")
+    print("      └─ Génère fusion_train_smart4.csv + fusion_test_smart4.csv")
+    print("      └─ Durée estimée: 10-40 minutes\n")
     print("  [2] ML EVALUATION (ADAPTÉ)")
     print("      └─ GUI si progress_gui disponible, sinon console")
-    print("      └─ K-Fold validation + rapports\n")
+    print("      └─ K-Fold validation + rapports")
+    print("      └─ Durée estimée: 1-6 heures\n")
     print("  [3] DDoS DETECTOR (ADAPTÉ)")
     print("      └─ GUI si progress_gui disponible, sinon console")
-    print("      └─ Prédictions sur test holdout\n")
+    print("      └─ Prédictions sur test holdout")
+    print("      └─ Durée estimée: 5-15 minutes\n")
     print("  [4] TEST DECISION TREE (ADAPTÉ)")
     print("      └─ GUI si progress_gui disponible, sinon console")
-    print("      └─ Détection overfitting automatique\n")
-    print("  [5] PIPELINE COMPLÈTE (SÉQUENTIELLE)")
+    print("      └─ Détection overfitting automatique")
+    print("      └─ Durée estimée: 15-60 minutes\n")
+    print("  [5] CV OPTIMIZATION V3 (GRID SEARCH)")
+    print("      └─ Hyperparamètres variables avec graphiques")
+    print("      └─ Trouvé meilleure config pour chaque algo")
+    print("      └─ Durée estimée: 2-10 heures\n")
+    print("  [6] PIPELINE COMPLÈTE (SÉQUENTIELLE)")
     print("      └─ Lance tous les scripts dans l'ordre")
-    print("      └─ Consolidation → ML Eval → DDoS Det → Test DT\n")
-    print("  [6] QUITTER\n")
+    print("      └─ Consolidation → ML Eval → Test DT → DDoS Det")
+    print("      └─ Durée estimée: 2-15 heures\n")
+    print("  [7] QUITTER\n")
     
-    choice = input("Votre choix (1-6): ").strip()
+    choice = input("Votre choix (1-7): ").strip()
     return choice
 
 def check_files():
-    """Vérifier fichiers Python requis (ADAPTÉS)"""
+    """Vérifie fichiers Python requis"""
     required_files = {
         "consolidateddata_CORRECTED.py": "Consolidation Dataset",
         "ml_evaluation_v3_ADAPTÉ.py": "ML Evaluation (ADAPTÉ)",
         "ddos_detector_production_ADAPTÉ.py": "DDoS Detector (ADAPTÉ)",
         "test_dt_splits_ADAPTÉ.py": "Test DT Splits (ADAPTÉ)",
+        "cv_optimization_v3.py": "CV Optimization V3",
     }
     
     optional_files = {
@@ -59,7 +71,7 @@ def check_files():
     missing = []
     for fname, desc in required_files.items():
         if os.path.exists(fname):
-            file_size = os.path.getsize(fname) / 1024  # KB
+            file_size = os.path.getsize(fname) / 1024
             print(f"  ✅ {fname:<40} ({file_size:>8.1f} KB)")
         else:
             print(f"  ❌ {fname:<40} MANQUANT")
@@ -68,30 +80,27 @@ def check_files():
     print("\n[CHECK] Fichiers optionnels:\n")
     for fname, desc in optional_files.items():
         if os.path.exists(fname):
-            file_size = os.path.getsize(fname) / 1024  # KB
+            file_size = os.path.getsize(fname) / 1024
             print(f"  ✅ {fname:<40} ({file_size:>8.1f} KB) - {desc}")
         else:
             print(f"  ⚠️  {fname:<40} absent (mode console utilisé)")
     
     if missing:
         print(f"\n[ERROR] Fichiers manquants: {', '.join(missing)}")
-        print("[ERROR] Assurez-vous que les scripts ADAPTÉS sont présents")
         return False
     
     print("\n  ✅ Tous les fichiers requis présents!")
     return True
 
 def check_dataset():
-    """Vérifier présence du dataset"""
+    """Vérifie présence du dataset"""
     print("\n[CHECK] Vérification dataset...\n")
     
-    # Vérifier fusion_train/test (si consolidation déjà faite)
     if os.path.exists("fusion_train_smart4.csv"):
         size_train = os.path.getsize("fusion_train_smart4.csv") / (1024**3)
         print(f"  ✅ fusion_train_smart4.csv ({size_train:.2f} GB)")
         return True
     
-    # Vérifier sources (TON_IoT + CIC)
     if os.path.exists("../TONIOT/train_test_network.csv"):
         size = os.path.getsize("../TONIOT/train_test_network.csv") / (1024**3)
         print(f"  ✅ train_test_network.csv ({size:.2f} GB)")
@@ -116,12 +125,12 @@ def mode_consolidation():
         input("Appuyez sur ENTREE pour revenir au menu...")
         return False
     
-    print("[INFO] Une fenetre Tkinter va s'ouvrir")
-    print("       1. Sélectionnez train_test_network.csv")
+    print("[INFO] Une fenêtre Tkinter va s'ouvrir")
+    print("       1. Sélectionnez train_test_network.csv (TON_IoT)")
     print("       2. Sélectionnez dossier CIC")
-    print("       3. Choisissez [Annuler] pour split 60/40 scientifique")
-    print("       4. Cliquez DEMARRER")
-    print("       Durée estimée: 10-40 minutes\n")
+    print("       3. Cliquez DEMARRER")
+    print("       Durée estimée: 10-40 minutes")
+    print("       ⏳ Vous verrez progress bars détaillées pour chaque étape\n")
     
     input("Appuyez sur ENTREE pour lancer...")
     
@@ -156,15 +165,10 @@ def mode_ml_evaluation():
         input("Appuyez sur ENTREE pour revenir au menu...")
         return False
     
-    if not os.path.exists("fusion_test_smart4.csv"):
-        print("[ERROR] fusion_test_smart4.csv manquant")
-        print("[INFO] Lancez Consolidation en premier")
-        input("Appuyez sur ENTREE pour revenir au menu...")
-        return False
-    
     print("[INFO] Lancement ML Evaluation V3")
     print("       - GUI si progress_gui.py disponible")
     print("       - Console sinon (mode fallback)")
+    print("       - RAM gestion dynamique (<90%)")
     print("       Durée estimée: 1-6 heures\n")
     
     input("Appuyez sur ENTREE pour lancer...")
@@ -196,15 +200,10 @@ def mode_ddos_detector():
         input("Appuyez sur ENTREE pour revenir au menu...")
         return False
     
-    if not os.path.exists("fusion_test_smart4.csv"):
-        print("[ERROR] fusion_test_smart4.csv manquant")
-        print("[INFO] Lancez Consolidation en premier")
-        input("Appuyez sur ENTREE pour revenir au menu...")
-        return False
-    
     print("[INFO] Lancement DDoS Detector Production")
     print("       - GUI si progress_gui.py disponible")
-    print("       - Console sinon (mode fallback)")
+    print("       - Console sinon")
+    print("       - Batch processing avec gestion RAM")
     print("       Durée estimée: 5-15 minutes\n")
     
     input("Appuyez sur ENTREE pour lancer...")
@@ -237,9 +236,9 @@ def mode_test_dt():
         return False
     
     print("[INFO] Lancement Test Decision Tree Splits")
-    print("       - GUI si progress_gui.py disponible")
-    print("       - Console sinon (mode fallback)")
+    print("       - Détection overfitting automatique")
     print("       - 30 évaluations (6 tailles × 5 runs)")
+    print("       - Gestion RAM dynamique")
     print("       Durée estimée: 15-60 minutes\n")
     
     input("Appuyez sur ENTREE pour lancer...")
@@ -258,10 +257,43 @@ def mode_test_dt():
     input("Appuyez sur ENTREE pour revenir au menu...")
     return True
 
+def mode_cv_optimization():
+    """Lancer CV Optimization Grid Search"""
+    print_header()
+    print("\n[5] CV OPTIMIZATION V3 - GRID SEARCH\n")
+    print("="*80 + "\n")
+    
+    if not os.path.exists("cv_optimization_v3.py"):
+        print("[ERROR] cv_optimization_v3.py manquant")
+        input("Appuyez sur ENTREE pour revenir au menu...")
+        return False
+    
+    print("[INFO] Lancement CV Optimization V3 - Grid Search")
+    print("       - Hyperparamètres variables")
+    print("       - GUI avec graphiques scrollables")
+    print("       - Paramètres vs F1 Scores")
+    print("       - Gestion RAM dynamique")
+    print("       Durée estimée: 2-10 heures\n")
+    
+    input("Appuyez sur ENTREE pour lancer...")
+    
+    result = subprocess.run([sys.executable, "cv_optimization_v3.py"])
+    
+    if result.returncode != 0:
+        print("\n[WARNING] CV Optimization interrompue")
+        return False
+    
+    print("\n[OK] CV Optimization complétée!")
+    print("     - cv_results_summary.txt généré")
+    print("     - cv_optimal_splits.json généré")
+    
+    input("Appuyez sur ENTREE pour revenir au menu...")
+    return True
+
 def mode_pipeline_complete():
     """Lancer pipeline séquentielle"""
     print_header()
-    print("\n[5] PIPELINE COMPLÈTE (SÉQUENTIELLE)\n")
+    print("\n[6] PIPELINE COMPLÈTE (SÉQUENTIELLE)\n")
     print("="*80 + "\n")
     
     if not check_files():
@@ -273,8 +305,8 @@ def mode_pipeline_complete():
     print("  2. ML Evaluation (1-6 heures)")
     print("  3. Test Decision Tree (15-60 min)")
     print("  4. DDoS Detector (5-15 min)")
-    print("  ────────────────────────────")
-    print("  TOTAL: 2-10 heures estimées\n")
+    print("  ────────────────────────────────")
+    print("  TOTAL: 2-15 heures estimées\n")
     
     input("Appuyez sur ENTREE pour lancer...")
     
@@ -315,7 +347,7 @@ def mode_pipeline_complete():
     print("  ✅ preprocessed_dataset.npz")
     print("  ✅ evaluation_results_summary.txt")
     print("  ✅ ml_evaluation_results.json")
-    print("  ✅ graph_eval_*.png")
+    print("  ✅ graph_eval_*.png (4 graphiques)")
     print("  ✅ dt_test_results.json")
     print("  ✅ test_dt_splits.png")
     print("  ✅ ddos_predictions_test_holdout.csv")
@@ -328,7 +360,6 @@ def main():
     """Main loop"""
     os.system('cls' if os.name == 'nt' else 'clear')
     
-    # Vérification initiale des fichiers
     if not check_files():
         print("\n[ERROR] Fichiers manquants!")
         input("Appuyez sur ENTREE pour quitter...")
@@ -358,9 +389,13 @@ def main():
         
         elif choice == "5":
             os.system('cls' if os.name == 'nt' else 'clear')
-            mode_pipeline_complete()
+            mode_cv_optimization()
         
         elif choice == "6":
+            os.system('cls' if os.name == 'nt' else 'clear')
+            mode_pipeline_complete()
+        
+        elif choice == "7":
             print("\nAu revoir!")
             sys.exit(0)
         

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TEST DECISION TREE SPLITS - ADAPTÉ
-========================================
-✅ progress_gui OPTIONNEL (console fallback)
-✅ CORRECTION: Utilise MEMES CLASSES que training
-✅ Modes: GUI (si disponible) + CONSOLE
+TEST DECISION TREE SPLITS - ADAPTÉ + OPTIMISÉ RAM
+================================================
+✅ progress_gui optionnel (console fallback)
 ✅ Détection overfitting automatique
-========================================
+✅ Gestion RAM dynamique (<90%)
+================================================
 """
 
 import os
 import sys
 import json
+import gc
+import psutil
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -30,9 +31,36 @@ except ImportError:
 
 USE_GUI = HAS_GUI
 
+# ============= MEMORY MANAGER =============
+class MemoryManager:
+    RAM_THRESHOLD = 90.0
+    
+    @staticmethod
+    def get_ram_usage():
+        try:
+            return psutil.virtual_memory().percent
+        except:
+            return 50
+    
+    @staticmethod
+    def get_available_ram_gb():
+        try:
+            return psutil.virtual_memory().available / (1024**3)
+        except:
+            return 8
+    
+    @staticmethod
+    def check_and_cleanup():
+        ram_usage = MemoryManager.get_ram_usage()
+        if ram_usage > MemoryManager.RAM_THRESHOLD:
+            gc.collect()
+            return False
+        return True
 
+
+# ============= DT SPLITS TESTER =============
 class DTSplitsTester:
-    """Test Decision Tree avec différentes tailles de split"""
+    """Test Decision Tree avec gestion RAM"""
     
     def __init__(self, ui=None):
         self.ui = ui
@@ -64,32 +92,37 @@ class DTSplitsTester:
             print(f"[{ts}] [{level}] {msg}")
 
     def log_alert(self, msg, level="error"):
-        """Alert compatible GUI + console"""
         if self.ui:
             self.ui.log_alert(msg, level=level)
         else:
             print(f"[ALERT] {msg}")
 
     def load_data(self):
-        """Charger les données d'entraînement"""
+        """Charge les données"""
         try:
             if not os.path.exists("preprocessed_dataset.npz"):
                 self.log_alert("Données manquantes", level="error")
                 return False
             
+            # Nettoyer avant charge
+            gc.collect()
+            
             data = np.load("preprocessed_dataset.npz", allow_pickle=True)
             self.X = data["X"]
             self.y = data["y"]
-            # ✅ CORRECTION: Charger les classes du training
             self.classes = data["classes"]
             
             self.log(f"Données chargées: X={self.X.shape}, y={len(self.y):,}", level="OK")
             self.log(f"Classes: {list(self.classes)}", level="OK")
+            self.log(f"RAM: {MemoryManager.get_ram_usage():.1f}%", level="DETAIL")
             
             if self.ui:
-                self.ui.log(f"Données chargées: {len(self.y):,} échantillons", level="OK")
                 self.ui.update_stage("load", 1, 1, "Données chargées")
                 self.ui.update_global(1, 4, "Données chargées")
+            
+            # Cleanup
+            del data
+            gc.collect()
             
             return True
         except Exception as e:
@@ -97,7 +130,7 @@ class DTSplitsTester:
             return False
 
     def test_splits(self):
-        """Tester DT avec différentes tailles de split"""
+        """Teste DT avec différentes tailles"""
         try:
             test_sizes = [0.05, 0.10, 0.15, 0.20, 0.25, 0.50]
             num_runs = 5
@@ -119,6 +152,12 @@ class DTSplitsTester:
                 for run in range(num_runs):
                     current_test += 1
                     
+                    # Vérifier RAM avant split
+                    if not MemoryManager.check_and_cleanup():
+                        self.log("RAM critique, pause", level="WARN")
+                        import time
+                        time.sleep(1)
+                    
                     # Split stratifié
                     X_train, X_test, y_train, y_test = train_test_split(
                         self.X, self.y,
@@ -128,7 +167,9 @@ class DTSplitsTester:
                     )
                     
                     # Entraîner DT
-                    model = DecisionTreeClassifier(random_state=42 + run)
+                    model = DecisionTreeClassifier(random_state=42 + run, 
+                                                  max_depth=20, 
+                                                  min_samples_split=10)
                     model.fit(X_train, y_train)
                     
                     # Prédire
@@ -155,6 +196,10 @@ class DTSplitsTester:
                                             f"Test {test_size*100:.0f}% run {run+1}")
                         self.ui.update_global(1 + current_test/total_tests, 4,
                                             f"Évaluation {current_test}/{total_tests}")
+                    
+                    # Cleanup
+                    del X_train, X_test, y_train, y_test, y_pred, model
+                    gc.collect()
                 
                 # Statistiques par taille
                 mean_f1 = np.mean(f1_runs)
@@ -175,7 +220,7 @@ class DTSplitsTester:
             return False
 
     def analyze_overfitting(self):
-        """Analyser si le modèle surfit"""
+        """Analyse overfitting"""
         try:
             self.log(f"\nDétection d'overfitting\n", level="INFO")
             
@@ -219,7 +264,7 @@ class DTSplitsTester:
             return False
 
     def generate_graph(self):
-        """Générer graphique F1 vs test size"""
+        """Génère graphiques"""
         try:
             self.log(f"\nGénération graphique", level="INFO")
             
@@ -238,7 +283,6 @@ class DTSplitsTester:
             axes[0].set_ylim([0, 1])
             axes[0].grid(True, alpha=0.3)
             
-            # Ajouter les valeurs sur les points
             for x, y, std in zip(test_sizes_pct, f1_means, f1_stds):
                 axes[0].text(x, y+0.03, f'{y:.3f}', ha='center', fontsize=9)
             
@@ -257,7 +301,6 @@ class DTSplitsTester:
             axes[1].legend()
             axes[1].grid(True, alpha=0.3, axis='y')
             
-            # Ajouter les valeurs
             for x, c in zip(test_sizes_pct, cv):
                 axes[1].text(x, c+0.002, f'{c:.4f}', ha='center', fontsize=9)
             
@@ -270,7 +313,8 @@ class DTSplitsTester:
             if self.ui:
                 self.ui.update_stage("graph", 1, 1, "Graphique généré")
                 self.ui.update_global(4, 4, "Terminé")
-                self.ui.log("Graphique généré", level="OK")
+            
+            gc.collect()
             
             return True
         except Exception as e:
@@ -278,15 +322,39 @@ class DTSplitsTester:
             return False
 
     def save_results(self):
-        """Sauvegarder les résultats en JSON"""
+        """Sauvegarde résultats et modèle"""
         try:
             with open('dt_test_results.json', 'w', encoding='utf-8') as f:
                 json.dump(self.results, f, indent=2, ensure_ascii=False, default=float)
             
             self.log(f"Résultats sauvegardés: dt_test_results.json", level="OK")
             
+            # Entraîner et sauvegarder meilleur modèle
+            import joblib
+            
+            # Meilleur split basé sur résultats
+            best_idx = np.argmax(self.results['f1_means'])
+            best_test_size = self.results['test_sizes'][best_idx]
+            
+            self.log(f"Entraînement modèle final (test_size={best_test_size})...", level="INFO")
+            
+            X_train, X_test, y_train, y_test = train_test_split(
+                self.X, self.y,
+                test_size=best_test_size,
+                random_state=42,
+                stratify=self.y
+            )
+            
+            final_model = DecisionTreeClassifier(random_state=42, max_depth=20, 
+                                               min_samples_split=10)
+            final_model.fit(X_train, y_train)
+            
+            joblib.dump(final_model, 'ddos_detector_final.pkl')
+            
+            self.log(f"Modèle sauvegardé: ddos_detector_final.pkl", level="OK")
+            
             if self.ui:
-                self.ui.log("Résultats sauvegardés", level="OK")
+                self.ui.log("Résultats et modèle sauvegardés", level="OK")
             
             return True
         except Exception as e:
@@ -294,7 +362,7 @@ class DTSplitsTester:
             return False
 
     def run(self):
-        """Exécuter tous les tests"""
+        """Exécute tous les tests"""
         if not self.load_data():
             return False
         
@@ -336,7 +404,7 @@ def run_with_gui():
 
 
 def main():
-    """Point d'entrée principal"""
+    """Point d'entrée"""
     print("\n" + "="*80)
     print("TEST DECISION TREE SPLITS - OVERFITTING DETECTION")
     print("="*80 + "\n")

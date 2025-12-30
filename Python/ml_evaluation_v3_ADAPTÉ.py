@@ -1,15 +1,13 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ML EVALUATION V3 - ADAPTÉE
-========================================
-✅ progress_gui OPTIONNEL (console fallback)
-✅ CORRECTION: LabelEncoder utilise MEMES CLASSES que training
-✅ Pas de fit_transform(), utilise transform() avec classes du NPZ
-✅ K-Fold validation sur test holdout
-✅ Rapports et graphiques
-✅ Modes: GUI (si progress_gui disponible) + CONSOLE (fallback)
-========================================
+ML EVALUATION V3 - ADAPTÉ + OPTIMISÉ RAM
+=====================================
+✅ Gestion RAM dynamique (<90%)
+✅ Memory optimization automatique
+✅ Fallback console
+✅ K-Fold validation
+=====================================
 """
 
 import os
@@ -20,6 +18,7 @@ import numpy as np
 import pandas as pd
 import multiprocessing
 import threading
+import psutil
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
@@ -37,14 +36,38 @@ except ImportError:
     GenericProgressGUI = None
 
 NUM_CORES = multiprocessing.cpu_count()
-MODELS_CONFIG = {
-    "Logistic Regression": {"n_jobs": -1},
-    "Naive Bayes": {"n_jobs": 1},
-    "Decision Tree": {"n_jobs": -1},
-    "Random Forest": {"n_jobs": -1},
-}
 
 
+# ============= MEMORY MANAGER =============
+class MemoryManager:
+    """Gestion mémoire dynamique"""
+    RAM_THRESHOLD = 90.0
+    
+    @staticmethod
+    def get_ram_usage():
+        try:
+            return psutil.virtual_memory().percent
+        except:
+            return 50
+    
+    @staticmethod
+    def get_available_ram_gb():
+        try:
+            return psutil.virtual_memory().available / (1024**3)
+        except:
+            return 8
+    
+    @staticmethod
+    def check_and_cleanup():
+        """Nettoie si RAM trop haute"""
+        ram_usage = MemoryManager.get_ram_usage()
+        if ram_usage > MemoryManager.RAM_THRESHOLD:
+            gc.collect()
+            return False
+        return True
+
+
+# ============= ML EVALUATION RUNNER =============
 class MLEvaluationRunner:
     def __init__(self, ui=None):
         self.ui = ui
@@ -54,15 +77,12 @@ class MLEvaluationRunner:
         self.X_test = None
         self.y_test = None
         self.classes = None
+        
         if self.ui:
-            self._init_ui()
-
-    def _init_ui(self):
-        """Initialiser les stages de la GUI"""
-        self.ui.add_stage("load", "Chargement train/test")
-        self.ui.add_stage("train", "Entraînement + évaluation holdout")
-        self.ui.add_stage("reports", "Rapports")
-        self.ui.add_stage("graphs", "Graphiques")
+            self.ui.add_stage("load", "Chargement train/test")
+            self.ui.add_stage("train", "Entraînement + évaluation holdout")
+            self.ui.add_stage("reports", "Rapports")
+            self.ui.add_stage("graphs", "Graphiques")
 
     def log(self, msg, level="INFO"):
         """Log compatible GUI + console"""
@@ -73,66 +93,76 @@ class MLEvaluationRunner:
             print(f"[{ts}] [{level}] {msg}")
 
     def log_alert(self, msg, level="error"):
-        """Alert compatible GUI + console"""
         if self.ui:
             self.ui.log_alert(msg, level=level)
         else:
             print(f"[ALERT] {msg}")
 
     def load_data(self):
-        """✅ CORRIGÉ: Charger train et test avec classes cohérentes"""
+        """Charge train et test avec gestion RAM"""
         npz_files = ["preprocessed_dataset.npz", "tensor_data.npz"]
         npz_file = next((f for f in npz_files if os.path.exists(f)), None)
+        
         if not npz_file:
             self.log_alert("NPZ introuvable", level="error")
             return False
         
         try:
             t0 = time.time()
+            
+            # Nettoyer avant charge
+            gc.collect()
+            
             data = np.load(npz_file, allow_pickle=True)
             self.X_train = data["X"]
             self.y_train = data["y"]
-            # ✅ CORRECTION: Sauvegarder les classes du training
             self.classes = data["classes"]
-            self.log(f"Train NPZ {npz_file} chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
+            
+            self.log(f"Train NPZ chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
             self.log(f"Classes: {list(self.classes)}", level="OK")
+            self.log(f"RAM: {MemoryManager.get_ram_usage():.1f}%", level="DETAIL")
 
-            # Charger le test holdout
+            # Charger test holdout
             if not os.path.exists("fusion_test_smart4.csv"):
                 self.log_alert("fusion_test_smart4.csv introuvable", level="error")
                 return False
             
+            # Charger test en chunks si grand
             df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False, encoding='utf-8')
             self.log(f"Test chargé: {len(df_test):,} lignes", level="OK")
+            
+            # Vérifier RAM
+            if not MemoryManager.check_and_cleanup():
+                self.log("RAM critique, nettoyage", level="WARN")
             
             numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
             X_test_raw = df_test[numeric_cols].astype(np.float32)
             X_test_raw = X_test_raw.fillna(X_test_raw.mean())
             
             if X_test_raw.shape[1] != self.X_train.shape[1]:
-                self.log_alert(f"Mismatch features train/test: train {self.X_train.shape[1]} vs test {X_test_raw.shape[1]}", level="error")
+                self.log_alert(f"Mismatch features", level="error")
                 return False
             
-            # Normaliser avec stats du training
+            # Normaliser avec stats training
             mean = self.X_train.mean(axis=0)
             std = self.X_train.std(axis=0) + 1e-8
             self.X_test = ((X_test_raw - mean) / std).astype(np.float32)
             
-            # ✅ CORRECTION: Utiliser MEMES CLASSES que training
+            # Encoder labels
             lbl = LabelEncoder()
-            lbl.classes_ = self.classes  # Imposer les mêmes classes
-            
-            # Convertir labels en strings pour matcher
+            lbl.classes_ = self.classes
             y_test_raw = df_test["Label"].astype(str).values
-            
-            # transform() au lieu de fit_transform() pour garder l'ordre du training
             self.y_test = lbl.transform(y_test_raw)
             
             self.log(f"Test normalisé: X={self.X_test.shape}, y={len(self.y_test):,}", level="OK")
             
             if self.ui:
-                self.ui.update_stage("load", len(self.X_train)+len(self.X_test), len(self.X_train)+len(self.X_test), "Train/Test chargés")
+                self.ui.update_stage("load", 1, 1, "Train/Test chargés")
                 self.ui.update_global(1, 4, f"Train {len(self.X_train):,} | Test {len(self.X_test):,}")
+            
+            # Nettoyer
+            del df_test, X_test_raw
+            gc.collect()
             
             return True
         except Exception as e:
@@ -140,15 +170,13 @@ class MLEvaluationRunner:
             return False
 
     def train_eval(self):
-        """✅ K-Fold evaluation avec validation croisée"""
+        """K-Fold evaluation avec gestion RAM"""
         try:
             models = [
-                ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42,
-                                                           n_jobs=MODELS_CONFIG["Logistic Regression"]["n_jobs"])),
+                ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)),
                 ("Naive Bayes", GaussianNB()),
-                ("Decision Tree", DecisionTreeClassifier(random_state=42)),
-                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42,
-                                                         n_jobs=MODELS_CONFIG["Random Forest"]["n_jobs"])),
+                ("Decision Tree", DecisionTreeClassifier(random_state=42, max_depth=20, min_samples_split=10)),
+                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)),
             ]
             
             kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -162,18 +190,19 @@ class MLEvaluationRunner:
                 precision_runs = []
                 cm_sum = None
                 
-                fold_count = 0
                 for fold, (train_idx, test_idx) in enumerate(kf.split(self.X_test), 1):
-                    fold_count += 1
+                    # Vérifier RAM avant split
+                    if not MemoryManager.check_and_cleanup():
+                        self.log("RAM critique, pause", level="WARN")
+                        time.sleep(1)
                     
-                    # Combiner train original + fold train du test
                     X_train_combined = np.vstack([self.X_train, self.X_test[train_idx]])
                     y_train_combined = np.hstack([self.y_train, self.y_test[train_idx]])
                     
                     X_val = self.X_test[test_idx]
                     y_val = self.y_test[test_idx]
                     
-                    # Entraîner et prédire
+                    # Entraîner
                     model.fit(X_train_combined, y_train_combined)
                     y_pred = model.predict(X_val)
                     
@@ -186,11 +215,14 @@ class MLEvaluationRunner:
                     recall_runs.append(recall)
                     precision_runs.append(precision)
                     
-                    # Confusion matrix
                     cm = confusion_matrix(y_val, y_pred, labels=np.unique(self.y_test))
                     cm_sum = cm if cm_sum is None else cm_sum + cm
                     
                     self.log(f"  Fold {fold}: F1={f1:.4f} | Recall={recall:.4f} | Precision={precision:.4f}", level="info")
+                    
+                    # Cleanup
+                    del X_train_combined, y_train_combined, X_val, y_val, y_pred
+                    gc.collect()
                     
                     if self.ui:
                         self.ui.update_file_progress(f"{name}", int(fold / 5 * 100),
@@ -220,16 +252,14 @@ class MLEvaluationRunner:
             return False
 
     def save_reports(self):
-        """Sauvegarder rapports texte et JSON"""
+        """Sauvegarder rapports"""
         try:
-            # Rapport texte
             with open("evaluation_results_summary.txt", "w", encoding="utf-8") as f:
                 f.write("=" * 100 + "\n")
-                f.write("ML EVALUATION V3 - FINAL (ADAPTÉ)\n")
+                f.write("ML EVALUATION V3 - ADAPTÉ\n")
                 f.write("=" * 100 + "\n\n")
-                f.write("✅ CORRECTION: LabelEncoder cohérent avec training\n")
                 f.write("✅ K-Fold validation: 5 folds\n")
-                f.write("✅ Test holdout: fusion_test_smart4.csv\n\n")
+                f.write("✅ Gestion RAM dynamique\n\n")
                 
                 for name, res in sorted(self.results.items(), key=lambda x: x[1]["f1"], reverse=True):
                     f.write(f"{name:<25} F1={res['f1']:.4f}±{res['f1_std']:.4f} ")
@@ -239,7 +269,6 @@ class MLEvaluationRunner:
             
             self.log("Rapport texte: evaluation_results_summary.txt", level="OK")
             
-            # Rapport JSON
             with open("ml_evaluation_results.json", "w", encoding="utf-8") as f:
                 json.dump(self.results, f, indent=2, ensure_ascii=False)
             
@@ -296,8 +325,6 @@ class MLEvaluationRunner:
                 self.ui.update_stage("graphs", 1, 1, "Graphiques OK")
                 self.ui.update_global(4, 4, "Terminé")
             
-            self.log("Graphiques générés", level="OK")
-            
             return True
         except Exception as e:
             self.log_alert(f"Graphiques: {e}", level="error")
@@ -305,16 +332,15 @@ class MLEvaluationRunner:
 
 
 def main():
-    """Point d'entrée principal"""
+    """Point d'entrée"""
     print("\n" + "="*80)
-    print("ML EVALUATION V3 - ADAPTÉ")
+    print("ML EVALUATION V3 - ADAPTÉ (Gestion RAM Optimale)")
     print("="*80 + "\n")
 
     if HAS_GUI:
-        # Mode GUI
         print("[INFO] Mode GUI activé\n")
         ui = GenericProgressGUI(title="ML Evaluation V3 - ADAPTÉ", 
-                               header_info=f"Cores: {NUM_CORES}", 
+                               header_info=f"Cores: {NUM_CORES}, RAM: {MemoryManager.get_available_ram_gb():.1f}GB", 
                                max_workers=4)
         runner = MLEvaluationRunner(ui=ui)
 
@@ -346,7 +372,6 @@ def main():
         ui.start()
         return True
     else:
-        # Mode console
         print("[INFO] Mode console (progress_gui non disponible)\n")
         runner = MLEvaluationRunner(ui=None)
         

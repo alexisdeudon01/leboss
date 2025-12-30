@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DDoS DETECTOR - PRODUCTION - ADAPTÉ
-====================================
-✅ progress_gui OPTIONNEL (console fallback)
-✅ CORRECTION: Utilise MEMES CLASSES que training
-✅ Normalisation avec stats du training
-✅ Modes: GUI (si disponible) + CONSOLE
-====================================
+DDoS DETECTOR - PRODUCTION - ADAPTÉ + OPTIMISÉ RAM
+==================================================
+✅ progress_gui optionnel (console fallback)
+✅ Classes cohérentes du training
+✅ Normalisation training stats
+✅ Gestion RAM dynamique (<90%)
+==================================================
 """
 
 import joblib
@@ -16,6 +16,8 @@ import pandas as pd
 import os
 import sys
 import threading
+import psutil
+import gc
 from sklearn.preprocessing import LabelEncoder
 
 try:
@@ -27,9 +29,39 @@ except ImportError:
 
 USE_GUI = HAS_GUI and os.getenv("USE_PROGRESS_GUI", "1") == "1"
 
+# ============= MEMORY MANAGER =============
+class MemoryManager:
+    RAM_THRESHOLD = 90.0
+    
+    @staticmethod
+    def get_ram_usage():
+        try:
+            return psutil.virtual_memory().percent
+        except:
+            return 50
+    
+    @staticmethod
+    def check_and_cleanup():
+        ram_usage = MemoryManager.get_ram_usage()
+        if ram_usage > MemoryManager.RAM_THRESHOLD:
+            gc.collect()
+            return False
+        return True
+    
+    @staticmethod
+    def get_optimal_batch_size(min_batch=1000, max_batch=100000):
+        """Batch size adaptatif"""
+        ram_usage = MemoryManager.get_ram_usage()
+        if ram_usage > 80:
+            batch_size = int(min_batch * (100 - ram_usage) / 20)
+        else:
+            batch_size = max_batch
+        return max(min_batch, batch_size)
 
+
+# ============= DDoS DETECTOR =============
 class DDoSDetector:
-    """✅ CORRIGÉ: Gestion cohérente des classes et normalisation"""
+    """Détecteur DDoS avec gestion RAM"""
     
     def __init__(self, ui=None):
         self.model = None
@@ -61,9 +93,8 @@ class DDoSDetector:
             print(f"[ALERT] {msg}")
 
     def load_model_and_scaler(self):
-        """Charger le modèle et les paramètres de normalisation"""
+        """Charge modèle et paramètres normalisation"""
         try:
-            # Charger le modèle
             if not os.path.exists('ddos_detector_final.pkl'):
                 self.log_alert("ddos_detector_final.pkl manquant", level="error")
                 return False
@@ -71,30 +102,37 @@ class DDoSDetector:
             self.model = joblib.load('ddos_detector_final.pkl')
             self.log("Modèle chargé: ddos_detector_final.pkl", level="OK")
             
-            # Charger les paramètres de normalisation depuis le dataset d'entraînement
             if not os.path.exists('preprocessed_dataset.npz'):
-                self.log_alert("preprocessed_dataset.npz manquant pour scaler", level="error")
+                self.log_alert("preprocessed_dataset.npz manquant", level="error")
                 return False
+            
+            # Nettoyer avant charge
+            gc.collect()
             
             data = np.load('preprocessed_dataset.npz', allow_pickle=True)
             X_train = data['X']
             
-            # ✅ Sauvegarder les paramètres de normalisation du training
+            # Paramètres normalisation
             self.scaler_mean = X_train.mean(axis=0)
             self.scaler_std = X_train.std(axis=0) + 1e-8
             
-            # ✅ CORRECTION: Charger les classes du training
+            # Classes du training
             self.classes = data['classes']
             
-            # Créer le label encoder avec les MEMES classes
+            # Label encoder
             self.label_encoder = LabelEncoder()
             self.label_encoder.classes_ = self.classes
             
             self.log(f"Scaler et classes chargés (Mean shape: {self.scaler_mean.shape})", level="OK")
             self.log(f"Classes: {list(self.classes)}", level="OK")
+            self.log(f"RAM: {MemoryManager.get_ram_usage():.1f}%", level="DETAIL")
             
             if self.ui:
                 self.ui.update_stage("load_model", 1, 1, "Modèle et scaler chargés")
+            
+            # Cleanup
+            del data, X_train
+            gc.collect()
             
             return True
         except Exception as e:
@@ -102,9 +140,9 @@ class DDoSDetector:
             return False
 
     def normalize_features(self, X_raw):
-        """Normaliser les features avec les paramètres du training"""
+        """Normalise avec stats training"""
         if self.scaler_mean is None or self.scaler_std is None:
-            self.log_alert("Scaler non inicalisé", level="error")
+            self.log_alert("Scaler non initialisé", level="error")
             return None
         
         try:
@@ -114,88 +152,73 @@ class DDoSDetector:
             self.log_alert(f"Erreur normalisation: {e}", level="error")
             return None
 
-    def predict_single(self, sample):
-        """Prédire sur un seul échantillon"""
+    def predict_batch(self, samples, batch_size=None):
+        """Prédiction batch avec gestion RAM"""
         if self.model is None:
             self.log_alert("Modèle non chargé", level="error")
             return None
 
         try:
-            # Assurer que l'input est 2D
-            if len(sample.shape) == 1:
-                sample = sample.reshape(1, -1)
-
-            # Normaliser
-            sample_norm = self.normalize_features(sample)
-            if sample_norm is None:
-                return None
-
-            # Prédire
-            prediction = self.model.predict(sample_norm)[0]
-            probability = self.model.predict_proba(sample_norm)[0]
-
-            # ✅ CORRECTION: Utiliser les classes correctes
-            pred_label = self.classes[prediction]
+            if batch_size is None:
+                batch_size = MemoryManager.get_optimal_batch_size()
             
-            result = {
-                'prediction': str(pred_label),
-                'prediction_id': int(prediction),
-                'confidence': float(max(probability)),
-                'probabilities': {
-                    str(self.classes[0]): float(probability[0]),
-                    str(self.classes[1]): float(probability[1])
-                }
-            }
-
-            return result
-        except Exception as e:
-            self.log_alert(f"Erreur prédiction: {e}", level="error")
-            return None
-
-    def predict_batch(self, samples):
-        """Prédire sur plusieurs échantillons"""
-        if self.model is None:
-            self.log_alert("Modèle non chargé", level="error")
-            return None
-
-        try:
-            # Normaliser
-            samples_norm = self.normalize_features(samples)
-            if samples_norm is None:
-                return None
-
-            # Prédire
-            predictions = self.model.predict(samples_norm)
-            probabilities = self.model.predict_proba(samples_norm)
-
             results = []
-            for i, (pred, prob) in enumerate(zip(predictions, probabilities)):
-                # ✅ CORRECTION: Utiliser les classes correctes
-                pred_label = self.classes[pred]
+            total_samples = len(samples)
+            
+            for batch_idx in range(0, total_samples, batch_size):
+                # Vérifier RAM
+                if not MemoryManager.check_and_cleanup():
+                    self.log("RAM critique, pause", level="WARN")
+                    import time
+                    time.sleep(1)
                 
-                result = {
-                    'sample_id': i,
-                    'prediction': str(pred_label),
-                    'prediction_id': int(pred),
-                    'confidence': float(max(prob)),
-                    'probabilities': {
-                        str(self.classes[0]): float(prob[0]),
-                        str(self.classes[1]): float(prob[1])
+                batch_end = min(batch_idx + batch_size, total_samples)
+                batch = samples[batch_idx:batch_end]
+                
+                # Normaliser
+                batch_norm = self.normalize_features(batch)
+                if batch_norm is None:
+                    return None
+                
+                # Prédire
+                predictions = self.model.predict(batch_norm)
+                probabilities = self.model.predict_proba(batch_norm)
+                
+                # Formater résultats
+                for i, (pred, prob) in enumerate(zip(predictions, probabilities)):
+                    pred_label = self.classes[pred]
+                    
+                    result = {
+                        'sample_id': batch_idx + i,
+                        'prediction': str(pred_label),
+                        'prediction_id': int(pred),
+                        'confidence': float(max(prob)),
+                        'probabilities': {
+                            str(self.classes[0]): float(prob[0]),
+                            str(self.classes[1]): float(prob[1])
+                        }
                     }
-                }
-                results.append(result)
+                    results.append(result)
                 
-                if self.ui and i % 100 == 0:
-                    self.ui.update_stage("predict", i + 1, len(samples), 
-                                        f"Batch {i+1}/{len(samples)}")
-
+                # Progress
+                pct = batch_end / total_samples * 100
+                self.log(f"Batch {batch_idx//batch_size + 1}: {pct:.1f}% (RAM: {MemoryManager.get_ram_usage():.1f}%)", level="DETAIL")
+                
+                if self.ui:
+                    self.ui.update_stage("predict", batch_end, total_samples, 
+                                        f"Batch {batch_end}/{total_samples}")
+                
+                # Cleanup
+                del batch, batch_norm, predictions, probabilities
+                gc.collect()
+            
             if self.ui:
-                self.ui.update_stage("predict", len(samples), len(samples), 
+                self.ui.update_stage("predict", total_samples, total_samples, 
                                     "Prédictions terminées")
             
             return results
         except Exception as e:
-            self.log_alert(f"Erreur batch prédiction: {e}", level="error")
+            self.log_alert(f"Erreur prédiction: {e}", level="error")
             return None
 
 
@@ -216,7 +239,7 @@ def run_with_gui():
             
             ui.update_global(1, 3, "Modèle chargé")
             
-            # Charger test holdout
+            # Charger test
             if not os.path.exists("fusion_test_smart4.csv"):
                 ui.log_alert("fusion_test_smart4.csv introuvable", level="error")
                 return
@@ -234,13 +257,11 @@ def run_with_gui():
             if results:
                 ui.update_global(3, 3, "Terminé")
                 
-                # Statistiques
                 ddos_count = sum(1 for r in results if r['prediction'] == 'DDoS')
                 normal_count = len(results) - ddos_count
                 
                 summary = f"Prédictions terminées:\n  DDoS: {ddos_count:,}\n  Normal: {normal_count:,}"
                 ui.log_alert(summary, level="success")
-            
         except Exception as e:
             ui.log_alert(f"Erreur: {e}", level="error")
 
@@ -249,9 +270,9 @@ def run_with_gui():
 
 
 def main():
-    """Point d'entrée principal"""
+    """Point d'entrée"""
     print("\n" + "="*80)
-    print("DDoS DETECTOR - PRODUCTION (TEST HOLDOUT)")
+    print("DDoS DETECTOR - PRODUCTION (TEST HOLDOUT) - Gestion RAM Optimale")
     print("="*80 + "\n")
 
     detector = DDoSDetector()
@@ -260,7 +281,7 @@ def main():
         print("[ERROR] Impossible charger modèle")
         return False
 
-    # Mode GUI si disponible
+    # Mode GUI
     if USE_GUI:
         print("[INFO] Mode GUI activé\n")
         run_with_gui()
@@ -294,7 +315,7 @@ def main():
             print(f"    DDoS:  {ddos_count:,} ({ddos_count/len(results)*100:.1f}%)")
             print(f"    Normal: {normal_count:,} ({normal_count/len(results)*100:.1f}%)")
             
-            # Sauvegarder les prédictions
+            # Sauvegarder
             pred_df = pd.DataFrame(results)
             pred_df.to_csv("ddos_predictions_test_holdout.csv", index=False, encoding='utf-8')
             print(f"\n[OK] Prédictions sauvegardées: ddos_predictions_test_holdout.csv")

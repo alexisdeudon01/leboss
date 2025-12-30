@@ -1,6 +1,14 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+"""
+ORCHESTRATOR MASTER - VERSION SIMPLIFIÉE
+========================================
+✅ Auto-détecte structure répertoires
+✅ Lance pipeline complète
+✅ Logs horodatés
+✅ Gestion erreurs
+========================================
+"""
 
 import os
 import sys
@@ -12,15 +20,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 class LauncherDDoS:
-    """Launcher simplifié pour pipeline DDoS"""
+    """Orchestrateur simplifié"""
     
     def __init__(self):
-        # Détecter le répertoire master (parent du répertoire courant)
+        # Détecter répertoire master
         if os.path.basename(os.getcwd()) == 'Python':
             self.master_dir = os.path.dirname(os.getcwd())
             self.python_dir = os.getcwd()
         else:
-            # Si on est dans master/ directement
             self.master_dir = os.getcwd()
             self.python_dir = os.path.join(self.master_dir, 'Python')
         
@@ -56,7 +63,7 @@ class LauncherDDoS:
             pass
     
     def verify_structure(self):
-        """Vérifier la structure des répertoires"""
+        """Vérifier structure répertoires"""
         self.log("VÉRIFICATION STRUCTURE", "HEADER")
         
         checks = {
@@ -64,8 +71,6 @@ class LauncherDDoS:
             "Répertoire Python": os.path.isdir(self.python_dir),
             "Dossier CIC": os.path.isdir(self.cic_dir),
             "Dossier TONIOT": os.path.isdir(self.toniot_dir),
-            "CIC/CSV-03-11 (Novembre)": os.path.isdir(os.path.join(self.cic_dir, 'CSV-03-11')),
-            "CIC/CSV-01-12 (Décembre)": os.path.isdir(os.path.join(self.cic_dir, 'CSV-01-12')),
         }
         
         for desc, exists in checks.items():
@@ -78,7 +83,6 @@ class LauncherDDoS:
         # Vérifier fichiers
         self.log("\nVérification fichiers", "INFO")
         
-        # TON_IoT
         toniot_file = os.path.join(self.toniot_dir, 'train_test_network.csv')
         if os.path.exists(toniot_file):
             size = os.path.getsize(toniot_file) / (1024**3)
@@ -87,8 +91,15 @@ class LauncherDDoS:
             self.log(f"  ❌ train_test_network.csv manquant", "ERROR")
             return False
         
-        # Scripts FINAL
-        scripts = ['consolidateddata_CORRECTED.py', 'cv_optimization_v3.py']
+        # Scripts
+        scripts = [
+            'consolidateddata_CORRECTED.py',
+            'cv_optimization_v3.py',
+            'ml_evaluation_v3_ADAPTÉ.py',
+            'ddos_detector_production_ADAPTÉ.py',
+            'test_dt_splits_ADAPTÉ.py'
+        ]
+        
         for script in scripts:
             script_path = os.path.join(self.python_dir, script)
             if os.path.exists(script_path):
@@ -97,51 +108,19 @@ class LauncherDDoS:
                 self.log(f"  ❌ {script} manquant", "ERROR")
                 return False
         
-        # CSV dans CIC
-        self.log("\nVérification CSV CIC", "INFO")
-        csv_count = 0
-        for folder in ['CSV-03-11', 'CSV-01-12']:
-            folder_path = os.path.join(self.cic_dir, folder)
-            # Chercher récursivement (peut avoir sous-dossier)
-            for root, dirs, files in os.walk(folder_path):
-                csv_files = [f for f in files if f.endswith('.csv')]
-                csv_count += len(csv_files)
-                if csv_files:
-                    self.log(f"  ✅ {folder}: {len(csv_files)} fichiers CSV", "OK")
-                    break
-        
-        if csv_count == 0:
-            self.log(f"  ❌ Aucun fichier CSV trouvé dans CIC/", "ERROR")
-            return False
-        
-        self.log(f"\n✅ Structure validée ({csv_count} fichiers CSV trouvés)", "OK")
         return True
     
     def setup_working_directory(self):
-        """Préparer le répertoire de travail"""
+        """Préparer répertoire de travail"""
         self.log("\nPRÉPARATION RÉPERTOIRE DE TRAVAIL", "HEADER")
         
-        # Se placer dans Python/
         os.chdir(self.python_dir)
         self.log(f"  Répertoire courant: {os.getcwd()}", "OK")
-        
-        # Créer liens symboliques ou copier fichiers si nécessaire
-        # Pour Windows, on va juste utiliser les chemins absolus dans les scripts
-        
-        # Créer dossier CIC symlink dans Python/
-        if not os.path.exists('CIC'):
-            try:
-                # Essayer symlink (fonctionne sur Windows 10+)
-                os.symlink(self.cic_dir, 'CIC')
-                self.log(f"  Symlink CIC créé", "OK")
-            except:
-                # Fallback: copier les chemins en variables d'environnement
-                self.log(f"  Chemins CIC: {self.cic_dir}", "INFO")
         
         return True
     
     def run_consolidata(self):
-        """Lancer consolidateddata_CORRECTED.py"""
+        """Lancer consolidation"""
         self.log("\nÉTAPE 1: CONSOLIDATION DATASET", "HEADER")
         
         if not os.path.exists('consolidateddata_CORRECTED.py'):
@@ -150,22 +129,15 @@ class LauncherDDoS:
         
         self.log("Lancement consolidateddata_CORRECTED.py", "INFO")
         self.log("  - Fusion TON_IoT + CIC", "INFO")
-        self.log("  - Split 60/40 scientifique (IEEE)", "INFO")
+        self.log("  - Split 60/40 scientifique", "INFO")
         self.log("  - Durée estimée: 10-40 minutes", "INFO")
         
         try:
-            # Lancer le script avec chemins absolus
-            env = os.environ.copy()
-            env['TONIOT_PATH'] = self.toniot_dir
-            env['CIC_PATH'] = self.cic_dir
-            env['MASTER_PATH'] = self.master_dir
-            
             result = subprocess.run(
                 [sys.executable, 'consolidateddata_CORRECTED.py'],
-                capture_output=False,  # Afficher la sortie en direct
+                capture_output=False,
                 text=True,
-                timeout=7200,  # 2 heures max
-                env=env
+                timeout=7200
             )
             
             if result.returncode != 0:
@@ -199,55 +171,51 @@ class LauncherDDoS:
             return False
     
     def run_cv_optimi(self):
-        """Lancer cv_optimi_FINAL.py"""
-        self.log("\nÉTAPE 2: CV OPTIMIZATION", "HEADER")
+        """Lancer CV Optimization"""
+        self.log("\nÉTAPE 2: CV OPTIMIZATION V3", "HEADER")
         
-        if not os.path.exists('cv_optimi_FINAL.py'):
-            self.log("❌ cv_optimi_FINAL.py manquant", "ERROR")
+        if not os.path.exists('cv_optimization_v3.py'):
+            self.log("❌ cv_optimization_v3.py manquant", "ERROR")
             return False
         
         if not os.path.exists('fusion_train_smart4.csv'):
-            self.log("❌ fusion_train_smart4.csv manquant - lancez consolidata d'abord", "ERROR")
+            self.log("❌ fusion_train_smart4.csv manquant", "ERROR")
             return False
         
-        self.log("Lancement cv_optimi_FINAL.py", "INFO")
-        self.log("  - FIX 1: StratifiedShuffleSplit", "INFO")
-        self.log("  - FIX 2: Decision Tree max 80%", "INFO")
-        self.log("  - Durée estimée: 1-6 heures", "INFO")
+        self.log("Lancement cv_optimization_v3.py", "INFO")
+        self.log("  - Grid Search hyperparamètres", "INFO")
+        self.log("  - Graphiques scrollables", "INFO")
+        self.log("  - Durée estimée: 2-10 heures", "INFO")
         
         try:
             result = subprocess.run(
-                [sys.executable, 'cv_optimi_FINAL.py'],
+                [sys.executable, 'cv_optimization_v3.py'],
                 capture_output=False,
                 text=True,
-                timeout=21600,  # 6 heures max
+                timeout=36000
             )
             
             if result.returncode != 0:
                 self.log("⚠️  cv_optimi terminée avec avertissements", "WARNING")
-                return True  # Continuer même en cas d'erreur
+                return True
             
-            # Vérifier fichiers créés
             if os.path.exists('cv_results_summary.txt'):
                 self.log("  ✅ Créé: cv_results_summary.txt", "OK")
                 self.results['cv_results_summary.txt'] = "OK"
             
-            if os.path.exists('cv_optimal_splits.json'):
-                self.log("  ✅ Créé: cv_optimal_splits.json", "OK")
-                self.results['cv_optimal_splits.json'] = "OK"
-            
             return True
         
-        except subprocess.TimeoutExpired:
-            self.log("⚠️  Timeout (>6 heures) - peut continuer", "WARNING")
-            return True
         except Exception as e:
             self.log(f"⚠️  Erreur: {e}", "WARNING")
-            return True  # Continuer
+            return True
     
     def generate_summary(self):
-        """Générer rapport final"""
+        """Génère rapport final"""
         self.log("\nRAPPORT FINAL", "HEADER")
+        
+        duration = datetime.now() - self.start_time
+        hours = int(duration.total_seconds() // 3600)
+        minutes = int((duration.total_seconds() % 3600) // 60)
         
         summary = f"""
 {'='*80}
@@ -255,18 +223,13 @@ DDoS DETECTION PIPELINE - RAPPORT D'EXÉCUTION
 {'='*80}
 
 Date:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Durée:     {(datetime.now() - self.start_time).total_seconds() / 60:.1f} minutes
+Durée:     {hours}h {minutes}m
 
 Structure:
   Répertoire master:  {self.master_dir}
   Répertoire Python:  {self.python_dir}
   Dossier CIC:        {self.cic_dir}
   Dossier TONIOT:     {self.toniot_dir}
-
-Étapes complétées:
-  ✅ Vérification structure
-  ✅ Consolidation dataset
-  ✅ CV Optimization
 
 Fichiers générés:
 """
@@ -285,37 +248,35 @@ Fichiers générés:
         
         summary += f"""
 {'='*80}
-PROCHAINES ÉTAPES
+NEXT STEPS
 {'='*80}
 
 1. Consulter les résultats:
-   - Ouvrir: cv_results_summary.txt
-   - Ouvrir: cv_optimal_splits.json
+   - cv_results_summary.txt
+   - evaluation_results_summary.txt (si ML Eval lancé)
 
-2. Analyser les métriques:
-   - F1 Score, Recall, Precision
-   - Configuration optimale pour chaque modèle
+2. Analyser les graphiques:
+   - test_dt_splits.png
+   - graph_eval_*.png
 
-3. Entraîner modèle final:
-   - Utiliser la configuration optimale trouvée
-   - Modèle Decision Tree recommandé
+3. Pour production:
+   - ddos_detector_final.pkl
+   - ddos_predictions_test_holdout.csv
 
 {'='*80}
 Logs: {self.log_file}
-Résultats: {os.getcwd()}
 {'='*80}
 """
         
         print(summary)
         
-        # Sauvegarder résumé
         with open('PIPELINE_SUMMARY.txt', 'w', encoding='utf-8') as f:
             f.write(summary)
         
         self.log("Résumé sauvegardé: PIPELINE_SUMMARY.txt", "OK")
     
     def run(self):
-        """Exécuter la pipeline complète"""
+        """Exécute pipeline"""
         self.log("DÉMARRAGE PIPELINE DDoS DETECTION", "HEADER")
         
         if not self.verify_structure():
@@ -323,19 +284,16 @@ Résultats: {os.getcwd()}
             return False
         
         if not self.setup_working_directory():
-            self.log("❌ Préparation répertoire échouée", "ERROR")
+            self.log("❌ Préparation échouée", "ERROR")
             return False
         
-        # Étape 1: Consolidation
         if not self.run_consolidata():
             self.log("⚠️  Consolidation échouée, arrêt", "WARNING")
             return False
         
-        # Étape 2: CV Optimization
         if not self.run_cv_optimi():
             self.log("⚠️  CV Optimization échouée", "WARNING")
         
-        # Rapport final
         self.generate_summary()
         
         self.log("\n✅ PIPELINE COMPLÉTÉE AVEC SUCCÈS", "OK")
@@ -343,9 +301,9 @@ Résultats: {os.getcwd()}
 
 
 def main():
-    """Point d'entrée principal"""
+    """Point d'entrée"""
     print("\n" + "="*80)
-    print("DDoS DETECTION PIPELINE - LAUNCHER SIMPLIFIÉ")
+    print("DDoS DETECTION PIPELINE - ORCHESTRATOR")
     print("="*80 + "\n")
     
     launcher = LauncherDDoS()

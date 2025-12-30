@@ -1,408 +1,319 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Generic progress GUI (Tkinter) - Réutilisable pour tous les scripts
-
-Objectif: Interface unifiée pour ML/CV/DT scripts sans réécrire UI à chaque fois
-
-OPTIMISATIONS INTÉGRÉES:
-  ✓ Multithreading avec max_workers configurable
-  ✓ Monitoring RAM/CPU en temps réel (psutil)
-  ✓ Barre de progression globale + étapes + tâches parallèles
-  ✓ Logs détaillés avec timestamps
-  ✓ Alertes avec couleurs (error/warning/success)
-  ✓ ETA automatique
-  ✓ Scrollable containers pour fichiers/workers
-
-UTILISATION:
-    from progress_gui import GenericProgressGUI
-    ui = GenericProgressGUI(title="Mon Job", header_info="Dataset XYZ", max_workers=8)
-    ui.add_stage("step1", "Lecture")
-    ui.add_stage("step2", "Traitement")
-    
-    def worker():
-        ui.update_global(0, 100, "Lecture...", eta=360)
-        ui.update_stage("step1", 50, 100, "Mi-parcours")
-        ui.update_file_progress("fileA.csv", 30, "Chunk 3/10")
-        ui.log("Message détaillé", level="INFO")
-        ui.log_alert("Petite alerte", level="warning")
-    
-    threading.Thread(target=worker, daemon=True).start()
-    ui.start()  # bloque sur mainloop
+PROGRESS GUI - Interface Tkinter Générique
+==========================================
+✅ Interface réutilisable pour tous les scripts
+✅ Progress bars, logs, stats
+✅ Support multi-threading
+==========================================
 """
-
-import threading
-import time
-from collections import deque
-from datetime import timedelta
-
-try:
-    import psutil
-except ImportError:
-    psutil = None
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-
-
-def _fmt_eta(seconds):
-    """Formatter un ETA lisible."""
-    try:
-        return str(timedelta(seconds=int(seconds)))
-    except Exception:
-        return "--:--"
+import threading
+import time
+from datetime import datetime, timedelta
 
 
 class GenericProgressGUI:
-    """
-    Interface générique pour tasks ML/CV/DT avec:
-    - Monitoring RAM/CPU
-    - Multithreading avec progress bars parallèles
-    - Logs verbeux + alertes
-    - ETA automatique
-    """
+    """Interface GUI générique et réutilisable"""
     
-    def __init__(self, title="Task Monitor", header_info="", max_workers=4, show_monitoring=True):
+    def __init__(self, title="Processing", header_info="", max_workers=4):
+        self.title = title
+        self.header_info = header_info
+        self.max_workers = max_workers
+        
         self.root = tk.Tk()
         self.root.title(title)
-        self.root.geometry("1200x800")
-        self.root.configure(bg="#f0f0f0")
-
-        self.max_workers = max_workers
-        self.progress_blocks = {}
-        self.file_progress_widgets = {}
-        self.file_progress_order = deque()
-        self.max_file_bars = max_workers
-        self.logs = deque(maxlen=500)
-        self.alerts = deque(maxlen=200)
-        self.show_monitoring = show_monitoring
-
-        self._build_ui(header_info)
-        if show_monitoring:
-            self._schedule_stats()
-
-    # ================================================================== UI
-    def _build_ui(self, header_info):
-        """Construire l'interface complète."""
+        self.root.geometry('1400x800')
+        self.root.configure(bg='#f0f0f0')
+        
+        self.stages = {}
+        self.file_progress = {}
+        self.global_progress = {'current': 0, 'total': 0, 'status': ''}
+        self.start_time = None
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Setup interface"""
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
-
-        # HEADER
-        header = tk.Frame(self.root, bg="#2c3e50", height=60)
-        header.grid(row=0, column=0, sticky="ew")
-        tk.Label(header, text=self.root.title(),
-                 font=("Arial", 14, "bold"), fg="white", bg="#2c3e50").pack(side=tk.LEFT, padx=20, pady=15)
-        tk.Label(header, text=header_info,
-                 font=("Arial", 9), fg="#bdc3c7", bg="#2c3e50").pack(side=tk.LEFT, padx=20)
-
-        # MAIN CONTAINER
-        container = tk.Frame(self.root, bg="#f0f0f0")
-        container.grid(row=1, column=0, sticky="nsew")
+        
+        # Header
+        header = tk.Frame(self.root, bg='#2c3e50', height=60)
+        header.grid(row=0, column=0, sticky='ew')
+        
+        tk.Label(header, text=self.title, 
+                font=('Arial', 14, 'bold'), fg='white', bg='#2c3e50').pack(side=tk.LEFT, padx=20, pady=15)
+        
+        if self.header_info:
+            tk.Label(header, text=self.header_info,
+                    font=('Arial', 10), fg='#bdc3c7', bg='#2c3e50').pack(side=tk.RIGHT, padx=20, pady=15)
+        
+        # Main container
+        container = tk.Frame(self.root, bg='#f0f0f0')
+        container.grid(row=1, column=0, sticky='nsew', padx=10, pady=10)
         container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
-
-        canvas = tk.Canvas(container, bg="#f0f0f0", highlightthickness=0)
-        canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        vscroll.grid(row=0, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=vscroll.set)
-
-        main = tk.Frame(canvas, bg="#f0f0f0")
-        win_id = canvas.create_window((0, 0), window=main, anchor="nw")
-
-        def _on_frame_config(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        main.bind("<Configure>", _on_frame_config)
-
-        def _on_canvas_config(event):
-            try:
-                canvas.itemconfigure(win_id, width=event.width)
-            except Exception:
-                pass
-        canvas.bind("<Configure>", _on_canvas_config)
-
-        # Layout: progress grid + logs
-        main.rowconfigure(0, weight=3)
-        main.rowconfigure(1, weight=2)
-        main.columnconfigure(0, weight=1)
-
-        progress_grid = tk.Frame(main, bg="#f0f0f0")
-        progress_grid.grid(row=0, column=0, sticky="nsew")
-        progress_grid.columnconfigure(0, weight=1)
-        progress_grid.columnconfigure(1, weight=1)
-
-        # --- GLOBAL PROGRESS ---
-        global_frame = tk.LabelFrame(progress_grid, text="Avancement global",
-                                     font=("Arial", 10, "bold"),
-                                     bg="white", relief=tk.SUNKEN, bd=2)
-        global_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        self.global_label = tk.Label(global_frame, text="Prêt", font=("Arial", 9), bg="white")
-        self.global_label.pack(fill=tk.X, padx=8, pady=(6, 2))
-        self.global_bar = ttk.Progressbar(global_frame, mode="determinate", maximum=100)
-        self.global_bar.pack(fill=tk.X, padx=8, pady=2)
-        self.global_details = tk.Label(global_frame, text="", font=("Arial", 8), bg="white", fg="#666")
-        self.global_details.pack(fill=tk.X, padx=8, pady=2)
-        self.global_eta = tk.Label(global_frame, text="ETA: --:--", font=("Arial", 8), bg="white", fg="#666")
-        self.global_eta.pack(fill=tk.X, padx=8, pady=(0, 6))
-
-        # --- LEFT: STAGES ---
-        self.stages_frame = tk.LabelFrame(progress_grid, text="Étapes",
-                                          font=("Arial", 10, "bold"),
-                                          bg="white", relief=tk.SUNKEN, bd=2)
-        self.stages_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=2)
-        self.stages_frame.columnconfigure(0, weight=1)
-
-        # --- RIGHT: PARALLEL TASKS + MONITORING ---
-        right_frame = tk.LabelFrame(progress_grid, text="Tâches parallèles",
-                                    font=("Arial", 10, "bold"),
-                                    bg="white", relief=tk.SUNKEN, bd=2)
-        right_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=2)
+        container.columnconfigure(0, weight=3)
+        container.columnconfigure(1, weight=1)
+        
+        # Left: Logs
+        left_frame = tk.LabelFrame(container, text='LOGS', font=('Arial', 10, 'bold'),
+                                   bg='white', relief=tk.SUNKEN, bd=2)
+        left_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 8), pady=0)
+        left_frame.rowconfigure(0, weight=1)
+        left_frame.columnconfigure(0, weight=1)
+        
+        self.log_text = scrolledtext.ScrolledText(left_frame, font=('Courier', 8),
+                                                  bg='#1a1a1a', fg='#00ff00', wrap=tk.WORD)
+        self.log_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        
+        # Right: Stats
+        right_frame = tk.Frame(container, bg='#f0f0f0')
+        right_frame.grid(row=0, column=1, sticky='nsew', padx=(8, 0), pady=0)
+        right_frame.rowconfigure(6, weight=1)
         right_frame.columnconfigure(0, weight=1)
-        right_frame.rowconfigure(2, weight=1)
-
-        tk.Label(right_frame, text="Threads/fichiers actifs (scrollable)",
-                 font=("Arial", 8), bg="white", fg="#333").grid(row=1, column=0, sticky="w", padx=8)
-
-        files_container = tk.Frame(right_frame, bg="white")
-        files_container.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        files_container.columnconfigure(0, weight=1)
-        files_container.rowconfigure(0, weight=1)
-
-        self.files_canvas = tk.Canvas(files_container, bg="white", highlightthickness=0)
-        self.files_canvas.grid(row=0, column=0, sticky="nsew")
-        file_scroll = ttk.Scrollbar(files_container, orient="vertical", command=self.files_canvas.yview)
-        file_scroll.grid(row=0, column=1, sticky="ns")
-        self.files_canvas.configure(yscrollcommand=file_scroll.set)
-        self.file_progress_container = tk.Frame(self.files_canvas, bg="white")
-        win_file = self.files_canvas.create_window((0, 0), window=self.file_progress_container, anchor="nw")
-
-        def _on_files_config(event):
-            self.files_canvas.configure(scrollregion=self.files_canvas.bbox("all"))
-        self.file_progress_container.bind("<Configure>", _on_files_config)
-
-        def _on_files_canvas(event):
-            try:
-                self.files_canvas.itemconfigure(win_file, width=event.width)
-            except Exception:
-                pass
-        self.files_canvas.bind("<Configure>", _on_files_canvas)
-
-        # --- MONITORING & ALERTS ---
-        monitor_frame = tk.LabelFrame(progress_grid, text="Monitoring & Alertes",
-                                      font=("Arial", 10, "bold"),
-                                      bg="white", relief=tk.SUNKEN, bd=2)
-        monitor_frame.grid(row=2, column=1, sticky="nsew", padx=(6, 0), pady=2)
-        monitor_frame.columnconfigure(0, weight=1)
-        monitor_frame.rowconfigure(2, weight=1)
-
-        self.ram_label = tk.Label(monitor_frame, text="RAM: --", font=("Arial", 9), bg="white")
-        self.ram_label.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
-        self.ram_progress = ttk.Progressbar(monitor_frame, mode="determinate", maximum=100)
-        self.ram_progress.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
-
-        self.cpu_label = tk.Label(monitor_frame, text="CPU: --", font=("Arial", 9), bg="white")
-        self.cpu_label.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 2))
-        self.cpu_progress = ttk.Progressbar(monitor_frame, mode="determinate", maximum=100)
-        self.cpu_progress.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
-
-        self.alerts_text = scrolledtext.ScrolledText(monitor_frame, height=6,
-                                                     font=("Courier", 8),
-                                                     bg="#f8f8f8", fg="#333")
-        self.alerts_text.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        self.alerts_text.tag_config("error", foreground="#d32f2f", font=("Courier", 8, "bold"))
-        self.alerts_text.tag_config("warning", foreground="#f57f17")
-        self.alerts_text.tag_config("success", foreground="#388e3c")
-
-        # --- LOGS ---
-        logs_frame = tk.LabelFrame(main, text="Logs détaillés (verbose)",
-                                   font=("Arial", 10, "bold"),
-                                   bg="white", relief=tk.SUNKEN, bd=2)
-        logs_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        logs_frame.rowconfigure(0, weight=1)
-        logs_frame.columnconfigure(0, weight=1)
-        self.logs_text = scrolledtext.ScrolledText(logs_frame,
-                                                   font=("Courier", 9),
-                                                   bg="#1e1e1e", fg="#00ff00")
-        self.logs_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-
-    # ================================================================== helpers
-    @staticmethod
-    def _pct(current, total):
-        """Calculer pourcentage."""
+        
+        # Global progress
+        global_frame = tk.LabelFrame(right_frame, text='GLOBAL', font=('Arial', 9, 'bold'),
+                                     bg='white', relief=tk.SUNKEN, bd=2)
+        global_frame.grid(row=0, column=0, sticky='ew', padx=0, pady=(0, 5))
+        global_frame.columnconfigure(0, weight=1)
+        
+        self.global_label = tk.Label(global_frame, text='0%', font=('Arial', 12, 'bold'),
+                                    bg='white', fg='#3498db')
+        self.global_label.pack(fill=tk.X, padx=8, pady=3)
+        
+        self.global_progress_bar = ttk.Progressbar(global_frame, mode='determinate', maximum=100)
+        self.global_progress_bar.pack(fill=tk.X, padx=8, pady=3)
+        
+        # Stages
+        stages_frame = tk.LabelFrame(right_frame, text='STAGES', font=('Arial', 9, 'bold'),
+                                     bg='white', relief=tk.SUNKEN, bd=2)
+        stages_frame.grid(row=1, column=0, sticky='ew', padx=0, pady=(0, 5))
+        stages_frame.columnconfigure(0, weight=1)
+        stages_frame.rowconfigure(0, weight=1)
+        
+        self.stages_text = scrolledtext.ScrolledText(stages_frame, height=8, font=('Courier', 8),
+                                                     bg='#f8f8f8', fg='#333')
+        self.stages_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        
+        # Time
+        time_frame = tk.LabelFrame(right_frame, text='TIME', font=('Arial', 9, 'bold'),
+                                   bg='white', relief=tk.SUNKEN, bd=2)
+        time_frame.grid(row=2, column=0, sticky='ew', padx=0, pady=(0, 5))
+        
+        self.elapsed_label = tk.Label(time_frame, text='00:00:00', font=('Arial', 10, 'bold'),
+                                     bg='white', fg='#9b59b6')
+        self.elapsed_label.pack(fill=tk.X, padx=8, pady=3)
+        
+        self.eta_label = tk.Label(time_frame, text='ETA: --:--:--', font=('Arial', 9),
+                                 bg='white', fg='#7f8c8d')
+        self.eta_label.pack(fill=tk.X, padx=8, pady=3)
+        
+        # Alerts
+        alerts_frame = tk.LabelFrame(right_frame, text='ALERTS', font=('Arial', 9, 'bold'),
+                                     bg='white', relief=tk.SUNKEN, bd=2)
+        alerts_frame.grid(row=3, column=0, sticky='ew', padx=0, pady=(0, 5))
+        alerts_frame.columnconfigure(0, weight=1)
+        
+        self.alert_label = tk.Label(alerts_frame, text='Ready', font=('Arial', 10, 'bold'),
+                                   bg='white', fg='#27ae60')
+        self.alert_label.pack(fill=tk.X, padx=8, pady=5)
+        
+        # File progress
+        file_frame = tk.LabelFrame(right_frame, text='FILES', font=('Arial', 9, 'bold'),
+                                   bg='white', relief=tk.SUNKEN, bd=2)
+        file_frame.grid(row=4, column=0, sticky='ew', padx=0, pady=(0, 5))
+        file_frame.columnconfigure(0, weight=1)
+        file_frame.rowconfigure(0, weight=1)
+        
+        self.file_text = scrolledtext.ScrolledText(file_frame, height=5, font=('Courier', 8),
+                                                   bg='#f8f8f8', fg='#333')
+        self.file_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        
+        # Status bar
+        footer = tk.Frame(self.root, bg='#ecf0f1', height=40)
+        footer.grid(row=2, column=0, sticky='ew')
+        
+        self.status_label = tk.Label(footer, text='Ready',
+                                    font=('Arial', 9, 'bold'),
+                                    fg='#27ae60', bg='#ecf0f1')
+        self.status_label.pack(side=tk.RIGHT, padx=20, pady=10)
+    
+    def add_stage(self, stage_id, label):
+        """Ajoute une étape"""
+        self.stages[stage_id] = {
+            'label': label,
+            'current': 0,
+            'total': 1,
+            'status': ''
+        }
+        self.update_stages_display()
+    
+    def update_stage(self, stage_id, current, total, status=''):
+        """Met à jour une étape"""
+        if stage_id in self.stages:
+            self.stages[stage_id]['current'] = current
+            self.stages[stage_id]['total'] = total
+            self.stages[stage_id]['status'] = status
+            self.update_stages_display()
+    
+    def update_stages_display(self):
+        """Affiche toutes les étapes"""
         try:
-            if total <= 0:
-                return 0
-            return max(0, min(100, int((current / total) * 100)))
-        except Exception:
-            return 0
-
-    def _make_block(self, parent, title):
-        """Créer un block progress stage."""
-        frame = tk.Frame(parent, bg="white")
-        frame.grid_columnconfigure(0, weight=1)
-        label = tk.Label(frame, text=title, font=("Arial", 9, "bold"), bg="white", fg="#2c3e50")
-        label.grid(row=0, column=0, sticky="w", padx=8, pady=(6, 2))
-        bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
-        bar.grid(row=1, column=0, sticky="ew", padx=8, pady=2)
-        detail = tk.Label(frame, text="", font=("Arial", 8), bg="white", fg="#666")
-        detail.grid(row=2, column=0, sticky="w", padx=8, pady=(0, 6))
-        return {"frame": frame, "label": label, "bar": bar, "detail": detail}
-
-    # ================================================================== public API
-    def add_stage(self, key, title):
-        """Ajouter une étape."""
-        if key in self.progress_blocks:
-            return
-        block = self._make_block(self.stages_frame, title)
-        row = len(self.progress_blocks)
-        block["frame"].grid(row=row, column=0, sticky="ew", padx=6, pady=4)
-        self.progress_blocks[key] = block
-
-    def update_stage(self, key, current, total, msg="", eta=None):
-        """Mettre à jour une étape."""
-        block = self.progress_blocks.get(key)
-        if not block:
-            return
-        pct = self._pct(current, total)
-        details = f"{current}/{total}" if total else f"{current}"
-        if pct:
-            details += f" ({pct}%)"
-        if eta is not None:
-            details += f" | ETA {_fmt_eta(eta)}"
-        def _apply():
-            block["label"].config(text=msg or block["label"].cget("text"))
-            block["bar"]["value"] = pct
-            block["detail"].config(text=details)
-        self.root.after(0, _apply)
-
-    def update_global(self, current, total, msg="", eta=None):
-        """Mettre à jour progress global."""
-        pct = self._pct(current, total)
-        details = f"{current}/{total}" if total else f"{current}"
-        if pct:
-            details += f" ({pct}%)"
-        def _apply():
-            self.global_bar["value"] = pct
-            self.global_label.config(text=msg)
-            self.global_details.config(text=details)
-            self.global_eta.config(text=f"ETA: {_fmt_eta(eta)}" if eta is not None else "ETA: --:--")
-        self.root.after(0, _apply)
-
-    def _ensure_file_widget(self, name):
-        """Assurer qu'un widget fichier existe."""
-        if name in self.file_progress_widgets:
-            return self.file_progress_widgets[name]
-        if len(self.file_progress_order) >= self.max_file_bars:
-            oldest = self.file_progress_order.popleft()
-            widget = self.file_progress_widgets.pop(oldest, None)
-            if widget:
-                widget["frame"].destroy()
-        frame = tk.Frame(self.file_progress_container, bg="white", bd=1, relief=tk.SOLID)
-        frame.pack(fill=tk.X, pady=2, padx=2)
-        title = tk.Label(frame, text=name, font=("Arial", 8, "bold"), bg="white", anchor="w")
-        title.pack(fill=tk.X, padx=6, pady=(4, 0))
-        bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
-        bar.pack(fill=tk.X, padx=6, pady=2)
-        status = tk.Label(frame, text="En attente", font=("Arial", 8), bg="white", fg="#666", anchor="w")
-        status.pack(fill=tk.X, padx=6, pady=(0, 4))
-        widget = {"frame": frame, "bar": bar, "status": status}
-        self.file_progress_widgets[name] = widget
-        self.file_progress_order.append(name)
-        return widget
-
-    def reset_file_progress(self):
-        """Réinitialiser tous les widgets fichiers."""
-        for widget in self.file_progress_widgets.values():
-            try:
-                widget["frame"].destroy()
-            except Exception:
-                pass
-        self.file_progress_widgets.clear()
-        self.file_progress_order.clear()
-        try:
-            self.files_canvas.yview_moveto(0)
-        except Exception:
+            self.stages_text.config(state=tk.NORMAL)
+            self.stages_text.delete(1.0, tk.END)
+            
+            for stage_id, data in self.stages.items():
+                current = data['current']
+                total = data['total']
+                pct = (current / total * 100) if total > 0 else 0
+                bar_width = 20
+                filled = int(bar_width * pct / 100)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                
+                line = f"{data['label']}\n"
+                line += f"[{bar}] {pct:5.1f}% ({current}/{total})\n"
+                if data['status']:
+                    line += f"→ {data['status']}\n"
+                line += "\n"
+                
+                self.stages_text.insert(tk.END, line)
+            
+            self.stages_text.config(state=tk.DISABLED)
+            self.root.update_idletasks()
+        except:
             pass
-
-    def update_file_progress(self, name, percent, status):
-        """Mettre à jour progress d'un fichier/thread."""
-        def _apply():
-            widget = self._ensure_file_widget(name)
-            widget["bar"]["value"] = max(0, min(100, percent))
-            widget["status"].config(text=status)
-        self.root.after(0, _apply)
-
+    
+    def update_global(self, current, total, status=''):
+        """Met à jour progress global"""
+        try:
+            self.global_progress['current'] = current
+            self.global_progress['total'] = total
+            self.global_progress['status'] = status
+            
+            pct = (current / total * 100) if total > 0 else 0
+            self.global_label.config(text=f'{pct:.1f}%')
+            self.global_progress_bar['value'] = pct
+            
+            self.root.update_idletasks()
+        except:
+            pass
+    
+    def update_file_progress(self, filename, pct, status=''):
+        """Met à jour progress fichier"""
+        try:
+            self.file_progress[filename] = {'pct': pct, 'status': status}
+            
+            self.file_text.config(state=tk.NORMAL)
+            self.file_text.delete(1.0, tk.END)
+            
+            for fname, data in self.file_progress.items():
+                bar_width = 20
+                filled = int(bar_width * data['pct'] / 100)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                
+                line = f"{fname}\n"
+                line += f"[{bar}] {data['pct']:3.0f}%\n"
+                if data['status']:
+                    line += f"→ {data['status']}\n"
+                line += "\n"
+                
+                self.file_text.insert(tk.END, line)
+            
+            self.file_text.config(state=tk.DISABLED)
+            self.root.update_idletasks()
+        except:
+            pass
+    
     def log(self, msg, level="INFO"):
-        """Ajouter un log avec timestamp."""
-        ts = time.strftime("%H:%M:%S")
-        icons = {"INFO": "[info]", "OK": "[ok]", "ERROR": "[err]", "WARNING": "[warn]", "PROGRESS": "[..]"}
-        icon = icons.get(level, ">")
-        formatted = f"{icon} [{ts}] {msg}"
-        self.logs.append(formatted)
-        def _apply():
-            self.logs_text.insert(tk.END, formatted + "\n")
-            self.logs_text.see(tk.END)
-        self.root.after(0, _apply)
-
-    def log_alert(self, msg, level="warning"):
-        """Ajouter une alerte."""
-        self.alerts.append(msg)
-        def _apply():
-            self.alerts_text.insert(tk.END, f"{msg}\n", level)
-            self.alerts_text.see(tk.END)
-        self.root.after(0, _apply)
-
-    # ================================================================== monitoring
-    def _schedule_stats(self):
-        """Scheduler le monitoring RAM/CPU."""
-        def tick():
-            self._update_stats_auto()
-            self.root.after(500, tick)
-        self.root.after(500, tick)
-
-    def _update_stats_auto(self):
-        """Mettre à jour stats auto (psutil)."""
-        if not psutil:
-            return
+        """Ajoute log"""
         try:
-            ram_pct = psutil.virtual_memory().percent
-            cpu_pct = psutil.cpu_percent(interval=None)
-            self.update_stats_now(cpu_pct, ram_pct)
-        except Exception:
+            ts = datetime.now().strftime("%H:%M:%S")
+            log_line = f"[{ts}] [{level:<6}] {msg}\n"
+            
+            self.log_text.insert(tk.END, log_line)
+            self.log_text.see(tk.END)
+            self.root.update_idletasks()
+        except:
             pass
-
-    def update_stats_now(self, cpu=None, ram=None):
-        """Mettre à jour stats manuellement."""
-        def _apply():
-            if ram is not None:
-                self.ram_label.config(text=f"RAM: {ram:.1f}%")
-                self.ram_progress["value"] = max(0, min(100, ram))
-            if cpu is not None:
-                self.cpu_label.config(text=f"CPU: {cpu:.1f}%")
-                self.cpu_progress["value"] = max(0, min(100, cpu))
-        self.root.after(0, _apply)
-
-    # ================================================================== lifecycle
+    
+    def log_alert(self, msg, level="info"):
+        """Alert"""
+        try:
+            colors = {
+                'success': '#27ae60',
+                'error': '#e74c3c',
+                'warning': '#f39c12',
+                'info': '#3498db'
+            }
+            color = colors.get(level, '#3498db')
+            
+            self.alert_label.config(text=msg, fg=color)
+            
+            self.log(msg, level=level.upper())
+            self.root.update_idletasks()
+        except:
+            pass
+    
+    def update_time(self):
+        """Met à jour temps"""
+        try:
+            if self.start_time:
+                elapsed = time.time() - self.start_time
+                hrs = int(elapsed // 3600)
+                mins = int((elapsed % 3600) // 60)
+                secs = int(elapsed % 60)
+                
+                self.elapsed_label.config(text=f"{hrs:02d}:{mins:02d}:{secs:02d}")
+                
+                # ETA
+                if self.global_progress['current'] > 0 and self.global_progress['total'] > 0:
+                    avg_time = elapsed / self.global_progress['current']
+                    remaining = avg_time * (self.global_progress['total'] - self.global_progress['current'])
+                    eta = datetime.now() + timedelta(seconds=remaining)
+                    self.eta_label.config(text=f"ETA: {eta.strftime('%H:%M:%S')}")
+            
+            self.root.after(500, self.update_time)
+        except:
+            self.root.after(500, self.update_time)
+    
     def start(self):
-        """Lancer la boucle Tkinter (bloque)."""
+        """Démarre GUI"""
+        self.start_time = time.time()
+        self.update_time()
         self.root.mainloop()
+    
+    def stop(self):
+        """Arrête GUI"""
+        try:
+            self.root.quit()
+        except:
+            pass
 
 
 if __name__ == "__main__":
-    # Petite démo
-    import time as _time
-    ui = GenericProgressGUI(title="Demo Progress", header_info="Exemple générique", max_workers=5)
-    ui.add_stage("stage1", "Étape 1")
-    ui.add_stage("stage2", "Étape 2")
-
-    def demo_worker():
-        for i in range(0, 101, 5):
-            ui.update_global(i, 100, "Avancement général", eta=200 - 2 * i)
-            ui.update_stage("stage1", i, 100, f"Step1 {i}%", eta=150 - i)
-            ui.update_stage("stage2", i // 2, 50, f"Step2 {i//2}/50", eta=100 - i)
-            ui.update_file_progress(f"tâche-{i%3}", i % 100, f"Progress {i}%")
-            ui.log(f"Log {i}", level="INFO")
-            _time.sleep(0.2)
-        ui.log_alert("Démo terminée", level="success")
+    # Test
+    gui = GenericProgressGUI(title="Test Progress GUI", header_info="Demo")
     
-    threading.Thread(target=demo_worker, daemon=True).start()
-    ui.start()
+    gui.add_stage("stage1", "Stage 1: Data Loading")
+    gui.add_stage("stage2", "Stage 2: Processing")
+    gui.add_stage("stage3", "Stage 3: Output")
+    
+    gui.log("Starting test...", level="INFO")
+    gui.log_alert("Test started", level="success")
+    
+    def demo():
+        for i in range(11):
+            gui.update_stage("stage1", i, 10, f"Loading {i}/10")
+            gui.update_global(i, 30, "Processing...")
+            gui.log(f"Progress: {i}/10", level="INFO")
+            time.sleep(0.5)
+        
+        gui.log_alert("Complete!", level="success")
+    
+    threading.Thread(target=demo, daemon=True).start()
+    gui.start()
