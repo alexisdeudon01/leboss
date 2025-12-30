@@ -109,7 +109,7 @@ class DDoSDetector:
 
 
 def run_with_gui():
-    ui = GenericProgressGUI(title="DDoS Detector", header_info="Production", max_workers=2)
+    ui = GenericProgressGUI(title="DDoS Detector", header_info="Production holdout", max_workers=2)
     detector = DDoSDetector(ui=ui)
 
     def worker():
@@ -120,17 +120,16 @@ def run_with_gui():
         ui.update_global(1, 3, "Modele charge")
         try:
             data = np.load('preprocessed_dataset.npz', allow_pickle=True)
-            X_test = data['X'][:100]
-            y_test = data['y'][:100]
-            ui.update_stage("load_data", len(X_test), len(X_test), "Donnees chargees")
-            ui.update_global(2, 3, "Donnees chargees")
+            X_train = data['X']
+            mean = X_train.mean(axis=0)
+            std = X_train.std(axis=0) + 1e-8
+            if not os.path.exists("fusion_test_smart4.csv"):
+                ui.log_alert("fusion_test_smart4.csv introuvable", level="error")
+                return
+            df_test = np.loadtxt("fusion_test_smart4.csv", delimiter=",", skiprows=1)
+            ui.update_stage("load_data", len(df_test), len(df_test), "Test chargé")
+            X_test = ((df_test[:, :-2] - mean) / std).astype(np.float32)
             results = detector.predict_batch(X_test)
-            correct = 0
-            for i, result in enumerate(results[:10]):
-                if (y_test[i] == 1 and result['prediction'] == 'DDoS') or \
-                   (y_test[i] == 0 and result['prediction'] == 'Normal'):
-                    correct += 1
-            ui.log(f"Precision sur 10 echantillons: {correct}/10", level="INFO")
             ui.update_global(3, 3, "Termine")
             ui.log_alert("Predictions terminees", level="success")
         except Exception as e:
@@ -141,37 +140,29 @@ def run_with_gui():
 
 
 def main():
-    if GenericProgressGUI and USE_GUI:
-        run_with_gui()
-        return
-
-    print("[INFO] DDoS Detector - Production")
+    print("[INFO] DDoS Detector - Production (test holdout)")
 
     detector = DDoSDetector()
     if not detector.load_model():
         return False
 
-    print("[OK] Modele pret pour les predictions")
+    if GenericProgressGUI and USE_GUI:
+        run_with_gui()
+        return
 
     try:
         data = np.load('preprocessed_dataset.npz', allow_pickle=True)
-        X_test = data['X'][:100]  # Premiers 100 echantillons
-        y_test = data['y'][:100]
+        X_train = data['X']
+        mean = X_train.mean(axis=0)
+        std = X_train.std(axis=0) + 1e-8
+        if not os.path.exists("fusion_test_smart4.csv"):
+            print("[ERROR] fusion_test_smart4.csv introuvable")
+            return
+        df_test = np.loadtxt("fusion_test_smart4.csv", delimiter=",", skiprows=1)
+        X_test = ((df_test[:, :-2] - mean) / std).astype(np.float32)
 
-        # Predire
         results = detector.predict_batch(X_test)
-
-        # Afficher resultats
-        correct = 0
-        for i, result in enumerate(results[:10]):
-            print(f"Sample {i}: Prediction={result['prediction']}, "
-                  f"Confidence={result['confidence']:.4f}")
-            if (y_test[i] == 1 and result['prediction'] == 'DDoS') or \
-               (y_test[i] == 0 and result['prediction'] == 'Normal'):
-                correct += 1
-
-        print(f"[OK] Precision sur premiers 10: {correct}/10")
-
+        print(f"[OK] Predictions sur test holdout: {len(results)} lignes")
     except Exception as e:
         print(f"[ERROR] Erreur test: {e}")
 

@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 ML EVALUATION V3 - PROGRESS GUI (fusion de l'adaptateur et du script principal)
 Pipeline:
   1) Chargement NPZ (preprocessed_dataset.npz ou tensor_data.npz)
-  2) Entraînement + KFold sur les modèles (LogReg, NB, DT, RF)
+  2) EntraÃ®nement + KFold sur les modÃ¨les (LogReg, NB, DT, RF)
   3) Rapports texte et graphiques
 UI: progress_gui.GenericProgressGUI (aucun flag, mode unique)
 """
@@ -42,13 +42,15 @@ class MLEvaluationRunner:
     def __init__(self, ui):
         self.ui = ui
         self.results = {}
-        self.X = None
-        self.y = None
+        self.X_train = None
+        self.y_train = None
+        self.X_test = None
+        self.y_test = None
         self._init_ui()
 
     def _init_ui(self):
-        self.ui.add_stage("load", "Chargement NPZ")
-        self.ui.add_stage("train", "Entraînement/KFold")
+        self.ui.add_stage("load", "Chargement train/test")
+        self.ui.add_stage("train", "EntraÃ®nement + Ã©valuation holdout")
         self.ui.add_stage("reports", "Rapports")
         self.ui.add_stage("graphs", "Graphiques")
 
@@ -60,11 +62,30 @@ class MLEvaluationRunner:
             return False
         t0 = time.time()
         data = np.load(npz_file, allow_pickle=True)
-        self.X = data["X"]
-        self.y = data["y"]
-        self.ui.log(f"[OK] NPZ {npz_file} chargé ({len(self.y):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
-        self.ui.update_stage("load", len(self.y), len(self.y), "NPZ chargé")
-        self.ui.update_global(1, 4, "NPZ chargé")
+        self.X_train = data["X"]
+        self.y_train = data["y"]
+        self.ui.log(f"[OK] Train NPZ {npz_file} chargÃ© ({len(self.y_train):,} Ã©chantillons) en {time.time()-t0:.1f}s", level="OK")
+
+        # Charger le test holdout
+        if not os.path.exists("fusion_test_smart4.csv"):
+            self.ui.log_alert("fusion_test_smart4.csv introuvable", level="error")
+            return False
+        df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False)
+        numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
+        X_test_raw = df_test[numeric_cols].astype(np.float32)
+        X_test_raw = X_test_raw.fillna(X_test_raw.mean())
+        if X_test_raw.shape[1] != self.X_train.shape[1]:
+            self.ui.log_alert(f"Mismatch features train/test: train {self.X_train.shape[1]} vs test {X_test_raw.shape[1]}", level="error")
+            return False
+        mean = self.X_train.mean(axis=0)
+        std = self.X_train.std(axis=0) + 1e-8
+        self.X_test = ((X_test_raw - mean) / std).astype(np.float32)
+        lbl = LabelEncoder()
+        self.y_test = lbl.fit_transform(df_test["Label"].astype(str))
+
+        self.ui.update_stage("load", len(self.X_train), len(self.X_train), "Train chargÃ©")
+        self.ui.update_stage("load", len(self.X_train)+len(self.X_test), len(self.X_train)+len(self.X_test), "Train/Test chargÃ©s")
+        self.ui.update_global(1, 4, f"Train {len(self.X_train):,} | Test {len(self.X_test):,}")
         return True
 
     def train_eval(self):
@@ -104,7 +125,7 @@ class MLEvaluationRunner:
                 "cm": cm_sum.tolist() if cm_sum is not None else [],
             }
             self.ui.update_stage("train", i, total, f"{name} F1={self.results[name]['f1']:.3f}")
-            self.ui.update_global(1 + i / total, 4, f"Modèle {i}/{total}")
+            self.ui.update_global(1 + i / total, 4, f"ModÃ¨le {i}/{total}")
         return True
 
     def save_reports(self):
@@ -114,11 +135,11 @@ class MLEvaluationRunner:
                 f.write("ML EVALUATION V3 - PROGRESS GUI\n")
                 f.write("=" * 100 + "\n\n")
                 for name, res in sorted(self.results.items(), key=lambda x: x[1]["f1"], reverse=True):
-                    f.write(f"{name:<25} F1={res['f1']:.4f}±{res['f1_std']:.4f} Recall={res['recall']:.4f} Precision={res['precision']:.4f}\n")
+                    f.write(f"{name:<25} F1={res['f1']:.4f}Â±{res['f1_std']:.4f} Recall={res['recall']:.4f} Precision={res['precision']:.4f}\n")
                 f.write("=" * 100 + "\n")
             self.ui.update_stage("reports", 1, 1, "Rapports OK")
             self.ui.update_global(3, 4, "Rapports")
-            self.ui.log("[OK] Rapports sauvegardés", level="OK")
+            self.ui.log("[OK] Rapports sauvegardÃ©s", level="OK")
         except Exception as e:
             self.ui.log_alert(f"Rapports: {e}", level="error")
 
@@ -143,8 +164,8 @@ class MLEvaluationRunner:
                 plt.savefig(fname, dpi=150, bbox_inches="tight")
                 plt.close()
             self.ui.update_stage("graphs", 1, 1, "Graphiques OK")
-            self.ui.update_global(4, 4, "Terminé")
-            self.ui.log("[OK] Graphiques générés", level="OK")
+            self.ui.update_global(4, 4, "TerminÃ©")
+            self.ui.log("[OK] Graphiques gÃ©nÃ©rÃ©s", level="OK")
         except Exception as e:
             self.ui.log_alert(f"Graphiques: {e}", level="error")
 
@@ -159,7 +180,7 @@ def main():
         runner.train_eval()
         runner.save_reports()
         runner.save_graphs()
-        ui.log_alert("Evaluation terminée", level="success")
+        ui.log_alert("Evaluation terminÃ©e", level="success")
 
     threading.Thread(target=job, daemon=True).start()
     ui.start()
@@ -167,3 +188,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

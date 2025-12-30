@@ -88,6 +88,8 @@ class DDoSDetectionOrchestrator:
             "evaluation_results_summary.txt",
             "FINAL_PROJECT_REPORT.txt",
             "cv_detailed_metrics.csv",
+            "fusion_train_smart4.csv",
+            "fusion_test_smart4.csv",
             
             # Standalone scripts
             "_cv_opt_standalone.py",
@@ -139,7 +141,7 @@ class DDoSDetectionOrchestrator:
         # 1. Verifier fichiers Python requis
         self.log("\n[1] Verification fichiers Python", "SUBHEADER")
         required_py_files = [
-            "orchestrator_master.py",
+            "consolidatedata.py",
             "cv_optimization_v3.py",
             "ml_evaluation_v3.py",
             "test_dt_splits.py",
@@ -164,9 +166,8 @@ class DDoSDetectionOrchestrator:
         # 2. Verifier fichiers Dataset
         self.log("\n[2] Verification fichiers Dataset", "SUBHEADER")
         csv_files = [
-            "fusion_ton_iot_cic_final_smart.csv",
-            "fusion_ton_iot_cic_final_smart4.csv",
-            "fusion_ton_iot_cic_final_smart3.csv"
+            "fusion_train_smart4.csv",
+            "fusion_test_smart4.csv",
         ]
         
         csv_found = False
