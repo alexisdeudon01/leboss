@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SCRIPT CONSOLIDATION DATASET - VERSION FINALE OPTIMISÉE
+SCRIPT CONSOLIDATION DATASET - VERSION FINALE OPTIMISÉE - CORRIGÉ
 
 AMÉLIORATIONS:
   ✓ Recherche RÉCURSIVE des fichiers CIC
@@ -11,6 +11,7 @@ AMÉLIORATIONS:
   ✓ Suppression automatique fichiers intermédiaires
   ✓ Monitoring CPU/RAM en temps réel
   ✓ Boutons DÉMARRER/ARRÊTER visibles
+  ✓ CORRECTION: Détection split par dossier parent (CSV-03-11/CSV-01-12)
 """
 
 import pandas as pd
@@ -711,20 +712,23 @@ class ConsolidatorGUI:
             self.log(f"[CIC] {filename}: {file_size_gb:.2f} GB | ~{est_rows:,} lignes estimees", 'INFO')
             self.update_file_progress(filename, 0, "Lecture en cours...")
 
-            # D?terminer split ? partir du chemin complet (y compris dossiers) pour g?rer les noms sans date
+            # ✅ CORRECT: Déterminer split à partir du dossier parent (CSV-03-11 = train, CSV-01-12 = test)
             split = 'unknown'
             try:
-                path_tokens = [p.lower() for p in Path(csv_file).parts]
-                joined = "_".join(path_tokens + [filename.lower()])
-                if 'test' in joined or '201812' in joined or 'dec' in joined:
-                    split = 'test'
-                elif 'train' in joined or '201811' in joined or 'nov' in joined:
-                    split = 'train'
+                parent_folder = os.path.basename(os.path.dirname(csv_file)).lower()
+                
+                if '01-12' in parent_folder:
+                    split = 'test'   # Décembre
+                elif '03-11' in parent_folder:
+                    split = 'train'  # Novembre
+                else:
+                    split = 'unknown'
             except Exception:
                 split = 'unknown'
+
             if split == 'unknown':
                 split = 'train'
-                self.log_alert(f"[CIC][{filename}] Split inconnu -> fallback TRAIN (attendu 201811/201812)", 'warning')
+                self.log_alert(f"[CIC][{filename}] Split inconnu -> fallback TRAIN (dossier parent attendu: CSV-03-11 ou CSV-01-12)", 'warning')
 
             chunk_size = max(20000, min(150000, self.ram.chunk_size // 3))
             chunks = []
@@ -1010,7 +1014,7 @@ class ConsolidatorGUI:
                                 else:
                                     self.cic_rows_total += rows
                                 cic_success += 1
-                                self.log(f"[CIC] {os.path.basename(csv_file)} -> {rows:,} lignes ecrites [{split}]", 'OK')
+                                self.log(f"[CIC] {os.path.basename(csv_file)} -> {rows:,} lignes ecrites [{split.upper()}]", 'OK')
                                 del df_res
                                 gc.collect()
                             else:
