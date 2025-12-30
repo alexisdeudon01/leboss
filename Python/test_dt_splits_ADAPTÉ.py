@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-TEST DECISION TREE SPLITS - DETECTION OVERFITTING
+TEST DECISION TREE SPLITS - ADAPTÉ
 ========================================
-Teste Decision Tree avec 6 tailles de test (5%, 10%, 15%, 20%, 25%, 50%)
-5 runs par taille = 30 évaluations
-Détecte si le modèle surfit les données
+✅ progress_gui OPTIONNEL (console fallback)
 ✅ CORRECTION: Utilise MEMES CLASSES que training
+✅ Modes: GUI (si disponible) + CONSOLE
+✅ Détection overfitting automatique
 ========================================
 """
 
@@ -22,8 +23,12 @@ from sklearn.metrics import f1_score, recall_score, precision_score, confusion_m
 
 try:
     from progress_gui import GenericProgressGUI
+    HAS_GUI = True
 except ImportError:
+    HAS_GUI = False
     GenericProgressGUI = None
+
+USE_GUI = HAS_GUI
 
 
 class DTSplitsTester:
@@ -49,13 +54,27 @@ class DTSplitsTester:
             self.ui.add_stage("analysis", "Analyse overfitting")
             self.ui.add_stage("graph", "Graphiques")
 
+    def log(self, msg, level="INFO"):
+        """Log compatible GUI + console"""
+        if self.ui:
+            self.ui.log(msg, level=level)
+        else:
+            import time
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] [{level}] {msg}")
+
+    def log_alert(self, msg, level="error"):
+        """Alert compatible GUI + console"""
+        if self.ui:
+            self.ui.log_alert(msg, level=level)
+        else:
+            print(f"[ALERT] {msg}")
+
     def load_data(self):
         """Charger les données d'entraînement"""
         try:
             if not os.path.exists("preprocessed_dataset.npz"):
-                print("[ERROR] preprocessed_dataset.npz manquant")
-                if self.ui:
-                    self.ui.log_alert("Données manquantes", level="error")
+                self.log_alert("Données manquantes", level="error")
                 return False
             
             data = np.load("preprocessed_dataset.npz", allow_pickle=True)
@@ -64,19 +83,17 @@ class DTSplitsTester:
             # ✅ CORRECTION: Charger les classes du training
             self.classes = data["classes"]
             
-            print(f"[OK] Données chargées: X={self.X.shape}, y={len(self.y):,}")
-            print(f"    Classes: {list(self.classes)}")
+            self.log(f"Données chargées: X={self.X.shape}, y={len(self.y):,}", level="OK")
+            self.log(f"Classes: {list(self.classes)}", level="OK")
             
             if self.ui:
-                self.ui.log(f"[OK] Données chargées: {len(self.y):,} échantillons", level="OK")
+                self.ui.log(f"Données chargées: {len(self.y):,} échantillons", level="OK")
                 self.ui.update_stage("load", 1, 1, "Données chargées")
                 self.ui.update_global(1, 4, "Données chargées")
             
             return True
         except Exception as e:
-            print(f"[ERROR] Erreur load_data: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur: {e}", level="error")
+            self.log_alert(f"Erreur: {e}", level="error")
             return False
 
     def test_splits(self):
@@ -87,13 +104,13 @@ class DTSplitsTester:
             total_tests = len(test_sizes) * num_runs
             current_test = 0
             
-            print("\n[TEST] Évaluation Decision Tree avec différentes tailles")
-            print(f"  Test sizes: {test_sizes}")
-            print(f"  Runs par taille: {num_runs}")
-            print(f"  Total: {total_tests} évaluations\n")
+            self.log(f"\nÉvaluation Decision Tree avec différentes tailles", level="INFO")
+            self.log(f"Test sizes: {test_sizes}", level="INFO")
+            self.log(f"Runs par taille: {num_runs}", level="INFO")
+            self.log(f"Total: {total_tests} évaluations\n", level="INFO")
             
             for test_size in test_sizes:
-                print(f"\n[TEST_SIZE] {test_size*100:.0f}% test")
+                self.log(f"\n{test_size*100:.0f}% test", level="INFO")
                 
                 f1_runs = []
                 recall_runs = []
@@ -126,7 +143,7 @@ class DTSplitsTester:
                     recall_runs.append(recall)
                     precision_runs.append(precision)
                     
-                    print(f"  Run {run+1}: F1={f1:.4f} | Recall={recall:.4f} | Precision={precision:.4f}")
+                    self.log(f"  Run {run+1}: F1={f1:.4f} | Recall={recall:.4f} | Precision={precision:.4f}", level="info")
                     
                     if self.ui:
                         self.ui.update_file_progress(
@@ -150,53 +167,46 @@ class DTSplitsTester:
                 self.results['precision_means'].append(np.mean(precision_runs))
                 self.results['all_f1_runs'][f'{test_size*100:.0f}%'] = f1_runs
                 
-                print(f"  ✅ RÉSUMÉ: F1={mean_f1:.4f}±{std_f1:.4f}")
+                self.log(f"RÉSUMÉ: F1={mean_f1:.4f}±{std_f1:.4f}", level="OK")
             
             return True
         except Exception as e:
-            print(f"[ERROR] Erreur test_splits: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur: {e}", level="error")
+            self.log_alert(f"Erreur: {e}", level="error")
             return False
 
     def analyze_overfitting(self):
         """Analyser si le modèle surfit"""
         try:
-            print("\n[ANALYSIS] Détection d'overfitting\n")
+            self.log(f"\nDétection d'overfitting\n", level="INFO")
             
             f1_scores = np.array(self.results['f1_means'])
             f1_stds = np.array(self.results['f1_stds'])
             test_sizes = np.array(self.results['test_sizes'])
             
-            # Analyser la tendance
-            # En général, avec un overfitting:
-            # - F1 train > F1 test (on ne test que test ici, donc on regarde la variance)
-            # - La variabilité augmente avec des test sets plus petits
-            
-            print("F1 Score par taille de test:")
+            self.log(f"F1 Score par taille de test:", level="INFO")
             for ts, f1, std in zip(test_sizes, f1_scores, f1_stds):
-                print(f"  {ts*100:>5.0f}% test: F1={f1:.4f}±{std:.4f}")
+                self.log(f"  {ts*100:>5.0f}% test: F1={f1:.4f}±{std:.4f}", level="info")
             
             # Coefficients de variation
-            cv = f1_stds / f1_scores  # Coefficient de variation
-            print("\nCoefficients de variation:")
+            cv = f1_stds / f1_scores
+            self.log(f"\nCoefficients de variation:", level="INFO")
             for ts, c in zip(test_sizes, cv):
-                print(f"  {ts*100:>5.0f}% test: CV={c:.4f}")
+                self.log(f"  {ts*100:>5.0f}% test: CV={c:.4f}", level="info")
             
             # Décision
             mean_cv = np.mean(cv)
-            print(f"\nMoyenne CV: {mean_cv:.4f}")
+            self.log(f"\nMoyenne CV: {mean_cv:.4f}", level="INFO")
             
             if mean_cv < 0.02:
-                verdict = "✅ EXCELLENT - Très stable (pas d'overfitting)"
+                verdict = "EXCELLENT - Très stable (pas d'overfitting)"
             elif mean_cv < 0.05:
-                verdict = "✅ BON - Stable (peu d'overfitting)"
+                verdict = "BON - Stable (peu d'overfitting)"
             elif mean_cv < 0.10:
-                verdict = "⚠️ ACCEPTABLE - Peu stable (léger overfitting)"
+                verdict = "ACCEPTABLE - Peu stable (léger overfitting)"
             else:
-                verdict = "❌ INSTABLE - Très variable (overfitting probable)"
+                verdict = "INSTABLE - Très variable (overfitting probable)"
             
-            print(f"\nVERDICT: {verdict}\n")
+            self.log(f"\nVERDICT: {verdict}\n", level="OK")
             
             if self.ui:
                 self.ui.log(f"[ANALYSIS] {verdict}", level="OK")
@@ -205,15 +215,13 @@ class DTSplitsTester:
             
             return True
         except Exception as e:
-            print(f"[ERROR] Erreur analyze: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur analyse: {e}", level="error")
+            self.log_alert(f"Erreur analyse: {e}", level="error")
             return False
 
     def generate_graph(self):
         """Générer graphique F1 vs test size"""
         try:
-            print("\n[GRAPH] Génération graphique")
+            self.log(f"\nGénération graphique", level="INFO")
             
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
             
@@ -257,18 +265,16 @@ class DTSplitsTester:
             plt.savefig('test_dt_splits.png', dpi=150, bbox_inches='tight')
             plt.close()
             
-            print("[OK] Graphique sauvegardé: test_dt_splits.png")
+            self.log(f"Graphique sauvegardé: test_dt_splits.png", level="OK")
             
             if self.ui:
                 self.ui.update_stage("graph", 1, 1, "Graphique généré")
                 self.ui.update_global(4, 4, "Terminé")
-                self.ui.log("[OK] Graphique généré", level="OK")
+                self.ui.log("Graphique généré", level="OK")
             
             return True
         except Exception as e:
-            print(f"[ERROR] Erreur graphique: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur graphique: {e}", level="error")
+            self.log_alert(f"Erreur graphique: {e}", level="error")
             return False
 
     def save_results(self):
@@ -277,16 +283,14 @@ class DTSplitsTester:
             with open('dt_test_results.json', 'w', encoding='utf-8') as f:
                 json.dump(self.results, f, indent=2, ensure_ascii=False, default=float)
             
-            print("[OK] Résultats sauvegardés: dt_test_results.json")
+            self.log(f"Résultats sauvegardés: dt_test_results.json", level="OK")
             
             if self.ui:
-                self.ui.log("[OK] Résultats sauvegardés", level="OK")
+                self.ui.log("Résultats sauvegardés", level="OK")
             
             return True
         except Exception as e:
-            print(f"[ERROR] Erreur save: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur sauvegarde: {e}", level="error")
+            self.log_alert(f"Erreur sauvegarde: {e}", level="error")
             return False
 
     def run(self):
@@ -337,20 +341,19 @@ def main():
     print("TEST DECISION TREE SPLITS - OVERFITTING DETECTION")
     print("="*80 + "\n")
 
-    tester = DTSplitsTester()
-    
-    # Mode GUI si disponible
-    if GenericProgressGUI:
-        print("[INFO] Lancement mode GUI...")
+    if USE_GUI:
+        print("[INFO] Mode GUI activé\n")
         run_with_gui()
         return True
-
+    
     # Mode console
+    print("[INFO] Mode console (progress_gui non disponible)\n")
+    tester = DTSplitsTester()
     success = tester.run()
     
     if success:
         print("\n" + "="*80)
-        print("TEST COMPLETÉ")
+        print("TEST COMPLÉTÉ")
         print("="*80 + "\n")
         return True
     else:

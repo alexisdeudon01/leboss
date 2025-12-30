@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-DDoS DETECTOR - PRODUCTION SCRIPT - CORRIGÉ
-Charge le modèle final et prédit sur nouvelles données
+DDoS DETECTOR - PRODUCTION - ADAPTÉ
+====================================
+✅ progress_gui OPTIONNEL (console fallback)
 ✅ CORRECTION: Utilise MEMES CLASSES que training
 ✅ Normalisation avec stats du training
+✅ Modes: GUI (si disponible) + CONSOLE
+====================================
 """
 
 import joblib
 import numpy as np
 import pandas as pd
 import os
+import sys
 import threading
 from sklearn.preprocessing import LabelEncoder
 
-# Optional GUI
 try:
     from progress_gui import GenericProgressGUI
+    HAS_GUI = True
 except ImportError:
+    HAS_GUI = False
     GenericProgressGUI = None
 
-USE_GUI = os.getenv("USE_PROGRESS_GUI", "1") == "1"
+USE_GUI = HAS_GUI and os.getenv("USE_PROGRESS_GUI", "1") == "1"
 
 
 class DDoSDetector:
@@ -38,24 +44,36 @@ class DDoSDetector:
             self.ui.add_stage("load_data", "Chargement données")
             self.ui.add_stage("predict", "Prédiction lot")
 
+    def log(self, msg, level="OK"):
+        """Log compatible GUI + console"""
+        if self.ui:
+            self.ui.log(msg, level=level)
+        else:
+            import time
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] [{level}] {msg}")
+
+    def log_alert(self, msg, level="error"):
+        """Alert compatible GUI + console"""
+        if self.ui:
+            self.ui.log_alert(msg, level=level)
+        else:
+            print(f"[ALERT] {msg}")
+
     def load_model_and_scaler(self):
         """Charger le modèle et les paramètres de normalisation"""
         try:
             # Charger le modèle
             if not os.path.exists('ddos_detector_final.pkl'):
-                print("[ERROR] ddos_detector_final.pkl manquant")
-                if self.ui:
-                    self.ui.log_alert("Modèle manquant", level="error")
+                self.log_alert("ddos_detector_final.pkl manquant", level="error")
                 return False
             
             self.model = joblib.load('ddos_detector_final.pkl')
-            print("[OK] Modèle chargé: ddos_detector_final.pkl")
+            self.log("Modèle chargé: ddos_detector_final.pkl", level="OK")
             
             # Charger les paramètres de normalisation depuis le dataset d'entraînement
             if not os.path.exists('preprocessed_dataset.npz'):
-                print("[ERROR] preprocessed_dataset.npz manquant pour scaler")
-                if self.ui:
-                    self.ui.log_alert("Données d'entraînement manquantes", level="error")
+                self.log_alert("preprocessed_dataset.npz manquant pour scaler", level="error")
                 return False
             
             data = np.load('preprocessed_dataset.npz', allow_pickle=True)
@@ -72,37 +90,34 @@ class DDoSDetector:
             self.label_encoder = LabelEncoder()
             self.label_encoder.classes_ = self.classes
             
-            print(f"[OK] Scaler et classes chargés")
-            print(f"    Mean shape: {self.scaler_mean.shape}")
-            print(f"    Classes: {list(self.classes)}")
+            self.log(f"Scaler et classes chargés (Mean shape: {self.scaler_mean.shape})", level="OK")
+            self.log(f"Classes: {list(self.classes)}", level="OK")
             
             if self.ui:
                 self.ui.update_stage("load_model", 1, 1, "Modèle et scaler chargés")
             
             return True
         except Exception as e:
-            print(f"[ERROR] Erreur chargement modèle: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur modèle: {e}", level="error")
+            self.log_alert(f"Erreur chargement modèle: {e}", level="error")
             return False
 
     def normalize_features(self, X_raw):
         """Normaliser les features avec les paramètres du training"""
         if self.scaler_mean is None or self.scaler_std is None:
-            print("[ERROR] Scaler non inicalisé")
+            self.log_alert("Scaler non inicalisé", level="error")
             return None
         
         try:
             X_normalized = ((X_raw - self.scaler_mean) / self.scaler_std).astype(np.float32)
             return X_normalized
         except Exception as e:
-            print(f"[ERROR] Erreur normalisation: {e}")
+            self.log_alert(f"Erreur normalisation: {e}", level="error")
             return None
 
     def predict_single(self, sample):
         """Prédire sur un seul échantillon"""
         if self.model is None:
-            print("[ERROR] Modèle non chargé")
+            self.log_alert("Modèle non chargé", level="error")
             return None
 
         try:
@@ -123,26 +138,24 @@ class DDoSDetector:
             pred_label = self.classes[prediction]
             
             result = {
-                'prediction': pred_label,
+                'prediction': str(pred_label),
                 'prediction_id': int(prediction),
                 'confidence': float(max(probability)),
                 'probabilities': {
-                    self.classes[0]: float(probability[0]),
-                    self.classes[1]: float(probability[1])
+                    str(self.classes[0]): float(probability[0]),
+                    str(self.classes[1]): float(probability[1])
                 }
             }
 
             return result
         except Exception as e:
-            print(f"[ERROR] Erreur prédiction: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur prédiction: {e}", level="error")
+            self.log_alert(f"Erreur prédiction: {e}", level="error")
             return None
 
     def predict_batch(self, samples):
         """Prédire sur plusieurs échantillons"""
         if self.model is None:
-            print("[ERROR] Modèle non chargé")
+            self.log_alert("Modèle non chargé", level="error")
             return None
 
         try:
@@ -162,12 +175,12 @@ class DDoSDetector:
                 
                 result = {
                     'sample_id': i,
-                    'prediction': pred_label,
+                    'prediction': str(pred_label),
                     'prediction_id': int(pred),
                     'confidence': float(max(prob)),
                     'probabilities': {
-                        self.classes[0]: float(prob[0]),
-                        self.classes[1]: float(prob[1])
+                        str(self.classes[0]): float(prob[0]),
+                        str(self.classes[1]): float(prob[1])
                     }
                 }
                 results.append(result)
@@ -182,9 +195,7 @@ class DDoSDetector:
             
             return results
         except Exception as e:
-            print(f"[ERROR] Erreur batch prédiction: {e}")
-            if self.ui:
-                self.ui.log_alert(f"Erreur batch: {e}", level="error")
+            self.log_alert(f"Erreur batch prédiction: {e}", level="error")
             return None
 
 
@@ -210,7 +221,7 @@ def run_with_gui():
                 ui.log_alert("fusion_test_smart4.csv introuvable", level="error")
                 return
             
-            df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False)
+            df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False, encoding='utf-8')
             numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
             X_test_raw = df_test[numeric_cols].astype(np.float32)
             X_test_raw = X_test_raw.fillna(X_test_raw.mean())
@@ -229,7 +240,6 @@ def run_with_gui():
                 
                 summary = f"Prédictions terminées:\n  DDoS: {ddos_count:,}\n  Normal: {normal_count:,}"
                 ui.log_alert(summary, level="success")
-                print(f"\n[OK] {summary}")
             
         except Exception as e:
             ui.log_alert(f"Erreur: {e}", level="error")
@@ -251,12 +261,13 @@ def main():
         return False
 
     # Mode GUI si disponible
-    if GenericProgressGUI and USE_GUI:
-        print("[INFO] Lancement mode GUI...")
+    if USE_GUI:
+        print("[INFO] Mode GUI activé\n")
         run_with_gui()
         return True
 
     # Mode console
+    print("[INFO] Mode console\n")
     try:
         print("[INFO] Chargement test holdout...")
         
@@ -264,7 +275,7 @@ def main():
             print("[ERROR] fusion_test_smart4.csv introuvable")
             return False
         
-        df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False)
+        df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False, encoding='utf-8')
         print(f"[OK] Test chargé: {len(df_test):,} lignes")
         
         numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
@@ -285,7 +296,7 @@ def main():
             
             # Sauvegarder les prédictions
             pred_df = pd.DataFrame(results)
-            pred_df.to_csv("ddos_predictions_test_holdout.csv", index=False)
+            pred_df.to_csv("ddos_predictions_test_holdout.csv", index=False, encoding='utf-8')
             print(f"\n[OK] Prédictions sauvegardées: ddos_predictions_test_holdout.csv")
             
             return True
@@ -302,5 +313,4 @@ def main():
 
 if __name__ == "__main__":
     success = main()
-    import sys
     sys.exit(0 if success else 1)

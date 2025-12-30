@@ -1,11 +1,14 @@
 ﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-ML EVALUATION V3 - FINAL CORRIGÉ
+ML EVALUATION V3 - ADAPTÉE
 ========================================
+✅ progress_gui OPTIONNEL (console fallback)
 ✅ CORRECTION: LabelEncoder utilise MEMES CLASSES que training
 ✅ Pas de fit_transform(), utilise transform() avec classes du NPZ
 ✅ K-Fold validation sur test holdout
 ✅ Rapports et graphiques
+✅ Modes: GUI (si progress_gui disponible) + CONSOLE (fallback)
 ========================================
 """
 
@@ -28,9 +31,10 @@ import json
 
 try:
     from progress_gui import GenericProgressGUI
+    HAS_GUI = True
 except ImportError:
-    print("progress_gui manquant (progress_gui.py)")
-    sys.exit(1)
+    HAS_GUI = False
+    GenericProgressGUI = None
 
 NUM_CORES = multiprocessing.cpu_count()
 MODELS_CONFIG = {
@@ -42,7 +46,7 @@ MODELS_CONFIG = {
 
 
 class MLEvaluationRunner:
-    def __init__(self, ui):
+    def __init__(self, ui=None):
         self.ui = ui
         self.results = {}
         self.X_train = None
@@ -50,20 +54,37 @@ class MLEvaluationRunner:
         self.X_test = None
         self.y_test = None
         self.classes = None
-        self._init_ui()
+        if self.ui:
+            self._init_ui()
 
     def _init_ui(self):
+        """Initialiser les stages de la GUI"""
         self.ui.add_stage("load", "Chargement train/test")
         self.ui.add_stage("train", "Entraînement + évaluation holdout")
         self.ui.add_stage("reports", "Rapports")
         self.ui.add_stage("graphs", "Graphiques")
+
+    def log(self, msg, level="INFO"):
+        """Log compatible GUI + console"""
+        if self.ui:
+            self.ui.log(msg, level=level)
+        else:
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] [{level}] {msg}")
+
+    def log_alert(self, msg, level="error"):
+        """Alert compatible GUI + console"""
+        if self.ui:
+            self.ui.log_alert(msg, level=level)
+        else:
+            print(f"[ALERT] {msg}")
 
     def load_data(self):
         """✅ CORRIGÉ: Charger train et test avec classes cohérentes"""
         npz_files = ["preprocessed_dataset.npz", "tensor_data.npz"]
         npz_file = next((f for f in npz_files if os.path.exists(f)), None)
         if not npz_file:
-            self.ui.log_alert("NPZ introuvable", level="error")
+            self.log_alert("NPZ introuvable", level="error")
             return False
         
         try:
@@ -73,23 +94,23 @@ class MLEvaluationRunner:
             self.y_train = data["y"]
             # ✅ CORRECTION: Sauvegarder les classes du training
             self.classes = data["classes"]
-            self.ui.log(f"[OK] Train NPZ {npz_file} chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
-            self.ui.log(f"[OK] Classes: {list(self.classes)}", level="OK")
+            self.log(f"Train NPZ {npz_file} chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
+            self.log(f"Classes: {list(self.classes)}", level="OK")
 
             # Charger le test holdout
             if not os.path.exists("fusion_test_smart4.csv"):
-                self.ui.log_alert("fusion_test_smart4.csv introuvable", level="error")
+                self.log_alert("fusion_test_smart4.csv introuvable", level="error")
                 return False
             
-            df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False)
-            self.ui.log(f"[OK] Test chargé: {len(df_test):,} lignes", level="OK")
+            df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False, encoding='utf-8')
+            self.log(f"Test chargé: {len(df_test):,} lignes", level="OK")
             
             numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
             X_test_raw = df_test[numeric_cols].astype(np.float32)
             X_test_raw = X_test_raw.fillna(X_test_raw.mean())
             
             if X_test_raw.shape[1] != self.X_train.shape[1]:
-                self.ui.log_alert(f"Mismatch features train/test: train {self.X_train.shape[1]} vs test {X_test_raw.shape[1]}", level="error")
+                self.log_alert(f"Mismatch features train/test: train {self.X_train.shape[1]} vs test {X_test_raw.shape[1]}", level="error")
                 return False
             
             # Normaliser avec stats du training
@@ -107,13 +128,15 @@ class MLEvaluationRunner:
             # transform() au lieu de fit_transform() pour garder l'ordre du training
             self.y_test = lbl.transform(y_test_raw)
             
-            self.ui.log(f"[OK] Test normalisé: X={self.X_test.shape}, y={len(self.y_test):,}", level="OK")
-            self.ui.update_stage("load", len(self.X_train), len(self.X_train), "Train chargé")
-            self.ui.update_stage("load", len(self.X_train)+len(self.X_test), len(self.X_train)+len(self.X_test), "Train/Test chargés")
-            self.ui.update_global(1, 4, f"Train {len(self.X_train):,} | Test {len(self.X_test):,}")
+            self.log(f"Test normalisé: X={self.X_test.shape}, y={len(self.y_test):,}", level="OK")
+            
+            if self.ui:
+                self.ui.update_stage("load", len(self.X_train)+len(self.X_test), len(self.X_train)+len(self.X_test), "Train/Test chargés")
+                self.ui.update_global(1, 4, f"Train {len(self.X_train):,} | Test {len(self.X_test):,}")
+            
             return True
         except Exception as e:
-            self.ui.log_alert(f"Erreur load_data: {e}", level="error")
+            self.log_alert(f"Erreur load_data: {e}", level="error")
             return False
 
     def train_eval(self):
@@ -132,7 +155,7 @@ class MLEvaluationRunner:
             total = len(models)
             
             for i, (name, model) in enumerate(models, 1):
-                self.ui.log(f"\n[MODEL {i}/{total}] {name}", level="OK")
+                self.log(f"\n[MODEL {i}/{total}] {name}", level="OK")
                 
                 f1_runs = []
                 recall_runs = []
@@ -167,9 +190,11 @@ class MLEvaluationRunner:
                     cm = confusion_matrix(y_val, y_pred, labels=np.unique(self.y_test))
                     cm_sum = cm if cm_sum is None else cm_sum + cm
                     
-                    self.ui.log(f"  Fold {fold}: F1={f1:.4f} | Recall={recall:.4f} | Precision={precision:.4f}", level="info")
-                    self.ui.update_file_progress(f"{name}", int(fold / 5 * 100),
-                                                f"Fold {fold}/5 F1={f1:.4f}")
+                    self.log(f"  Fold {fold}: F1={f1:.4f} | Recall={recall:.4f} | Precision={precision:.4f}", level="info")
+                    
+                    if self.ui:
+                        self.ui.update_file_progress(f"{name}", int(fold / 5 * 100),
+                                                    f"Fold {fold}/5 F1={f1:.4f}")
                 
                 # Résultats finaux
                 mean_f1 = np.mean(f1_runs)
@@ -183,13 +208,15 @@ class MLEvaluationRunner:
                     "cm": cm_sum.tolist() if cm_sum is not None else [],
                 }
                 
-                self.ui.log(f"  ✅ {name}: F1={mean_f1:.4f}±{std_f1:.4f}", level="OK")
-                self.ui.update_stage("train", i, total, f"{name} F1={mean_f1:.4f}")
-                self.ui.update_global(1 + i / total, 4, f"Modèle {i}/{total}")
+                self.log(f"✅ {name}: F1={mean_f1:.4f}±{std_f1:.4f}", level="OK")
+                
+                if self.ui:
+                    self.ui.update_stage("train", i, total, f"{name} F1={mean_f1:.4f}")
+                    self.ui.update_global(1 + i / total, 4, f"Modèle {i}/{total}")
             
             return True
         except Exception as e:
-            self.ui.log_alert(f"Erreur train_eval: {e}", level="error")
+            self.log_alert(f"Erreur train_eval: {e}", level="error")
             return False
 
     def save_reports(self):
@@ -198,7 +225,7 @@ class MLEvaluationRunner:
             # Rapport texte
             with open("evaluation_results_summary.txt", "w", encoding="utf-8") as f:
                 f.write("=" * 100 + "\n")
-                f.write("ML EVALUATION V3 - FINAL (CORRIGÉ)\n")
+                f.write("ML EVALUATION V3 - FINAL (ADAPTÉ)\n")
                 f.write("=" * 100 + "\n\n")
                 f.write("✅ CORRECTION: LabelEncoder cohérent avec training\n")
                 f.write("✅ K-Fold validation: 5 folds\n")
@@ -210,19 +237,21 @@ class MLEvaluationRunner:
                 
                 f.write("=" * 100 + "\n")
             
-            self.ui.log("[OK] Rapport texte: evaluation_results_summary.txt", level="OK")
+            self.log("Rapport texte: evaluation_results_summary.txt", level="OK")
             
             # Rapport JSON
             with open("ml_evaluation_results.json", "w", encoding="utf-8") as f:
                 json.dump(self.results, f, indent=2, ensure_ascii=False)
             
-            self.ui.log("[OK] Rapport JSON: ml_evaluation_results.json", level="OK")
-            self.ui.update_stage("reports", 1, 1, "Rapports OK")
-            self.ui.update_global(3, 4, "Rapports")
+            self.log("Rapport JSON: ml_evaluation_results.json", level="OK")
+            
+            if self.ui:
+                self.ui.update_stage("reports", 1, 1, "Rapports OK")
+                self.ui.update_global(3, 4, "Rapports")
             
             return True
         except Exception as e:
-            self.ui.log_alert(f"Rapports: {e}", level="error")
+            self.log_alert(f"Rapports: {e}", level="error")
             return False
 
     def save_graphs(self):
@@ -260,53 +289,87 @@ class MLEvaluationRunner:
                 plt.savefig(fname, dpi=150, bbox_inches="tight")
                 plt.close()
                 
-                self.ui.log(f"[OK] Graphique: {fname}", level="OK")
+                self.log(f"Graphique: {fname}", level="OK")
                 gc.collect()
             
-            self.ui.update_stage("graphs", 1, 1, "Graphiques OK")
-            self.ui.update_global(4, 4, "Terminé")
-            self.ui.log("[OK] Graphiques générés", level="OK")
+            if self.ui:
+                self.ui.update_stage("graphs", 1, 1, "Graphiques OK")
+                self.ui.update_global(4, 4, "Terminé")
+            
+            self.log("Graphiques générés", level="OK")
             
             return True
         except Exception as e:
-            self.ui.log_alert(f"Graphiques: {e}", level="error")
+            self.log_alert(f"Graphiques: {e}", level="error")
             return False
 
 
 def main():
     """Point d'entrée principal"""
-    ui = GenericProgressGUI(title="ML Evaluation V3 - CORRIGÉ", 
-                           header_info=f"Cores: {NUM_CORES}", 
-                           max_workers=4)
-    runner = MLEvaluationRunner(ui=ui)
+    print("\n" + "="*80)
+    print("ML EVALUATION V3 - ADAPTÉ")
+    print("="*80 + "\n")
 
-    def job():
-        try:
-            ui.update_global(0, 4, "Initialisation")
-            
-            if not runner.load_data():
-                ui.log_alert("Échec chargement données", level="error")
-                return
-            
-            if not runner.train_eval():
-                ui.log_alert("Échec entraînement", level="error")
-                return
-            
-            if not runner.save_reports():
-                ui.log_alert("Échec rapports", level="error")
-                return
-            
-            if not runner.save_graphs():
-                ui.log_alert("Échec graphiques", level="error")
-                return
-            
-            ui.log_alert("Evaluation terminée avec succès!", level="success")
-        except Exception as e:
-            ui.log_alert(f"Erreur: {e}", level="error")
+    if HAS_GUI:
+        # Mode GUI
+        print("[INFO] Mode GUI activé\n")
+        ui = GenericProgressGUI(title="ML Evaluation V3 - ADAPTÉ", 
+                               header_info=f"Cores: {NUM_CORES}", 
+                               max_workers=4)
+        runner = MLEvaluationRunner(ui=ui)
 
-    threading.Thread(target=job, daemon=True).start()
-    ui.start()
+        def job():
+            try:
+                ui.update_global(0, 4, "Initialisation")
+                
+                if not runner.load_data():
+                    ui.log_alert("Échec chargement données", level="error")
+                    return
+                
+                if not runner.train_eval():
+                    ui.log_alert("Échec entraînement", level="error")
+                    return
+                
+                if not runner.save_reports():
+                    ui.log_alert("Échec rapports", level="error")
+                    return
+                
+                if not runner.save_graphs():
+                    ui.log_alert("Échec graphiques", level="error")
+                    return
+                
+                ui.log_alert("Evaluation terminée avec succès!", level="success")
+            except Exception as e:
+                ui.log_alert(f"Erreur: {e}", level="error")
+
+        threading.Thread(target=job, daemon=True).start()
+        ui.start()
+        return True
+    else:
+        # Mode console
+        print("[INFO] Mode console (progress_gui non disponible)\n")
+        runner = MLEvaluationRunner(ui=None)
+        
+        if not runner.load_data():
+            print("[ERROR] Chargement données échouée")
+            return False
+        
+        if not runner.train_eval():
+            print("[ERROR] Entraînement échoué")
+            return False
+        
+        if not runner.save_reports():
+            print("[ERROR] Rapports échoué")
+            return False
+        
+        if not runner.save_graphs():
+            print("[ERROR] Graphiques échoué")
+            return False
+        
+        print("\n✅ Evaluation complétée avec succès!")
+        return True
 
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    sys.exit(0 if success else 1)
