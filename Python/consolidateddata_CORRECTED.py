@@ -147,9 +147,9 @@ class DataConsolidator:
             return None
     
     def consolidate(self, toniot_path, cic_dir, use_dialog=True):
-        """Consolide TON_IoT + CIC"""
+        """Consolide TON_IoT + CIC avec vérifications robustes"""
         self.log("=" * 80, "HEADER")
-        self.log("CONSOLIDATION DATASET - DÉTAILLÉE", "HEADER")
+        self.log("CONSOLIDATION DATASET - DÉTAILLÉE + ROBUSTE", "HEADER")
         self.log("=" * 80, "HEADER")
         
         # Sélectionner fichiers si dialog
@@ -215,6 +215,13 @@ class DataConsolidator:
         df_combined = pd.concat([df_toniot] + dfs_cic, ignore_index=True)
         self.log(f"  Combiné: {len(df_combined):,} lignes", "OK")
         
+        # ✅ VÉRIFICATION 1: Label existe
+        if 'Label' not in df_combined.columns:
+            self.log("ERREUR CRITIQUE: Colonne 'Label' manquante!", "ERROR")
+            self.log(f"  Colonnes disponibles: {list(df_combined.columns)}", "ERROR")
+            return False
+        self.log("  ✅ Label colonne présente", "OK")
+        
         # ÉTAPE 4: Nettoyage
         self.log("\nÉTAPE 4: Nettoyage Données", "STEP")
         
@@ -226,6 +233,10 @@ class DataConsolidator:
         df_combined = df_combined.dropna(subset=['Label'])
         self.log(f"  Rows avec Label valide: {len(df_combined):,}", "OK")
         
+        if len(df_combined) == 0:
+            self.log("ERREUR: Aucune ligne avec Label valide!", "ERROR")
+            return False
+        
         # ÉTAPE 5: Split 60/40
         self.log("\nÉTAPE 5: Split Scientifique 60/40", "STEP")
         
@@ -235,11 +246,25 @@ class DataConsolidator:
                                      test_size=0.4, random_state=42)
         
         for train_idx, test_idx in sss.split(df_combined, df_combined['Label']):
-            df_train = df_combined.iloc[train_idx]
-            df_test = df_combined.iloc[test_idx]
+            df_train = df_combined.iloc[train_idx].copy()
+            df_test = df_combined.iloc[test_idx].copy()
         
         self.log(f"  Train: {len(df_train):,} lignes (60%)", "DETAIL")
         self.log(f"  Test: {len(df_test):,} lignes (40%)", "DETAIL")
+        
+        # ✅ VÉRIFICATION 2: Même colonnes train/test
+        if list(df_train.columns) != list(df_test.columns):
+            self.log("ERREUR: Colonnes train et test différentes!", "ERROR")
+            train_cols = set(df_train.columns)
+            test_cols = set(df_test.columns)
+            missing_in_test = train_cols - test_cols
+            missing_in_train = test_cols - train_cols
+            if missing_in_test:
+                self.log(f"  Manquant dans test: {missing_in_test}", "ERROR")
+            if missing_in_train:
+                self.log(f"  Manquant dans train: {missing_in_train}", "ERROR")
+            return False
+        self.log("  ✅ Colonnes identiques train/test", "OK")
         
         # ÉTAPE 6: Sélectionner colonnes numériques
         self.log("\nÉTAPE 6: Sélection Features", "STEP")
@@ -248,26 +273,53 @@ class DataConsolidator:
         if 'Label' in numeric_cols:
             numeric_cols.remove('Label')
         
+        # ✅ VÉRIFICATION 3: Features pas vides
+        if len(numeric_cols) == 0:
+            self.log("ERREUR: Aucune colonne numérique trouvée!", "ERROR")
+            self.log(f"  Colonnes dans train: {list(df_train.columns)}", "ERROR")
+            return False
+        
         self.log(f"  Features numériques: {len(numeric_cols)}", "DETAIL")
+        self.log(f"  Premiers features: {numeric_cols[:5]}...", "DETAIL")
+        
+        # ✅ VÉRIFICATION 4: Même numeric_cols dans test
+        test_numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
+        if 'Label' in test_numeric_cols:
+            test_numeric_cols.remove('Label')
+        
+        if numeric_cols != test_numeric_cols:
+            self.log("ERREUR: Colonnes numériques différentes entre train et test!", "ERROR")
+            self.log(f"  Train numériques ({len(numeric_cols)}): {numeric_cols[:5]}...", "ERROR")
+            self.log(f"  Test numériques ({len(test_numeric_cols)}): {test_numeric_cols[:5]}...", "ERROR")
+            return False
+        self.log("  ✅ Colonnes numériques identiques", "OK")
         
         # ÉTAPE 7: Écriture avec progress
         self.log("\nÉTAPE 7: Écriture Fichiers", "STEP")
         
-        # Ajouter Label columns
-        df_train['Label'] = df_combined.loc[train_idx, 'Label'].values
-        df_test['Label'] = df_combined.loc[test_idx, 'Label'].values
-        
         # Écrire train
         self.log("  Écriture fusion_train_smart4.csv...", "DETAIL")
-        df_train.to_csv('fusion_train_smart4.csv', index=False, encoding='utf-8')
-        train_size = os.path.getsize('fusion_train_smart4.csv') / (1024**3)
-        self.log(f"    OK: {len(df_train):,} lignes ({train_size:.2f} GB)", "OK")
+        try:
+            df_train.to_csv('fusion_train_smart4.csv', index=False, encoding='utf-8')
+            if not os.path.exists('fusion_train_smart4.csv'):
+                raise Exception("Fichier non créé")
+            train_size = os.path.getsize('fusion_train_smart4.csv') / (1024**3)
+            self.log(f"    ✅ OK: {len(df_train):,} lignes ({train_size:.2f} GB)", "OK")
+        except Exception as e:
+            self.log(f"    ❌ ERREUR écriture train: {e}", "ERROR")
+            return False
         
         # Écrire test
         self.log("  Écriture fusion_test_smart4.csv...", "DETAIL")
-        df_test.to_csv('fusion_test_smart4.csv', index=False, encoding='utf-8')
-        test_size = os.path.getsize('fusion_test_smart4.csv') / (1024**3)
-        self.log(f"    OK: {len(df_test):,} lignes ({test_size:.2f} GB)", "OK")
+        try:
+            df_test.to_csv('fusion_test_smart4.csv', index=False, encoding='utf-8')
+            if not os.path.exists('fusion_test_smart4.csv'):
+                raise Exception("Fichier non créé")
+            test_size = os.path.getsize('fusion_test_smart4.csv') / (1024**3)
+            self.log(f"    ✅ OK: {len(df_test):,} lignes ({test_size:.2f} GB)", "OK")
+        except Exception as e:
+            self.log(f"    ❌ ERREUR écriture test: {e}", "ERROR")
+            return False
         
         # ÉTAPE 8: Normalisation + NPZ
         self.log("\nÉTAPE 8: Normalisation et NPZ", "STEP")
@@ -281,6 +333,7 @@ class DataConsolidator:
         y_train_encoded = le.fit_transform(y_train)
         
         self.log(f"  Classes: {list(le.classes_)}", "DETAIL")
+        self.log(f"  Distribution: Normal={np.sum(y_train_encoded==0)}, DDoS={np.sum(y_train_encoded==1)}", "DETAIL")
         
         # Normaliser
         scaler = StandardScaler()
@@ -290,22 +343,41 @@ class DataConsolidator:
         
         # Sauvegarder NPZ
         self.log("  Sauvegarde preprocessed_dataset.npz...", "DETAIL")
-        np.savez_compressed('preprocessed_dataset.npz',
-                           X=X_train_scaled,
-                           y=y_train_encoded,
-                           classes=le.classes_)
-        
-        npz_size = os.path.getsize('preprocessed_dataset.npz') / (1024**3)
-        self.log(f"    OK: {npz_size:.2f} GB", "OK")
+        try:
+            np.savez_compressed('preprocessed_dataset.npz',
+                               X=X_train_scaled,
+                               y=y_train_encoded,
+                               classes=le.classes_,
+                               numeric_cols=np.array(numeric_cols, dtype=object))  # ✅ AJOUTER
+            
+            if not os.path.exists('preprocessed_dataset.npz'):
+                raise Exception("Fichier non créé")
+            
+            npz_size = os.path.getsize('preprocessed_dataset.npz') / (1024**3)
+            self.log(f"    ✅ OK: {npz_size:.2f} GB", "OK")
+            
+            # Vérifier que le NPZ se charge bien
+            data = np.load('preprocessed_dataset.npz', allow_pickle=True)
+            self.log(f"    ✅ Vérification NPZ: X={data['X'].shape}, y={data['y'].shape}, classes={list(data['classes'])}", "OK")
+            
+        except Exception as e:
+            self.log(f"    ❌ ERREUR NPZ: {e}", "ERROR")
+            return False
         
         # RÉSUMÉ
         self.log("\n" + "=" * 80, "HEADER")
-        self.log("CONSOLIDATION COMPLÉTÉE", "HEADER")
+        self.log("CONSOLIDATION COMPLÉTÉE AVEC SUCCÈS", "HEADER")
         self.log("=" * 80, "HEADER")
         self.log(f"\nFichiers générés:", "OK")
-        self.log(f"  • fusion_train_smart4.csv ({train_size:.2f} GB)", "OK")
-        self.log(f"  • fusion_test_smart4.csv ({test_size:.2f} GB)", "OK")
-        self.log(f"  • preprocessed_dataset.npz ({npz_size:.2f} GB)", "OK")
+        self.log(f"  ✅ fusion_train_smart4.csv ({train_size:.2f} GB) - {len(df_train):,} lignes", "OK")
+        self.log(f"  ✅ fusion_test_smart4.csv ({test_size:.2f} GB) - {len(df_test):,} lignes", "OK")
+        self.log(f"  ✅ preprocessed_dataset.npz ({npz_size:.2f} GB) - {len(numeric_cols)} features", "OK")
+        
+        self.log(f"\nVérifications robustes:", "OK")
+        self.log(f"  ✅ Label colonne présente", "OK")
+        self.log(f"  ✅ Colonnes identiques train/test", "OK")
+        self.log(f"  ✅ Features numériques valides", "OK")
+        self.log(f"  ✅ NPZ chargeable et valide", "OK")
         
         return True
 
