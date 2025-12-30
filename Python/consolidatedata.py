@@ -711,19 +711,20 @@ class ConsolidatorGUI:
             self.log(f"[CIC] {filename}: {file_size_gb:.2f} GB | ~{est_rows:,} lignes estimees", 'INFO')
             self.update_file_progress(filename, 0, "Lecture en cours...")
 
-            # Déterminer split à partir de la date dans le nom (201811 = train, 201812 = test)
+            # D?terminer split ? partir du chemin complet (y compris dossiers) pour g?rer les noms sans date
             split = 'unknown'
             try:
-                parts = filename.split('_')
-                date_part = parts[1] if len(parts) > 1 else ''
-                if date_part.startswith('201811'):
-                    split = 'train'
-                elif date_part.startswith('201812'):
+                path_tokens = [p.lower() for p in Path(csv_file).parts]
+                joined = "_".join(path_tokens + [filename.lower()])
+                if 'test' in joined or '201812' in joined or 'dec' in joined:
                     split = 'test'
+                elif 'train' in joined or '201811' in joined or 'nov' in joined:
+                    split = 'train'
             except Exception:
                 split = 'unknown'
             if split == 'unknown':
-                self.log_alert(f"[CIC][{filename}] Split inconnu (attendu 201811/201812)", 'warning')
+                split = 'train'
+                self.log_alert(f"[CIC][{filename}] Split inconnu -> fallback TRAIN (attendu 201811/201812)", 'warning')
 
             chunk_size = max(20000, min(150000, self.ram.chunk_size // 3))
             chunks = []
