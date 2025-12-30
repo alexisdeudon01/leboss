@@ -1,0 +1,17 @@
+{
+  "folders": [
+    { "path": "." },
+    { "path": "../CIC" },
+    { "path": "../TONIOT" }
+  ],
+  "settings": {
+    "terminal.integrated.cwd": "${workspaceFolder}/Python",
+    "python.defaultInterpreterPath": "C:/Users/Shadow/Desktop/Request/Python/envMaster/Scripts/python.exe",
+    "python.analysis.extraPaths": [
+      "C:/Users/Shadow/Desktop/Request"
+    ],
+    "terminal.integrated.env.windows": {
+      "PYTHONPATH": "C:/Users/Shadow/Desktop/Request"
+    }
+  }
+}

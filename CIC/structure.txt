@@ -1,0 +1,30 @@
+Structure du dossier
+Le numéro de série du volume est B249-58A1
+C:.
+¦   structure.txt
+¦   
++---CSV-01-12
+¦   +---01-12
+¦           DrDoS_DNS.csv
+¦           DrDoS_LDAP.csv
+¦           DrDoS_MSSQL.csv
+¦           DrDoS_NetBIOS.csv
+¦           DrDoS_NTP.csv
+¦           DrDoS_SNMP.csv
+¦           DrDoS_SSDP.csv
+¦           DrDoS_UDP.csv
+¦           Syn.csv
+¦           TFTP.csv
+¦           UDPLag.csv
+¦           
++---CSV-03-11
+    +---03-11
+            .~lock.UDPLag.csv#
+            LDAP.csv
+            MSSQL.csv
+            NetBIOS.csv
+            Portmap.csv
+            Syn.csv
+            UDP.csv
+            UDPLag.csv
+            
