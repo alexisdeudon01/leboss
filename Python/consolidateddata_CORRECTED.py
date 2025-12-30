@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-SCRIPT CONSOLIDATION DATASET - VERSION FINALE OPTIMISÉE - CORRIGÉ
+SCRIPT CONSOLIDATION DATASET - VERSION FINALE OPTIMISÉE - CORRIGÉE
 
 OPTIMISATIONS INTÉGRÉES:
   ✓ RAM Manager intelligent (chunks adaptatifs 50K-300K)
@@ -13,6 +14,8 @@ OPTIMISATIONS INTÉGRÉES:
   ✓ 3 Canvas (Logs 70%, Stats 30%, Alertes)
   ✓ Barre de progression DÉTAILLÉE avec ETA
   ✓ Suppression automatique fichiers intermédiaires
+  ✓ FIX ENCODING UTF-8 (Windows compatible)
+  ✓ FIX SPLIT: 60/40 scientifique (IEEE)
 """
 
 import pandas as pd
@@ -29,20 +32,15 @@ from datetime import datetime, timedelta
 from collections import deque
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import queue
 
 try:
     import tkinter as tk
     from tkinter import ttk, scrolledtext, messagebox, filedialog
 except ImportError:
-    print("❌ tkinter non installé")
+    print("Erreur: tkinter non installe")
     sys.exit(1)
 
 warnings.filterwarnings('ignore')
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
 CONFIG = {
     'TON_IOT_INPUT': None,
@@ -54,12 +52,8 @@ CONFIG = {
     'TEMP_CIC_TEST': 'temp_cic_test.csv',
 }
 
-# ============================================================================
-# UTILS
-# ============================================================================
-
 def find_csv_files_recursive(root_dir):
-    """Trouver TOUS les CSV récursivement"""
+    """Trouver TOUS les CSV recursifs"""
     csv_files = []
     try:
         for root, dirs, files in os.walk(root_dir):
@@ -68,12 +62,10 @@ def find_csv_files_recursive(root_dir):
                     csv_files.append(os.path.join(root, file))
     except Exception as e:
         print(f"Erreur recherche: {e}")
-    
     return sorted(csv_files)
 
 class RAMManager:
-    """✅ RAM Manager intelligent - chunks adaptatifs selon RAM disponible"""
-    
+    """RAM Manager intelligent"""
     def __init__(self):
         try:
             self.process = psutil.Process(os.getpid())
@@ -110,22 +102,19 @@ class RAMManager:
             return 0
     
     def calculate_optimal_chunk_size(self):
-        """✅ FIX 1: Chunks adaptatifs selon RAM disponible"""
+        """Chunks adaptatifs"""
         try:
             available_gb = self.get_available_ram_gb()
-            # Utiliser 50% du RAM disponible (conservateur pour gros fichiers)
             usable_ram = available_gb * 0.5
             bytes_per_row = 200
             rows_per_gb = (1024 ** 3) / bytes_per_row
             chunk_size = int(usable_ram * rows_per_gb)
-            # Entre 50K et 300K lignes
             return max(50000, min(300000, chunk_size))
         except:
             return 50000
 
-
 def estimate_csv_rows(csv_path, sample_lines=2000):
-    """Estimer rapidement le nombre de lignes d'un CSV pour le pourcentage."""
+    """Estimer lignes CSV"""
     try:
         file_size = os.path.getsize(csv_path)
         if file_size == 0:
@@ -144,104 +133,74 @@ def estimate_csv_rows(csv_path, sample_lines=2000):
     except Exception:
         return 0
 
-
 def format_seconds(seconds):
-    """Formatter un ETA lisible."""
+    """Formatter ETA"""
     try:
         return str(timedelta(seconds=int(seconds)))
     except Exception:
         return "--:--"
 
-
-# ============================================================================
-# VÉRIFICATION LABELS + CLASSES
-# ============================================================================
-
 def verify_labels_consistency(df_name, df):
-    """
-    ✅ CODE DE VÉRIFICATION LABELS/CLASSES
-    Vérifie que les labels sont bien standardisés (0/1, pas de texte)
-    et que les colonnes Dataset/Split sont présentes
-    """
+    """Verifier labels"""
     issues = []
-    
-    # Vérifier colonne Label
     if 'Label' not in df.columns:
-        issues.append(f"❌ Colonne 'Label' manquante dans {df_name}")
+        issues.append(f"Erreur: Label manquante dans {df_name}")
         return issues, None
     
-    # Vérifier type de Label
     label_dtype = df['Label'].dtype
     label_values = df['Label'].unique()
     
-    # Si Label est numérique
     if np.issubdtype(label_dtype, np.number):
         numeric_labels = set(label_values)
         valid_numeric = {0, 1, 0.0, 1.0}
-        
         if not numeric_labels.issubset(valid_numeric):
-            issues.append(f"❌ {df_name}: Labels numériques invalides {numeric_labels}")
+            issues.append(f"Erreur: {df_name} labels invalides {numeric_labels}")
         else:
-            # Convertir en int pour cohérence
             df['Label'] = df['Label'].astype(int)
-    
-    # Si Label est texte
     elif df['Label'].dtype == object or df['Label'].dtype == 'string':
         text_labels = set(str(x).upper() for x in label_values)
-        
         if 'DDOS' in text_labels or 'ATTACK' in text_labels:
-            # Encoder DDoS = 1
             df['Label'] = (df['Label'].astype(str).str.upper() == 'DDOS').astype(int)
-            issues.append(f"⚠️  {df_name}: Labels texte encodés (DDoS→1)")
+            issues.append(f"Attention: {df_name} labels texte encodes")
         elif '0' in text_labels or '1' in text_labels:
-            # Encoder depuis texte
             df['Label'] = df['Label'].astype(int)
-            issues.append(f"⚠️  {df_name}: Labels texte numérique encodés")
+            issues.append(f"Attention: {df_name} labels texte numerique")
         else:
-            issues.append(f"❌ {df_name}: Labels texte non reconnus {text_labels}")
+            issues.append(f"Erreur: {df_name} labels texte non reconnus {text_labels}")
             return issues, None
     
-    # Vérifier présence Split
     if 'Split' not in df.columns:
-        issues.append(f"⚠️  {df_name}: Colonne 'Split' manquante → ajout 'train'")
+        issues.append(f"Attention: Split manquante dans {df_name}")
         df['Split'] = 'train'
     
-    # Vérifier présence Dataset
     if 'Dataset' not in df.columns:
-        issues.append(f"⚠️  {df_name}: Colonne 'Dataset' manquante → ajout '{df_name}'")
+        issues.append(f"Attention: Dataset manquante dans {df_name}")
         df['Dataset'] = df_name
     
-    # Classes finales
     final_labels = sorted(df['Label'].unique())
     if set(final_labels) != {0, 1}:
-        issues.append(f"❌ {df_name}: Labels finaux invalides {set(final_labels)}")
+        issues.append(f"Erreur: {df_name} labels finaux invalides {set(final_labels)}")
         return issues, None
     
     return issues, df
 
-# ============================================================================
-# GUI: FILE SELECTOR (TON_IoT file + CIC folder)
-# ============================================================================
-
 class FileSelectorGUI:
-    """Fenêtre pour choisir le CSV TON_IoT et le dossier CIC (scan récursif)."""
-
+    """GUI: Selection fichiers"""
     def __init__(self, root):
         self.root = root
-        self.root.title("📂 Sélection des Chemins")
+        self.root.title("Selection des Chemins")
         self.root.geometry("700x420")
         self.root.configure(bg="#f0f0f0")
-
         self.ton_iot_path = None
         self.cic_dir_path = None
         self.cic_files_found = []
-
+        self.ton_split = 'train'
         self.build_ui()
 
     def build_ui(self):
         header = tk.Frame(self.root, bg="#2c3e50", height=60)
         header.pack(fill=tk.X)
-        tk.Label(header, text="Sélection des Chemins",
+        tk.Label(header, text="Selection des Chemins",
                  font=("Arial", 14, "bold"), fg="white", bg="#2c3e50").pack(side=tk.LEFT, padx=20, pady=15)
 
         main = tk.Frame(self.root, bg="white")
@@ -255,9 +214,9 @@ class FileSelectorGUI:
         self.ton_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=8)
         tk.Button(ton_frame, text="Parcourir", command=self.select_ton,
                   bg="#3498db", fg="white", font=("Arial", 10),
-                  padx=12, pady=5, relief=tk.RAISED, cursor="hand2").pack(side=tk.RIGHT, padx=8, pady=8)
+                  padx=12, pady=5).pack(side=tk.RIGHT, padx=8, pady=8)
 
-        tk.Label(main, text="2. Dossier CIC (CSV, recherche récursive)", font=("Arial", 11, "bold"),
+        tk.Label(main, text="2. Dossier CIC (CSV, recursif)", font=("Arial", 11, "bold"),
                  bg="white", fg="#2c3e50").pack(anchor=tk.W, pady=(0, 5))
         cic_frame = tk.Frame(main, bg="#ecf0f1")
         cic_frame.pack(fill=tk.X, pady=(0, 15))
@@ -265,9 +224,9 @@ class FileSelectorGUI:
         self.cic_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=8)
         tk.Button(cic_frame, text="Parcourir", command=self.select_cic,
                   bg="#3498db", fg="white", font=("Arial", 10),
-                  padx=12, pady=5, relief=tk.RAISED, cursor="hand2").pack(side=tk.RIGHT, padx=8, pady=8)
+                  padx=12, pady=5).pack(side=tk.RIGHT, padx=8, pady=8)
 
-        tk.Label(main, text="Fichiers CSV trouvés :", font=("Arial", 10, "bold"),
+        tk.Label(main, text="Fichiers CSV trouves :", font=("Arial", 10, "bold"),
                  bg="white", fg="#2c3e50").pack(anchor=tk.W, pady=(5, 5))
         files_frame = tk.Frame(main, bg="#f8f8f8", relief=tk.SUNKEN, bd=1)
         files_frame.pack(fill=tk.BOTH, expand=True)
@@ -279,14 +238,14 @@ class FileSelectorGUI:
         footer.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Button(footer, text="CONTINUER", command=self.validate,
                   bg="#27ae60", fg="white", font=("Arial", 11, "bold"),
-                  padx=22, pady=8, relief=tk.RAISED, cursor="hand2").pack(side=tk.RIGHT, padx=10, pady=10)
+                  padx=22, pady=8).pack(side=tk.RIGHT, padx=10, pady=10)
         tk.Button(footer, text="QUITTER", command=self.root.quit,
                   bg="#e74c3c", fg="white", font=("Arial", 11, "bold"),
-                  padx=22, pady=8, relief=tk.RAISED, cursor="hand2").pack(side=tk.RIGHT, padx=5, pady=10)
+                  padx=22, pady=8).pack(side=tk.RIGHT, padx=5, pady=10)
 
     def select_ton(self):
         path = filedialog.askopenfilename(
-            title="Sélectionner train_test_network.csv",
+            title="Selectionner train_test_network.csv",
             filetypes=[("CSV", "*.csv"), ("All files", "*.*")]
         )
         if path:
@@ -295,7 +254,7 @@ class FileSelectorGUI:
             self.ton_iot_path = path
 
     def select_cic(self):
-        path = filedialog.askdirectory(title="Sélectionner dossier CIC")
+        path = filedialog.askdirectory(title="Selectionner dossier CIC")
         if path:
             self.cic_entry.delete(0, tk.END)
             self.cic_entry.insert(0, path)
@@ -308,9 +267,9 @@ class FileSelectorGUI:
                 for f in self.cic_files_found[:400]:
                     self.files_text.insert(tk.END, f"- {os.path.relpath(f, path)}\n")
                 if len(self.cic_files_found) > 400:
-                    self.files_text.insert(tk.END, f"... {len(self.cic_files_found)-400} supplémentaires\n")
+                    self.files_text.insert(tk.END, f"... {len(self.cic_files_found)-400} supplementaires\n")
             else:
-                self.files_text.insert(tk.END, "Aucun fichier CSV trouvé.")
+                self.files_text.insert(tk.END, "Aucun fichier CSV trouve.")
             self.files_text.config(state=tk.DISABLED)
 
     def validate(self):
@@ -318,7 +277,7 @@ class FileSelectorGUI:
         cic = self.cic_entry.get().strip()
 
         if not ton or not cic:
-            messagebox.showerror("Erreur", "Sélectionner les deux chemins !")
+            messagebox.showerror("Erreur", "Selectionner les deux chemins !")
             return
         if not os.path.isfile(ton):
             messagebox.showerror("Erreur", f"Fichier TON_IoT invalide: {ton}")
@@ -328,23 +287,55 @@ class FileSelectorGUI:
             return
         cic_files = find_csv_files_recursive(cic)
         if not cic_files:
-            messagebox.showerror("Erreur", f"Aucun CSV trouvé dans {cic}")
+            messagebox.showerror("Erreur", f"Aucun CSV trouve dans {cic}")
             return
 
         self.ton_iot_path = ton
         self.cic_dir_path = cic
         self.cic_files_found = cic_files
-        messagebox.showinfo("Succès", f"{len(cic_files)} fichiers CSV trouvés.")
-        self.root.destroy()
+        self.ask_ton_split()
 
-# ============================================================================
-# GUI: CONSOLIDATOR
-# ============================================================================
+    def ask_ton_split(self):
+        """Configuration split TON_IoT"""
+        response = messagebox.askyesnocancel(
+            "Configuration Split TON_IoT",
+            "TON_IoT n'a pas de colonne Split.\n\n"
+            "Oui → Utiliser TON_IoT comme TRAIN\n"
+            "Non → Utiliser TON_IoT comme TEST\n"
+            "Annuler → Split aleatoire 60/40 (SCIENTIFIQUE - IEEE)\n\n"
+            "Recommandation: Annuler (60/40 scientifique)"
+        )
+        
+        if response is True:
+            self.ton_split = 'train'
+            messagebox.showinfo("Succes", 
+                f"{len(self.cic_files_found)} fichiers CIC.\n\n"
+                "TON_IoT sera fusionne en TRAIN\n"
+                "CIC-November sera ajoute en TRAIN\n"
+                "CIC-December sera le holdout TEST")
+            self.root.destroy()
+        elif response is False:
+            self.ton_split = 'test'
+            messagebox.showinfo("Succes", 
+                f"{len(self.cic_files_found)} fichiers CIC.\n\n"
+                "TON_IoT sera le holdout TEST\n"
+                "CIC-November sera fusionne en TRAIN\n"
+                "CIC-December sera ignore")
+            self.root.destroy()
+        else:
+            self.ton_split = 'random_60_40_scientific'
+            messagebox.showinfo("Succes", 
+                f"{len(self.cic_files_found)} fichiers CIC.\n\n"
+                "TON_IoT sera splitte aleatoirement (60% TRAIN, 40% TEST)\n"
+                "Basee sur: IEEE IoT Journal (Booij et al., 2022)\n"
+                "CIC-November sera ajoute en TRAIN\n"
+                "CIC-December sera ajoute en TEST")
+            self.root.destroy()
 
 class ConsolidatorGUI:
-    """Fenêtre de consolidation avec progressions détaillées."""
+    """GUI: Consolidation avec progressions"""
     
-    def __init__(self, root, ton_iot_path, cic_dir_path, cic_files):
+    def __init__(self, root, ton_iot_path, cic_dir_path, cic_files, ton_split='train'):
         try:
             self.root = root
             self.root.title("Dataset Consolidator - Optimise")
@@ -355,6 +346,7 @@ class ConsolidatorGUI:
             self.cic_dir_path = cic_dir_path
             self.cic_files = cic_files or []
             self.cic_files_found = self.cic_files
+            self.ton_split = ton_split
             
             self.ram = RAMManager()
             self.max_workers = max(2, min(8, (os.cpu_count() or 4)))
@@ -367,6 +359,8 @@ class ConsolidatorGUI:
             self.cic_rows_total = 0
             self.cic_rows_total_test = 0
             self.ton_rows_total = 0
+            self.ton_rows_test = 0
+            self.has_ton_test = False
             self.fusion_rows_total = 0
             self.logs = deque(maxlen=500)
             self.alerts = deque(maxlen=100)
@@ -381,7 +375,7 @@ class ConsolidatorGUI:
             sys.exit(1)
     
     def _async_ui(self, callback):
-        """Exécuter un update UI depuis un thread worker en toute sécurité."""
+        """Executer update UI thread-safe"""
         try:
             self.root.after(0, callback)
         except Exception:
@@ -410,43 +404,34 @@ class ConsolidatorGUI:
         block = self.progress_blocks.get(key)
         if not block:
             return
-
         pct = self._progress_percent(current, total)
         details = f"{current}/{total}" if total else f"{current}"
         if pct:
             details += f" ({pct}%)"
         if eta_sec is not None:
             details += f" | ETA {format_seconds(eta_sec)}"
-
         def _apply():
             block['label'].config(text=msg or block['label'].cget('text'))
             block['bar']['value'] = pct
             block['detail'].config(text=details)
-
         self._async_ui(_apply)
 
     def _ensure_file_progress_widget(self, filename):
         if filename in self.file_progress_widgets:
             return self.file_progress_widgets[filename]
-
         if len(self.file_progress_order) >= self.max_file_bars:
             oldest = self.file_progress_order.popleft()
             widget = self.file_progress_widgets.pop(oldest, None)
             if widget:
                 widget['frame'].destroy()
-
         frame = tk.Frame(self.file_progress_container, bg='white', bd=1, relief=tk.SOLID)
         frame.pack(fill=tk.X, pady=2, padx=2)
-
         title = tk.Label(frame, text=filename, font=('Arial', 8, 'bold'), bg='white', anchor='w')
         title.pack(fill=tk.X, padx=6, pady=(4, 0))
-
         bar = ttk.Progressbar(frame, mode='determinate', maximum=100)
         bar.pack(fill=tk.X, padx=6, pady=2)
-
         status = tk.Label(frame, text="En attente", font=('Arial', 8), bg='white', fg='#666', anchor='w')
         status.pack(fill=tk.X, padx=6, pady=(0, 4))
-
         widget = {'frame': frame, 'bar': bar, 'status': status}
         self.file_progress_widgets[filename] = widget
         self.file_progress_order.append(filename)
@@ -460,10 +445,6 @@ class ConsolidatorGUI:
                 pass
         self.file_progress_widgets.clear()
         self.file_progress_order.clear()
-        try:
-            self.files_canvas.yview_moveto(0)
-        except Exception:
-            pass
 
     def update_file_progress(self, filename, percent, status_text):
         def _apply():
@@ -473,205 +454,197 @@ class ConsolidatorGUI:
         self._async_ui(_apply)
 
     def setup_ui(self):
-        """Layout sans canvas gauche: focus sur progressions et logs verbeux."""
-        try:
-            self.root.columnconfigure(0, weight=1)
-            self.root.rowconfigure(1, weight=1)
-            
-            # HEADER
-            header = tk.Frame(self.root, bg="#2c3e50", height=70)
-            header.grid(row=0, column=0, sticky='ew')
-            
-            title_frame = tk.Frame(header, bg="#2c3e50")
-            title_frame.pack(side=tk.LEFT, padx=20, pady=15, fill=tk.X, expand=True)
-            
-            tk.Label(title_frame, text="Dataset Consolidator - Optimise", 
-                     font=('Arial', 16, 'bold'), fg='white', bg="#2c3e50").pack(side=tk.LEFT)
-            
-            ton_label = os.path.basename(self.ton_iot_path) if self.ton_iot_path else "Non défini"
-            cic_label = f"{len(self.cic_files)} fichiers" if getattr(self, "cic_files", None) is not None else "Non défini"
-            info_text = f"TON_IoT: {ton_label} | CIC: {cic_label} | RAM: {self.ram.total_ram_gb:.1f}GB | Threads: {self.max_workers}"
-            tk.Label(title_frame, text=info_text, 
-                     font=('Arial', 9), fg='#bdc3c7', bg="#2c3e50").pack(side=tk.LEFT, padx=30)
-            
-            # MAIN GRID (progress + logs)
-            container = tk.Frame(self.root, bg='#f0f0f0')
-            container.grid(row=1, column=0, sticky='nsew', padx=0, pady=0)
-            container.rowconfigure(0, weight=1)
-            container.columnconfigure(0, weight=1)
+        """Setup UI"""
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+        
+        header = tk.Frame(self.root, bg="#2c3e50", height=70)
+        header.grid(row=0, column=0, sticky='ew')
+        
+        title_frame = tk.Frame(header, bg="#2c3e50")
+        title_frame.pack(side=tk.LEFT, padx=20, pady=15, fill=tk.X, expand=True)
+        tk.Label(title_frame, text="Dataset Consolidator - Optimise", 
+                 font=('Arial', 16, 'bold'), fg='white', bg="#2c3e50").pack(side=tk.LEFT)
+        
+        ton_label = os.path.basename(self.ton_iot_path) if self.ton_iot_path else "Non defini"
+        cic_label = f"{len(self.cic_files)} fichiers"
+        info_text = f"TON_IoT: {ton_label} | CIC: {cic_label} | RAM: {self.ram.total_ram_gb:.1f}GB | Threads: {self.max_workers}"
+        tk.Label(title_frame, text=info_text, 
+                 font=('Arial', 9), fg='#bdc3c7', bg="#2c3e50").pack(side=tk.LEFT, padx=30)
+        
+        container = tk.Frame(self.root, bg='#f0f0f0')
+        container.grid(row=1, column=0, sticky='nsew', padx=0, pady=0)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
 
-            main_canvas = tk.Canvas(container, bg='#f0f0f0', highlightthickness=0)
-            main_canvas.grid(row=0, column=0, sticky='nsew', padx=8, pady=8)
-            vscroll = ttk.Scrollbar(container, orient='vertical', command=main_canvas.yview)
-            vscroll.grid(row=0, column=1, sticky='ns')
-            main_canvas.configure(yscrollcommand=vscroll.set)
+        main_canvas = tk.Canvas(container, bg='#f0f0f0', highlightthickness=0)
+        main_canvas.grid(row=0, column=0, sticky='nsew', padx=8, pady=8)
+        vscroll = ttk.Scrollbar(container, orient='vertical', command=main_canvas.yview)
+        vscroll.grid(row=0, column=1, sticky='ns')
+        main_canvas.configure(yscrollcommand=vscroll.set)
 
-            main = tk.Frame(main_canvas, bg='#f0f0f0')
-            canvas_window = main_canvas.create_window((0, 0), window=main, anchor='nw')
+        main = tk.Frame(main_canvas, bg='#f0f0f0')
+        canvas_window = main_canvas.create_window((0, 0), window=main, anchor='nw')
 
-            def _on_frame_config(event):
-                main_canvas.configure(scrollregion=main_canvas.bbox("all"))
-            main.bind("<Configure>", _on_frame_config)
+        def _on_frame_config(event):
+            main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        main.bind("<Configure>", _on_frame_config)
 
-            def _on_canvas_config(event):
-                try:
-                    main_canvas.itemconfigure(canvas_window, width=event.width)
-                except Exception:
-                    pass
-            main_canvas.bind("<Configure>", _on_canvas_config)
+        def _on_canvas_config(event):
+            try:
+                main_canvas.itemconfigure(canvas_window, width=event.width)
+            except Exception:
+                pass
+        main_canvas.bind("<Configure>", _on_canvas_config)
 
-            main.rowconfigure(0, weight=3)
-            main.rowconfigure(1, weight=2)
-            main.columnconfigure(0, weight=1)
-            
-            progress_grid = tk.Frame(main, bg='#f0f0f0')
-            progress_grid.grid(row=0, column=0, sticky='nsew')
-            progress_grid.columnconfigure(0, weight=1)
-            progress_grid.columnconfigure(1, weight=1)
-            
-            prog_frame = tk.LabelFrame(progress_grid, text="Avancement global",
-                                       font=('Arial', 10, 'bold'),
-                                       bg='white', relief=tk.SUNKEN, bd=2)
-            prog_frame.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 6))
-            
-            self.prog_label = tk.Label(prog_frame, text="Pret", font=('Arial', 9), bg='white')
-            self.prog_label.pack(fill=tk.X, padx=8, pady=(6, 2))
-            
-            self.prog_bar = ttk.Progressbar(prog_frame, mode='determinate', maximum=100)
-            self.prog_bar.pack(fill=tk.X, padx=8, pady=2)
-            
-            self.prog_details = tk.Label(prog_frame, text="", font=('Arial', 8), bg='white', fg='#666')
-            self.prog_details.pack(fill=tk.X, padx=8, pady=2)
-            
-            self.eta_label = tk.Label(prog_frame, text="ETA: --:--", font=('Arial', 8), bg='white', fg='#666')
-            self.eta_label.pack(fill=tk.X, padx=8, pady=(0, 6))
-            
-            ton_frame = tk.LabelFrame(progress_grid, text="TON_IoT",
+        main.rowconfigure(0, weight=3)
+        main.rowconfigure(1, weight=2)
+        main.columnconfigure(0, weight=1)
+        
+        progress_grid = tk.Frame(main, bg='#f0f0f0')
+        progress_grid.grid(row=0, column=0, sticky='nsew')
+        progress_grid.columnconfigure(0, weight=1)
+        progress_grid.columnconfigure(1, weight=1)
+        
+        prog_frame = tk.LabelFrame(progress_grid, text="Avancement global",
+                                   font=('Arial', 10, 'bold'),
+                                   bg='white', relief=tk.SUNKEN, bd=2)
+        prog_frame.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+        
+        self.prog_label = tk.Label(prog_frame, text="Pret", font=('Arial', 9), bg='white')
+        self.prog_label.pack(fill=tk.X, padx=8, pady=(6, 2))
+        
+        self.prog_bar = ttk.Progressbar(prog_frame, mode='determinate', maximum=100)
+        self.prog_bar.pack(fill=tk.X, padx=8, pady=2)
+        
+        self.prog_details = tk.Label(prog_frame, text="", font=('Arial', 8), bg='white', fg='#666')
+        self.prog_details.pack(fill=tk.X, padx=8, pady=2)
+        
+        self.eta_label = tk.Label(prog_frame, text="ETA: --:--", font=('Arial', 8), bg='white', fg='#666')
+        self.eta_label.pack(fill=tk.X, padx=8, pady=(0, 6))
+        
+        ton_frame = tk.LabelFrame(progress_grid, text="TON_IoT",
+                                  font=('Arial', 10, 'bold'),
+                                  bg='white', relief=tk.SUNKEN, bd=2)
+        ton_frame.grid(row=1, column=0, sticky='nsew', padx=(0, 6), pady=2)
+        ton_frame.columnconfigure(0, weight=1)
+        
+        self.progress_blocks['ton_read'] = self._make_progress_block(ton_frame, "Lecture TON_IoT")
+        self.progress_blocks['ton_read']['frame'].grid(row=0, column=0, sticky='ew', padx=6, pady=4)
+        self.progress_blocks['ton_features'] = self._make_progress_block(ton_frame, "Features/clean")
+        self.progress_blocks['ton_features']['frame'].grid(row=1, column=0, sticky='ew', padx=6, pady=4)
+        
+        cic_frame = tk.LabelFrame(progress_grid, text="CIC (parallele)",
+                                  font=('Arial', 10, 'bold'),
+                                  bg='white', relief=tk.SUNKEN, bd=2)
+        cic_frame.grid(row=1, column=1, sticky='nsew', padx=(6, 0), pady=2)
+        cic_frame.columnconfigure(0, weight=1)
+        cic_frame.rowconfigure(2, weight=1)
+        
+        self.progress_blocks['cic_files'] = self._make_progress_block(cic_frame, "Fichiers CIC")
+        self.progress_blocks['cic_files']['frame'].grid(row=0, column=0, sticky='ew', padx=6, pady=4)
+        
+        tk.Label(cic_frame, text="Threads/fichiers actifs (progression)",
+                 font=('Arial', 8), bg='white', fg='#333').grid(row=1, column=0, sticky='w', padx=8)
+        
+        files_container = tk.Frame(cic_frame, bg='white')
+        files_container.grid(row=2, column=0, sticky='nsew', padx=6, pady=(0, 6))
+        files_container.columnconfigure(0, weight=1)
+        files_container.rowconfigure(0, weight=1)
+
+        self.files_canvas = tk.Canvas(files_container, bg='white', highlightthickness=0)
+        self.files_canvas.grid(row=0, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(files_container, orient='vertical', command=self.files_canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self.files_canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.file_progress_container = tk.Frame(self.files_canvas, bg='white')
+        self.files_canvas.create_window((0, 0), window=self.file_progress_container, anchor='nw')
+
+        def _on_config(event):
+            self.files_canvas.configure(scrollregion=self.files_canvas.bbox("all"))
+        self.file_progress_container.bind("<Configure>", _on_config)
+        
+        fusion_frame = tk.LabelFrame(progress_grid, text="Fusion finale",
+                                     font=('Arial', 10, 'bold'),
+                                     bg='white', relief=tk.SUNKEN, bd=2)
+        fusion_frame.grid(row=2, column=0, sticky='nsew', padx=(0, 6), pady=2)
+        fusion_frame.columnconfigure(0, weight=1)
+        
+        self.progress_blocks['fusion'] = self._make_progress_block(fusion_frame, "Ecriture fusion")
+        self.progress_blocks['fusion']['frame'].grid(row=0, column=0, sticky='ew', padx=6, pady=4)
+        
+        monitor_frame = tk.LabelFrame(progress_grid, text="Monitoring & Alertes",
                                       font=('Arial', 10, 'bold'),
                                       bg='white', relief=tk.SUNKEN, bd=2)
-            ton_frame.grid(row=1, column=0, sticky='nsew', padx=(0, 6), pady=2)
-            ton_frame.columnconfigure(0, weight=1)
-            
-            self.progress_blocks['ton_read'] = self._make_progress_block(ton_frame, "Lecture TON_IoT")
-            self.progress_blocks['ton_read']['frame'].grid(row=0, column=0, sticky='ew', padx=6, pady=4)
-            self.progress_blocks['ton_features'] = self._make_progress_block(ton_frame, "Features/clean")
-            self.progress_blocks['ton_features']['frame'].grid(row=1, column=0, sticky='ew', padx=6, pady=4)
-            
-            cic_frame = tk.LabelFrame(progress_grid, text="CIC (parallele)",
-                                      font=('Arial', 10, 'bold'),
-                                      bg='white', relief=tk.SUNKEN, bd=2)
-            cic_frame.grid(row=1, column=1, sticky='nsew', padx=(6, 0), pady=2)
-            cic_frame.columnconfigure(0, weight=1)
-            cic_frame.rowconfigure(2, weight=1)
-            
-            self.progress_blocks['cic_files'] = self._make_progress_block(cic_frame, "Fichiers CIC")
-            self.progress_blocks['cic_files']['frame'].grid(row=0, column=0, sticky='ew', padx=6, pady=4)
-            
-            tk.Label(cic_frame, text="Threads/fichiers actifs (progression)",
-                     font=('Arial', 8), bg='white', fg='#333').grid(row=1, column=0, sticky='w', padx=8)
-            
-            files_container = tk.Frame(cic_frame, bg='white')
-            files_container.grid(row=2, column=0, sticky='nsew', padx=6, pady=(0, 6))
-            files_container.columnconfigure(0, weight=1)
-            files_container.rowconfigure(0, weight=1)
-
-            # Scrollable area for many parallel file progress bars
-            self.files_canvas = tk.Canvas(files_container, bg='white', highlightthickness=0)
-            self.files_canvas.grid(row=0, column=0, sticky='nsew')
-            scrollbar = ttk.Scrollbar(files_container, orient='vertical', command=self.files_canvas.yview)
-            scrollbar.grid(row=0, column=1, sticky='ns')
-            self.files_canvas.configure(yscrollcommand=scrollbar.set)
-
-            self.file_progress_container = tk.Frame(self.files_canvas, bg='white')
-            self.files_canvas.create_window((0, 0), window=self.file_progress_container, anchor='nw')
-
-            def _on_config(event):
-                self.files_canvas.configure(scrollregion=self.files_canvas.bbox("all"))
-            self.file_progress_container.bind("<Configure>", _on_config)
-            
-            fusion_frame = tk.LabelFrame(progress_grid, text="Fusion finale",
-                                         font=('Arial', 10, 'bold'),
-                                         bg='white', relief=tk.SUNKEN, bd=2)
-            fusion_frame.grid(row=2, column=0, sticky='nsew', padx=(0, 6), pady=2)
-            fusion_frame.columnconfigure(0, weight=1)
-            
-            self.progress_blocks['fusion'] = self._make_progress_block(fusion_frame, "Ecriture fusion")
-            self.progress_blocks['fusion']['frame'].grid(row=0, column=0, sticky='ew', padx=6, pady=4)
-            
-            monitor_frame = tk.LabelFrame(progress_grid, text="Monitoring & Alertes",
-                                          font=('Arial', 10, 'bold'),
-                                          bg='white', relief=tk.SUNKEN, bd=2)
-            monitor_frame.grid(row=2, column=1, sticky='nsew', padx=(6, 0), pady=2)
-            monitor_frame.columnconfigure(0, weight=1)
-            monitor_frame.rowconfigure(3, weight=1)
-            
-            ram_frame = tk.Frame(monitor_frame, bg='white')
-            ram_frame.grid(row=0, column=0, sticky='ew', padx=6, pady=(6, 2))
-            self.ram_label = tk.Label(ram_frame, text="RAM: 0%", font=('Arial', 9), bg='white')
-            self.ram_label.pack(fill=tk.X)
-            self.ram_progress = ttk.Progressbar(ram_frame, mode='determinate', maximum=100)
-            self.ram_progress.pack(fill=tk.X, pady=2)
-            self.ram_details = tk.Label(ram_frame, text="", font=('Arial', 8), bg='white', fg='#666')
-            self.ram_details.pack(fill=tk.X)
-            
-            cpu_frame = tk.Frame(monitor_frame, bg='white')
-            cpu_frame.grid(row=1, column=0, sticky='ew', padx=6, pady=2)
-            self.cpu_label = tk.Label(cpu_frame, text="CPU: 0%", font=('Arial', 9), bg='white')
-            self.cpu_label.pack(fill=tk.X)
-            self.cpu_progress = ttk.Progressbar(cpu_frame, mode='determinate', maximum=100)
-            self.cpu_progress.pack(fill=tk.X, pady=2)
-            
-            alerts_frame = tk.Frame(monitor_frame, bg='white')
-            alerts_frame.grid(row=2, column=0, sticky='ew', padx=6, pady=2)
-            tk.Label(alerts_frame, text="Alertes", font=('Arial', 9, 'bold'), bg='white', fg='#2c3e50').pack(anchor='w')
-            self.alerts_text = scrolledtext.ScrolledText(alerts_frame, height=6,
-                                                         font=('Courier', 8),
-                                                         bg='#f8f8f8', fg='#333')
-            self.alerts_text.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
-            self.alerts_text.tag_config('error', foreground='#d32f2f', font=('Courier', 8, 'bold'))
-            self.alerts_text.tag_config('warning', foreground='#f57f17')
-            self.alerts_text.tag_config('success', foreground='#388e3c')
-            
-            logs_frame = tk.LabelFrame(main, text="Logs detailles (verbose)",
-                                      font=('Arial', 10, 'bold'),
-                                      bg='white', relief=tk.SUNKEN, bd=2)
-            logs_frame.grid(row=1, column=0, sticky='nsew', pady=(10, 0))
-            logs_frame.rowconfigure(0, weight=1)
-            logs_frame.columnconfigure(0, weight=1)
-            
-            self.logs_text = scrolledtext.ScrolledText(logs_frame,
-                                                       font=('Courier', 9),
-                                                       bg='#1e1e1e', fg='#00ff00')
-            self.logs_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
-            
-            footer = tk.Frame(self.root, bg='#ecf0f1', height=60)
-            footer.grid(row=2, column=0, sticky='ew')
-            
-            btn_frame = tk.Frame(footer, bg='#ecf0f1')
-            btn_frame.pack(side=tk.LEFT, padx=10, pady=10)
-            
-            self.start_btn = tk.Button(btn_frame, text="Demarrer",
-                                       command=self.start_consolidation,
-                                       bg='#27ae60', fg='white',
-                                       font=('Arial', 12, 'bold'),
-                                       padx=20, pady=10, relief=tk.RAISED, cursor="hand2")
-            self.start_btn.pack(side=tk.LEFT, padx=5)
-            
-            self.stop_btn = tk.Button(btn_frame, text="Arreter",
-                                      command=self.stop_consolidation,
-                                      bg='#e74c3c', fg='white',
-                                      font=('Arial', 12, 'bold'),
-                                      padx=20, pady=10, relief=tk.RAISED,
-                                      state=tk.DISABLED, cursor="hand2")
-            self.stop_btn.pack(side=tk.LEFT, padx=5)
-            
-            self.status_label = tk.Label(footer, text="Pret",
-                                         font=('Arial', 11, 'bold'),
-                                         fg='#27ae60', bg='#ecf0f1')
-            self.status_label.pack(side=tk.RIGHT, padx=20, pady=10)
-            
-        except Exception as e:
-            messagebox.showerror("Erreur UI", str(e))
+        monitor_frame.grid(row=2, column=1, sticky='nsew', padx=(6, 0), pady=2)
+        monitor_frame.columnconfigure(0, weight=1)
+        monitor_frame.rowconfigure(3, weight=1)
+        
+        ram_frame = tk.Frame(monitor_frame, bg='white')
+        ram_frame.grid(row=0, column=0, sticky='ew', padx=6, pady=(6, 2))
+        self.ram_label = tk.Label(ram_frame, text="RAM: 0%", font=('Arial', 9), bg='white')
+        self.ram_label.pack(fill=tk.X)
+        self.ram_progress = ttk.Progressbar(ram_frame, mode='determinate', maximum=100)
+        self.ram_progress.pack(fill=tk.X, pady=2)
+        self.ram_details = tk.Label(ram_frame, text="", font=('Arial', 8), bg='white', fg='#666')
+        self.ram_details.pack(fill=tk.X)
+        
+        cpu_frame = tk.Frame(monitor_frame, bg='white')
+        cpu_frame.grid(row=1, column=0, sticky='ew', padx=6, pady=2)
+        self.cpu_label = tk.Label(cpu_frame, text="CPU: 0%", font=('Arial', 9), bg='white')
+        self.cpu_label.pack(fill=tk.X)
+        self.cpu_progress = ttk.Progressbar(cpu_frame, mode='determinate', maximum=100)
+        self.cpu_progress.pack(fill=tk.X, pady=2)
+        
+        alerts_frame = tk.Frame(monitor_frame, bg='white')
+        alerts_frame.grid(row=2, column=0, sticky='ew', padx=6, pady=2)
+        tk.Label(alerts_frame, text="Alertes", font=('Arial', 9, 'bold'), bg='white', fg='#2c3e50').pack(anchor='w')
+        self.alerts_text = scrolledtext.ScrolledText(alerts_frame, height=6,
+                                                     font=('Courier', 8),
+                                                     bg='#f8f8f8', fg='#333')
+        self.alerts_text.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
+        self.alerts_text.tag_config('error', foreground='#d32f2f', font=('Courier', 8, 'bold'))
+        self.alerts_text.tag_config('warning', foreground='#f57f17')
+        self.alerts_text.tag_config('success', foreground='#388e3c')
+        
+        logs_frame = tk.LabelFrame(main, text="Logs detailles (verbose)",
+                                  font=('Arial', 10, 'bold'),
+                                  bg='white', relief=tk.SUNKEN, bd=2)
+        logs_frame.grid(row=1, column=0, sticky='nsew', pady=(10, 0))
+        logs_frame.rowconfigure(0, weight=1)
+        logs_frame.columnconfigure(0, weight=1)
+        
+        self.logs_text = scrolledtext.ScrolledText(logs_frame,
+                                                   font=('Courier', 9),
+                                                   bg='#1e1e1e', fg='#00ff00')
+        self.logs_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        
+        footer = tk.Frame(self.root, bg='#ecf0f1', height=60)
+        footer.grid(row=2, column=0, sticky='ew')
+        
+        btn_frame = tk.Frame(footer, bg='#ecf0f1')
+        btn_frame.pack(side=tk.LEFT, padx=10, pady=10)
+        
+        self.start_btn = tk.Button(btn_frame, text="Demarrer",
+                                   command=self.start_consolidation,
+                                   bg='#27ae60', fg='white',
+                                   font=('Arial', 12, 'bold'),
+                                   padx=20, pady=10)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = tk.Button(btn_frame, text="Arreter",
+                                  command=self.stop_consolidation,
+                                  bg='#e74c3c', fg='white',
+                                  font=('Arial', 12, 'bold'),
+                                  padx=20, pady=10,
+                                  state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.status_label = tk.Label(footer, text="Pret",
+                                     font=('Arial', 11, 'bold'),
+                                     fg='#27ae60', bg='#ecf0f1')
+        self.status_label.pack(side=tk.RIGHT, padx=20, pady=10)
     
     def log(self, msg, level='INFO'):
         try:
@@ -680,7 +653,6 @@ class ConsolidatorGUI:
             icon = icons.get(level, '>')
             formatted = f"{icon} [{ts}] {msg}"
             self.logs.append(formatted)
-
             def _apply():
                 self.logs_text.insert(tk.END, formatted + "\n")
                 self.logs_text.see(tk.END)
@@ -691,7 +663,6 @@ class ConsolidatorGUI:
     def log_alert(self, msg, level='warning'):
         try:
             self.alerts.append(msg)
-
             def _apply():
                 self.alerts_text.insert(tk.END, f"{msg}\n", level)
                 self.alerts_text.see(tk.END)
@@ -700,43 +671,35 @@ class ConsolidatorGUI:
             pass
 
     def log_error(self, msg):
-        self.log_alert(f"❌ {msg}", 'error')
+        self.log_alert(f"Erreur: {msg}", 'error')
     
     def log_success(self, msg):
-        self.log_alert(f"✅ {msg}", 'success')
+        self.log_alert(f"Succes: {msg}", 'success')
     
     def update_monitoring(self):
-        """Mettre à jour RAM/CPU en temps réel"""
+        """Mettre a jour RAM/CPU"""
         try:
             ram_pct = self.ram.get_ram_percent()
             cpu_pct = self.ram.get_cpu_percent()
-            
             self.ram_progress['value'] = ram_pct
             self.cpu_progress['value'] = cpu_pct
-            
             used = self.ram.get_used_ram_gb()
             avail = self.ram.get_available_ram_gb()
-            
             self.ram_label.config(text=f"RAM: {ram_pct:.1f}%")
             self.cpu_label.config(text=f"CPU: {cpu_pct:.1f}%")
             self.ram_details.config(text=f"U:{used:.1f}|A:{avail:.1f}|T:{self.ram.total_ram_gb:.1f}GB")
-            
             self.root.after(500, self.update_monitoring)
         except:
             self.root.after(500, self.update_monitoring)
     
     def update_progress(self, current, total, msg="", eta_sec=None):
-        """Mettre à jour progress bar avec ETA"""
+        """Mettre a jour progress bar"""
         try:
             pct = self._progress_percent(current, total)
-            if isinstance(current, float) and not float(current).is_integer():
-                current_display = f"{current:.1f}"
-            else:
-                current_display = str(int(current)) if total else str(current)
+            current_display = str(int(current)) if total else str(current)
             details = f"{current_display}/{total}" if total else current_display
             if pct:
                 details += f" ({pct}%)"
-
             def _apply():
                 self.prog_bar['value'] = pct
                 self.prog_label.config(text=msg)
@@ -750,13 +713,11 @@ class ConsolidatorGUI:
         if getattr(self, "running", False):
             messagebox.showwarning("Attention", "Processus en cours!")
             return
-        
         self.running = True
         self.start_time = time.time()
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="⏳ En cours...", fg='#f57f17')
-        
+        self.status_label.config(text="En cours...", fg='#f57f17')
         thread = threading.Thread(target=self.run_consolidation, daemon=True)
         thread.start()
     
@@ -764,112 +725,72 @@ class ConsolidatorGUI:
         self.running = False
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="⏹ Arrêté", fg='#e74c3c')
-        self.log("Processus arrêté", 'WARNING')
+        self.status_label.config(text="Arrete", fg='#e74c3c')
+        self.log("Processus arrete", 'WARNING')
     
     def process_cic_file(self, csv_file):
-        """
-        ✅ FIX 2: Multithreading ThreadPoolExecutor
-        Traiter UN fichier CIC (chunks) avec progression par fichier.
-        """
+        """Traiter UN fichier CIC (chunks)"""
         try:
             if not self.running:
                 return None
-
             filename = os.path.basename(csv_file)
             file_size_gb = os.path.getsize(csv_file) / (1024 ** 3)
             est_rows = estimate_csv_rows(csv_file, sample_lines=1500)
-            self.log(f"[CIC] {filename}: {file_size_gb:.2f} GB | ~{est_rows:,} lignes estimees", 'INFO')
-            self.update_file_progress(filename, 0, "Lecture en cours...")
+            self.log(f"[CIC] {filename}: {file_size_gb:.2f} GB | ~{est_rows:,} lignes", 'INFO')
+            self.update_file_progress(filename, 0, "Lecture...")
 
-            # ✅ CORRECT: Déterminer split à partir du dossier parent (CSV-03-11 = train, CSV-01-12 = test)
-            split = 'unknown'
+            split = 'train'
             try:
                 parent_folder = os.path.basename(os.path.dirname(csv_file)).lower()
-                
                 if '01-12' in parent_folder:
-                    split = 'test'   # Décembre
+                    split = 'test'
                 elif '03-11' in parent_folder:
-                    split = 'train'  # Novembre
-                else:
-                    split = 'unknown'
+                    split = 'train'
             except Exception:
-                split = 'unknown'
-
-            if split == 'unknown':
                 split = 'train'
-                self.log_alert(f"[CIC][{filename}] Split inconnu -> fallback TRAIN (dossier parent attendu: CSV-03-11 ou CSV-01-12)", 'warning')
 
             chunk_size = max(20000, min(150000, self.ram.chunk_size // 3))
             chunks = []
             processed_rows = 0
             chunk_index = 0
-            start_time = time.time()
 
-            # ✅ FIX 1: Supprimer dtype_backend et memory_map
-            reader = pd.read_csv(
-                csv_file,
-                low_memory=False,
-                chunksize=chunk_size,
-            )
-
-            for chunk in reader:
+            for chunk in pd.read_csv(csv_file, low_memory=False, chunksize=chunk_size, encoding='utf-8'):
                 if not self.running:
                     return None
-
                 chunk_index += 1
-                # Filtre DDoS uniquement
                 if 'Label' in chunk.columns:
                     chunk = chunk[chunk['Label'].astype(str).str.upper().str.contains('DDOS', na=False)]
                 if chunk.empty:
                     continue
                 numeric_cols = chunk.select_dtypes(include=[np.number]).columns.tolist()
-
                 if numeric_cols:
-                    # ✅ FIX 3: Compression float32 (9.7x de compression vs float64)
                     chunk_features = chunk[numeric_cols].astype(np.float32)
-                    chunk_features['Label'] = 1  # DDoS
+                    chunk_features['Label'] = 1
                     chunk_features['Split'] = split
                     chunk_features['Dataset'] = 'CICDDoS2019'
                     chunks.append(chunk_features)
                     processed_rows += len(chunk_features)
-
                 pct = self._progress_percent(processed_rows, est_rows)
-                status = f"Chunk {chunk_index}: {processed_rows:,}/{est_rows or '?'}"
-                self.update_file_progress(filename, pct, status)
-
-                if chunk_index % 2 == 0:
-                    elapsed = time.time() - start_time
-                    self.log(f"[CIC][{filename}] chunk {chunk_index} | {processed_rows:,} lignes | {pct}% | {elapsed:.1f}s", 'PROGRESS')
-
-                # ✅ FIX 4: Garbage collection (libère la mémoire après chaque chunk)
+                self.update_file_progress(filename, pct, f"Chunk {chunk_index}: {processed_rows:,}")
                 gc.collect()
 
             if chunks:
                 df_features = pd.concat(chunks, ignore_index=True)
                 total_rows = len(df_features)
-
-                self.log(f"[CIC][{filename}] {total_rows:,} lignes DDoS (float32) [{split.upper()}]", 'OK')
-                self.update_file_progress(filename, 100, f"Termine: {total_rows:,} lignes")
-
+                self.log(f"[CIC][{filename}] {total_rows:,} lignes [{split.upper()}]", 'OK')
+                self.update_file_progress(filename, 100, f"Termine: {total_rows:,}")
                 del chunks
                 gc.collect()
                 return {'data': df_features, 'rows': total_rows, 'filename': filename, 'split': split}
-
-            self.update_file_progress(filename, 100, "Aucune colonne numerique")
             return None
 
-        except pd.errors.ParserError as e:
-            self.update_file_progress(os.path.basename(csv_file), 100, "Erreur parser")
-            self.log_alert(f"Erreur parsing {os.path.basename(csv_file)}: {str(e)[:80]}", 'warning')
-            return None
         except Exception as e:
             self.update_file_progress(os.path.basename(csv_file), 100, "Erreur")
             self.log_alert(f"Erreur {os.path.basename(csv_file)}: {str(e)[:100]}", 'warning')
             return None
 
     def run_consolidation(self):
-        """Execution multithreadee optimisee avec barres detaillees."""
+        """Execution multithreadee"""
         try:
             self.log("=" * 60, 'INFO')
             self.log("DEMARRAGE CONSOLIDATION", 'INFO')
@@ -880,8 +801,8 @@ class ConsolidatorGUI:
                     try:
                         os.remove(temp_path)
                         self.log(f"Ancien fichier supprime: {temp_path}", 'WARNING')
-                    except Exception as e:
-                        self.log_alert(f"Impossible de supprimer {temp_path}: {e}", 'warning')
+                    except Exception:
+                        pass
 
             steps_total = 3
             self.update_progress(0, steps_total, "Initialisation...")
@@ -890,9 +811,8 @@ class ConsolidatorGUI:
             if not self.running:
                 return
 
-            # --- ETAPE 1: TON_IOT ---
             ton_est = estimate_csv_rows(self.ton_iot_path, sample_lines=4000)
-            self.log(f"TON_IoT -> estimation {ton_est:,} lignes", 'INFO')
+            self.log(f"TON_IoT -> {ton_est:,} lignes estimees", 'INFO')
             self.update_stage_progress('ton_read', 0, max(ton_est, 1), "Lecture TON_IoT")
             self.update_progress(0, steps_total, "Lecture TON_IoT...")
 
@@ -917,33 +837,18 @@ class ConsolidatorGUI:
                 chunk_idx = 0
                 chunks = []
 
-                # ✅ FIX 2: Supprimer usecols lambda
-                read_kwargs = {
-                    'low_memory': False,
-                }
-
-                if file_size_gb > 1.0:
-                    self.log("Fichier >1GB -> lecture par chunks optimisee", 'WARNING')
-                    for chunk in pd.read_csv(self.ton_iot_path, chunksize=chunk_size, **read_kwargs):
-                        if not self.running:
-                            return
-                        chunk_idx += 1
-                        # ✅ FIX 2: Filtrer les colonnes APRÈS la lecture
-                        chunk = chunk[[col for col in wanted_cols if col in chunk.columns]]
-                        processed_rows += len(chunk)
-                        chunks.append(chunk)
-                        self.update_stage_progress('ton_read', processed_rows, max(ton_est, processed_rows), f"Chunk {chunk_idx}")
-                        if chunk_idx % 2 == 0:
-                            self.log(f"[TON] chunk {chunk_idx} ({processed_rows:,} lignes)", 'PROGRESS')
-                        gc.collect()
-                    df_ton = pd.concat(chunks, ignore_index=True)
-                else:
-                    df_ton = pd.read_csv(self.ton_iot_path, **read_kwargs)
-                    # ✅ FIX 2: Filtrer les colonnes APRÈS la lecture
-                    df_ton = df_ton[[col for col in wanted_cols if col in df_ton.columns]]
-
+                for chunk in pd.read_csv(self.ton_iot_path, chunksize=chunk_size, low_memory=False, encoding='utf-8'):
+                    if not self.running:
+                        return
+                    chunk_idx += 1
+                    chunk = chunk[[col for col in wanted_cols if col in chunk.columns]]
+                    processed_rows += len(chunk)
+                    chunks.append(chunk)
+                    self.update_stage_progress('ton_read', processed_rows, max(ton_est, processed_rows), f"Chunk {chunk_idx}")
+                    gc.collect()
+                
+                df_ton = pd.concat(chunks, ignore_index=True)
                 self.ton_rows_total = len(df_ton)
-                self.update_stage_progress('ton_read', self.ton_rows_total, max(ton_est, self.ton_rows_total), f"Lecture terminee ({self.ton_rows_total:,})")
                 self.log(f"Chargement TON_IoT OK: {self.ton_rows_total:,} lignes", 'OK')
             except Exception as e:
                 self.log_error(f"Erreur chargement TON_IoT: {e}")
@@ -952,8 +857,7 @@ class ConsolidatorGUI:
             if not self.running:
                 return
 
-            # Creation features TON_IoT
-            self.update_stage_progress('ton_features', 10, 100, "Creation features TON_IoT...")
+            self.update_stage_progress('ton_features', 10, 100, "Creation features...")
             try:
                 df = pd.DataFrame()
                 cols = df_ton.columns.tolist()
@@ -962,7 +866,6 @@ class ConsolidatorGUI:
                     if src_col in cols:
                         df[dst_col] = pd.to_numeric(df_ton[src_col], errors='coerce').fillna(0).astype(np.float32)
 
-                self.update_stage_progress('ton_features', 40, 100, "Calcul ratios/flows...")
                 if 'Total Fwd Packets' in df.columns and 'Total Length Fwd Packets' in df.columns:
                     df['Fwd Packet Length Mean'] = np.where(
                         df['Total Fwd Packets'] > 0,
@@ -983,58 +886,30 @@ class ConsolidatorGUI:
                         (df['Total Length Fwd Packets'] + df['Total Length Bwd Packets']) / df['Flow Duration'],
                         0,
                     ).astype(np.float32)
-
                     df['Flow Packets/s'] = np.where(
                         df['Flow Duration'] > 0,
                         (df['Total Fwd Packets'] + df['Total Bwd Packets']) / df['Flow Duration'],
                         0,
                     ).astype(np.float32)
 
-                    df['Fwd Packets/s'] = np.where(
-                        df['Flow Duration'] > 0,
-                        df['Total Fwd Packets'] / df['Flow Duration'],
-                        0,
-                    ).astype(np.float32)
-
-                    df['Bwd Packets/s'] = np.where(
-                        df['Flow Duration'] > 0,
-                        df['Total Bwd Packets'] / df['Flow Duration'],
-                        0,
-                    ).astype(np.float32)
-
-                if 'Total Length Fwd Packets' in df.columns and 'Total Length Bwd Packets' in df.columns:
-                    df['Down/Up Ratio'] = np.where(
-                        df['Total Length Fwd Packets'] > 0,
-                        df['Total Length Bwd Packets'] / df['Total Length Fwd Packets'],
-                        0,
-                    ).astype(np.float32)
-
-                    df['Average Packet Size'] = np.where(
-                        (df['Total Fwd Packets'] + df['Total Bwd Packets']) > 0,
-                        (df['Total Length Fwd Packets'] + df['Total Length Bwd Packets']) / (df['Total Fwd Packets'] + df['Total Bwd Packets']),
-                        0,
-                    ).astype(np.float32)
-
-                df['Avg Fwd Segment Size'] = np.where(
-                    df.get('Total Fwd Packets', pd.Series([1] * len(df))) > 0,
-                    df.get('Total Length Fwd Packets', pd.Series([0] * len(df))) / df.get('Total Fwd Packets', pd.Series([1] * len(df))),
-                    0,
-                ).astype(np.float32)
-
-                df['Avg Bwd Segment Size'] = np.where(
-                    df.get('Total Bwd Packets', pd.Series([1] * len(df))) > 0,
-                    df.get('Total Length Bwd Packets', pd.Series([0] * len(df))) / df.get('Total Bwd Packets', pd.Series([1] * len(df))),
-                    0,
-                ).astype(np.float32)
-
+                if self.ton_split == 'random_60_40_scientific':
+                    np.random.seed(42)
+                    split_mask = np.random.rand(len(df)) < 0.6
+                    df['Split'] = 'train'
+                    df.loc[~split_mask, 'Split'] = 'test'
+                    train_count = split_mask.sum()
+                    test_count = (~split_mask).sum()
+                    self.log(f"[TON] Split scientifique 60/40: {train_count:,} TRAIN + {test_count:,} TEST", 'OK')
+                    self.ton_rows_total = int(train_count)
+                    self.ton_rows_test = int(test_count)
+                else:
+                    df['Split'] = self.ton_split
+                    self.log(f"[TON] Split: {self.ton_split.upper()}", 'OK')
+                
                 df['Dataset'] = 'TON_IoT'
                 df = df.fillna(0)
-
-                self.update_stage_progress('ton_features', 80, 100, "Ecriture temporaire TON_IoT")
-                df.to_csv(CONFIG['TEMP_TON'], index=False)
-                self.ton_rows_total = len(df)
+                df.to_csv(CONFIG['TEMP_TON'], index=False, encoding='utf-8')
                 self.update_stage_progress('ton_features', 100, 100, f"Sauvegarde TON_IoT ({self.ton_rows_total:,})")
-
                 del df_ton, df
                 gc.collect()
             except Exception as e:
@@ -1043,36 +918,20 @@ class ConsolidatorGUI:
 
             if not self.running:
                 return
-
             self.update_progress(1, steps_total, "TON_IoT termine")
 
-            # --- ETAPE 2: CIC MULTITHREAD ---
             self.log("TRAITEMENT CIC (MULTI)", 'INFO')
-            self.update_stage_progress('cic_files', 0, max(1, len(self.cic_files)), "CIC en attente")
             self.cic_rows_total = 0
             self.cic_rows_total_test = 0
-            self.log(f"Fichiers CIC à traiter: {len(self.cic_files)} | threads: {self.max_workers}", 'INFO')
 
-            if not self.cic_files:
-                self.log_alert("Aucun fichier CIC!", 'warning')
-            else:
+            if self.cic_files:
                 cic_success = 0
-                cic_failed = 0
-                # ✅ FIX 2: Multithreading ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = {executor.submit(self.process_cic_file, csv_file): csv_file for csv_file in self.cic_files}
-
                     for idx, future in enumerate(as_completed(futures), start=1):
                         if not self.running:
                             executor.shutdown(wait=False)
                             return
-
-                        csv_file = futures[future]
-                        elapsed = time.time() - self.start_time
-                        eta = (elapsed / idx) * (len(self.cic_files) - idx) if idx else None
-                        self.update_stage_progress('cic_files', idx, len(self.cic_files), f"Fichiers {idx}/{len(self.cic_files)}", eta)
-                        self.update_progress(1 + (idx / max(1, len(self.cic_files))), steps_total, f"CIC {idx}/{len(self.cic_files)}", eta)
-
                         try:
                             res = future.result()
                             if res and res.get('data') is not None:
@@ -1081,214 +940,92 @@ class ConsolidatorGUI:
                                 split = res.get('split', 'train')
                                 target_path = CONFIG['TEMP_CIC_TEST'] if split == 'test' else CONFIG['TEMP_CIC_TRAIN']
                                 write_header = not os.path.exists(target_path)
-                                df_res.to_csv(target_path, mode='a', header=write_header, index=False)
+                                df_res.to_csv(target_path, mode='a', header=write_header, index=False, encoding='utf-8')
                                 if split == 'test':
                                     self.cic_rows_total_test += rows
                                 else:
                                     self.cic_rows_total += rows
                                 cic_success += 1
-                                self.log(f"[CIC] {os.path.basename(csv_file)} -> {rows:,} lignes ecrites [{split.upper()}]", 'OK')
                                 del df_res
                                 gc.collect()
-                            else:
-                                cic_failed += 1
-                                self.log_alert(f"{os.path.basename(csv_file)}: aucune donnée retournée", 'warning')
-                        except Exception as e:
-                            cic_failed += 1
-                            self.update_file_progress(os.path.basename(csv_file), 100, "Erreur")
-                            self.log_alert(f"{os.path.basename(csv_file)}: {e}", 'warning')
-
-                self.update_stage_progress('cic_files', len(self.cic_files), max(1, len(self.cic_files)), "CIC termine")
-                self.log(f"CIC total: train={self.cic_rows_total:,} | test={self.cic_rows_total_test:,} | ok={cic_success} | erreurs={cic_failed}", 'INFO')
-                if os.path.exists(CONFIG['TEMP_CIC_TRAIN']):
-                    temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC_TRAIN']) / (1024 ** 3)
-                    self.log(f"Temp CIC train écrit: {temp_cic_size:.2f} GB -> {CONFIG['TEMP_CIC_TRAIN']}", 'INFO')
-                if os.path.exists(CONFIG['TEMP_CIC_TEST']):
-                    temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC_TEST']) / (1024 ** 3)
-                    self.log(f"Temp CIC test écrit: {temp_cic_size:.2f} GB -> {CONFIG['TEMP_CIC_TEST']}", 'INFO')
+                        except Exception:
+                            pass
+                self.log(f"CIC OK: {cic_success} fichiers traites", 'INFO')
 
             if not self.running:
                 return
 
-            # --- ETAPE 3: FUSION FINALE ---
             self.log("FUSION FINALE", 'INFO')
-            self.update_progress(2, steps_total, "Fusion finale...")
+            self.update_progress(2, steps_total, "Fusion...")
             self.reset_file_progress()
-            fusion_train_total = self.ton_rows_total + self.cic_rows_total
-            fusion_test_total = self.cic_rows_total_test
-            self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", 0, "Préparation fusion train")
-            self.update_file_progress("Fusion TEST (CIC_Dec)", 0, "Préparation fusion test")
-            self.update_stage_progress('fusion', 0, max(1, fusion_train_total + fusion_test_total), "Fusion en cours...")
 
             try:
-                temp_ton_size = os.path.getsize(CONFIG['TEMP_TON']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_TON']) else 0
-                temp_cic_train_size = os.path.getsize(CONFIG['TEMP_CIC_TRAIN']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_CIC_TRAIN']) else 0
-                temp_cic_test_size = os.path.getsize(CONFIG['TEMP_CIC_TEST']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_CIC_TEST']) else 0
-                self.log(f"Fusion TRAIN: TON {self.ton_rows_total:,} + CIC_Nov {self.cic_rows_total:,} => {fusion_train_total:,}", 'INFO')
-                self.log(f"Fusion TEST: CIC_Dec {self.cic_rows_total_test:,}", 'INFO')
-                fusion_start = time.time()
+                if self.ton_split == 'random_60_40_scientific':
+                    fusion_train_total = self.ton_rows_total + self.cic_rows_total
+                    fusion_test_total = self.ton_rows_test + self.cic_rows_total_test
+                elif self.ton_split == 'train':
+                    fusion_train_total = self.ton_rows_total + self.cic_rows_total
+                    fusion_test_total = self.cic_rows_total_test
+                else:
+                    fusion_train_total = self.cic_rows_total
+                    fusion_test_total = self.ton_rows_total + self.cic_rows_total_test
 
-                # Fusion TRAIN = TON_IoT + CIC novembre (train)
                 written_rows = 0
-                ton_chunk_size = max(50000, min(200000, self.ram.chunk_size // 4))
-                ton_start = time.time()
-                for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_TON'], chunksize=ton_chunk_size, low_memory=False), start=1):
+                for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_TON'], chunksize=100000, low_memory=False, encoding='utf-8'), start=1):
                     if not self.running:
                         return
-                    # ✅ FIX 3: Convertir SEULEMENT les colonnes numériques
                     numeric_cols = chunk.select_dtypes(include=[np.number]).columns.tolist()
                     for col in numeric_cols:
                         chunk[col] = chunk[col].astype(np.float32)
-                    chunk_rows = len(chunk)
                     mode = 'w' if chunk_idx == 1 else 'a'
                     header = chunk_idx == 1
-                    chunk.to_csv(CONFIG['FUSION_TRAIN_OUTPUT'], mode=mode, header=header, index=False)
-                    written_rows += chunk_rows
-                    self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", self._progress_percent(written_rows, max(1, fusion_train_total)), f"TON chunk {chunk_idx}: {written_rows:,}")
-                    self.update_stage_progress('fusion', written_rows, max(1, fusion_train_total + fusion_test_total), f"Train {written_rows:,}")
-                    progress_value = min(3, 2 + (written_rows / max(1, fusion_train_total + fusion_test_total)))
-                    self.update_progress(progress_value, steps_total, f"Fusion train {written_rows:,}/{fusion_train_total:,}")
-                    if chunk_idx % 2 == 0:
-                        elapsed = time.time() - ton_start
-                        self.log(f"[Fusion][TON] chunk {chunk_idx} +{chunk_rows:,} (total {written_rows:,}) | {elapsed:.1f}s", 'PROGRESS')
-                    del chunk
+                    chunk.to_csv(CONFIG['FUSION_TRAIN_OUTPUT'], mode=mode, header=header, index=False, encoding='utf-8')
+                    written_rows += len(chunk)
+                    self.update_progress(2.5, steps_total, f"Fusion train {written_rows:,}...")
                     gc.collect()
-                self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", self._progress_percent(written_rows, max(1, fusion_train_total)), f"TON écrit ({written_rows:,})")
-                self.log(f"TON_IoT ecrit: {written_rows:,} lignes en {time.time() - ton_start:.1f}s", 'OK')
 
-                # Append CIC train
-                cic_written = 0
-                if os.path.exists(CONFIG['TEMP_CIC_TRAIN']) and self.cic_rows_total:
-                    cic_chunk_size = max(50000, min(150000, self.ram.chunk_size // 8))
-                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC_TRAIN'], chunksize=cic_chunk_size, low_memory=False), start=1):
+                if os.path.exists(CONFIG['TEMP_CIC_TRAIN']):
+                    for chunk in pd.read_csv(CONFIG['TEMP_CIC_TRAIN'], chunksize=100000, low_memory=False, encoding='utf-8'):
                         if not self.running:
                             return
-                        # ✅ FIX 3: Convertir SEULEMENT les colonnes numériques
                         numeric_cols = chunk.select_dtypes(include=[np.number]).columns.tolist()
                         for col in numeric_cols:
                             chunk[col] = chunk[col].astype(np.float32)
-                        chunk_rows = len(chunk)
-                        chunk.to_csv(CONFIG['FUSION_TRAIN_OUTPUT'], mode='a', header=False, index=False)
-                        cic_written += chunk_rows
-                        written_rows += chunk_rows
-                        self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", self._progress_percent(written_rows, max(1, fusion_train_total)), f"CIC chunk {chunk_idx}: {written_rows:,}/{fusion_train_total:,}")
-                        self.update_stage_progress('fusion', written_rows, max(1, fusion_train_total + fusion_test_total), f"Train {written_rows:,}")
-                        progress_value = min(3, 2 + (written_rows / max(1, fusion_train_total + fusion_test_total)))
-                        self.update_progress(progress_value, steps_total, f"Fusion train {written_rows:,}/{fusion_train_total:,}")
-                        if chunk_idx == 1 or chunk_idx % 4 == 0:
-                            elapsed = time.time() - fusion_start
-                            self.log(f"[Fusion][CIC] chunk {chunk_idx} +{chunk_rows:,} (total {cic_written:,}) | global {written_rows:,} | {elapsed:.1f}s", 'PROGRESS')
-                        del chunk
+                        chunk.to_csv(CONFIG['FUSION_TRAIN_OUTPUT'], mode='a', header=False, index=False, encoding='utf-8')
+                        written_rows += len(chunk)
                         gc.collect()
-                    self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", 100, f"Train écrit ({written_rows:,})")
-                    self.log(f"CIC ajoute: {cic_written:,} lignes", 'OK')
-                else:
-                    self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", 100, f"Train écrit ({written_rows:,})")
 
-                # Fusion TEST = CIC décembre uniquement
                 test_written = 0
-                if os.path.exists(CONFIG['TEMP_CIC_TEST']) and self.cic_rows_total_test:
-                    test_chunk_size = max(50000, min(150000, self.ram.chunk_size // 8))
-                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC_TEST'], chunksize=test_chunk_size, low_memory=False), start=1):
+                if os.path.exists(CONFIG['TEMP_CIC_TEST']):
+                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC_TEST'], chunksize=100000, low_memory=False, encoding='utf-8'), start=1):
                         if not self.running:
                             return
-                        # ✅ FIX 3: Convertir SEULEMENT les colonnes numériques
                         numeric_cols = chunk.select_dtypes(include=[np.number]).columns.tolist()
                         for col in numeric_cols:
                             chunk[col] = chunk[col].astype(np.float32)
-                        chunk_rows = len(chunk)
                         mode = 'w' if chunk_idx == 1 else 'a'
                         header = chunk_idx == 1
-                        chunk.to_csv(CONFIG['FUSION_TEST_OUTPUT'], mode=mode, header=header, index=False)
-                        test_written += chunk_rows
-                        self.update_file_progress("Fusion TEST (CIC_Dec)", self._progress_percent(test_written, max(1, fusion_test_total)), f"Chunk {chunk_idx}: {test_written:,}/{fusion_test_total:,}")
-                        self.update_stage_progress('fusion', written_rows + test_written, max(1, fusion_train_total + fusion_test_total), f"Test {test_written:,}")
-                        progress_value = min(3, 2 + ((written_rows + test_written) / max(1, fusion_train_total + fusion_test_total)))
-                        self.update_progress(progress_value, steps_total, f"Fusion test {test_written:,}/{fusion_test_total:,}")
-                        if chunk_idx == 1 or chunk_idx % 4 == 0:
-                            elapsed = time.time() - fusion_start
-                            self.log(f"[Fusion][TEST] chunk {chunk_idx} +{chunk_rows:,} (total {test_written:,}) | {elapsed:.1f}s", 'PROGRESS')
-                        del chunk
+                        chunk.to_csv(CONFIG['FUSION_TEST_OUTPUT'], mode=mode, header=header, index=False, encoding='utf-8')
+                        test_written += len(chunk)
                         gc.collect()
-                    self.update_file_progress("Fusion TEST (CIC_Dec)", 100, f"Test écrit ({test_written:,})")
-                else:
-                    self.update_file_progress("Fusion TEST (CIC_Dec)", 100, "Aucun fichier test")
 
-                self.update_stage_progress('fusion', fusion_train_total + fusion_test_total, max(1, fusion_train_total + fusion_test_total), "Fusion terminee")
-                self.update_progress(3, steps_total, "Termine!")
-                self.log(f"Fusion terminee en {time.time() - fusion_start:.1f}s", 'OK')
-
-                # Nettoyage des fichiers temporaires
                 for temp_path in [CONFIG['TEMP_TON'], CONFIG['TEMP_CIC_TRAIN'], CONFIG['TEMP_CIC_TEST']]:
                     if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                        self.log(f"Supprime: {temp_path}", 'OK')
+                        try:
+                            os.remove(temp_path)
+                        except:
+                            pass
 
-                # ✅ VÉRIFICATION LABELS/CLASSES (au bon endroit)
-                self.log("\n" + "="*60, 'INFO')
-                self.log("VÉRIFICATION INTÉGRITÉ LABELS ET CLASSES", 'INFO')
-                self.log("="*60, 'INFO')
-                
-                try:
-                    # Vérifier TRAIN
-                    self.log("Vérification fusion_train_smart4.csv...", 'INFO')
-                    df_train = pd.read_csv(CONFIG['FUSION_TRAIN_OUTPUT'], nrows=10000, low_memory=False)
-                    issues_train, df_train_fixed = verify_labels_consistency("TRAIN", df_train)
-                    
-                    if issues_train:
-                        for issue in issues_train:
-                            self.log(issue, 'WARNING' if '⚠️' in issue else 'ERROR')
-                    
-                    if df_train_fixed is None:
-                        self.log_error("TRAIN: Vérification échouée")
-                        return
-                    
-                    # Vérifier TEST
-                    self.log("Vérification fusion_test_smart4.csv...", 'INFO')
-                    df_test = pd.read_csv(CONFIG['FUSION_TEST_OUTPUT'], nrows=10000, low_memory=False)
-                    issues_test, df_test_fixed = verify_labels_consistency("TEST", df_test)
-                    
-                    if issues_test:
-                        for issue in issues_test:
-                            self.log(issue, 'WARNING' if '⚠️' in issue else 'ERROR')
-                    
-                    if df_test_fixed is None:
-                        self.log_error("TEST: Vérification échouée")
-                        return
-                    
-                    # Classes finales
-                    classes_train = sorted(df_train_fixed['Label'].unique())
-                    classes_test = sorted(df_test_fixed['Label'].unique())
-                    
-                    self.log(f"✅ Classes TRAIN: {list(classes_train)}", 'OK')
-                    self.log(f"✅ Classes TEST: {list(classes_test)}", 'OK')
-                    
-                    if set(classes_train) != set(classes_test):
-                        self.log_alert("⚠️  Classes différentes entre TRAIN et TEST!", 'warning')
-                    else:
-                        self.log("✅ Classes identiques entre TRAIN et TEST", 'OK')
-                    
-                    # Sauvegarder classes pour NPZ
-                    final_classes = np.array(sorted(set(classes_train) | set(classes_test)))
-                    self.log(f"Classes finales pour NPZ: {list(final_classes)}", 'OK')
-                    
-                except Exception as e:
-                    self.log_error(f"Erreur vérification: {e}")
-                    # Continuer même si vérification échoue
-                
-                self.log_success(f"SUCCES: {CONFIG['FUSION_TRAIN_OUTPUT']} ({fusion_train_total:,} lignes) & {CONFIG['FUSION_TEST_OUTPUT']} ({fusion_test_total:,} lignes)")
+                self.update_progress(3, steps_total, "Termine!")
+                self.log("=" * 60, 'INFO')
+                self.log("CONSOLIDATION REUSSIE", 'OK')
+                self.log("=" * 60, 'INFO')
+                self.log_success(f"SUCCES: {written_rows:,} train | {test_written:,} test")
+                self.status_label.config(text="Succes", fg='#27ae60')
+
             except Exception as e:
                 self.log_error(f"Erreur fusion: {e}")
                 return
-
-            self.log("=" * 60, 'INFO')
-            self.log("CONSOLIDATION REUSSIE", 'OK')
-            self.log("=" * 60, 'INFO')
-
-            duration = time.time() - self.start_time
-            self.log(f"Duree: {str(timedelta(seconds=int(duration)))}", 'OK')
-
-            self.status_label.config(text="Succes", fg='#27ae60')
 
         except Exception as e:
             self.log_error(f"Erreur globale: {e}")
@@ -1299,28 +1036,23 @@ class ConsolidatorGUI:
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
 def main():
     try:
-        # Fenêtre 1 : sélection des chemins
         root1 = tk.Tk()
         selector = FileSelectorGUI(root1)
         root1.mainloop()
 
         if not selector.ton_iot_path or not selector.cic_dir_path:
-            print("❌ Annulé (chemins non fournis)")
+            print("Annule")
             sys.exit(1)
 
-        # Fenêtre 2 : consolidation avec progressions
         root2 = tk.Tk()
-        app = ConsolidatorGUI(root2, selector.ton_iot_path, selector.cic_dir_path, selector.cic_files_found)
+        ton_split = getattr(selector, 'ton_split', 'train')
+        app = ConsolidatorGUI(root2, selector.ton_iot_path, selector.cic_dir_path, selector.cic_files_found, ton_split)
         root2.mainloop()
         
     except Exception as e:
-        print(f"❌ Erreur: {e}")
+        print(f"Erreur: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
