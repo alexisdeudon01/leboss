@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 ORCHESTRATOR MASTER - DDoS DETECTION PROJECT
 ========================================
@@ -726,7 +726,7 @@ ETAPE 4: TEST DECISION TREE SPLITS
   [OK] F1 drop: ~0.001 (ZERO overfitting)
 
 ETAPE 5: ENTRAINEMENT MODELE FINAL
-  [OK] Decision Tree entraîne sur dataset complet
+  [OK] Decision Tree entraÃ®ne sur dataset complet
 
 ================================================================================
 
@@ -843,12 +843,12 @@ DEPLOIEMENT EN PRODUCTION
         
         # RESET COMPLET
         if not self.reset_all():
-            self.log("[ERROR] Erreur RESET, arrêt", "ERROR")
+            self.log("[ERROR] Erreur RESET, arrÃªt", "ERROR")
             return False
         
         # Verification structure
         if not self.verify_structure():
-            self.log("[ERROR] Structure invalide, arrêt", "ERROR")
+            self.log("[ERROR] Structure invalide, arrÃªt", "ERROR")
             return False
         
         # Pipeline
@@ -894,6 +894,10 @@ DEPLOIEMENT EN PRODUCTION
 
 def main():
     """Point d'entree principal"""
+    if run_with_progress_gui and USE_GUI:
+        # On affiche la GUI gÃ©nÃ©rique pour la partie CV si souhaitÃ©, sinon on exÃ©cute la pipeline classique.
+        run_with_progress_gui()
+        return
     print("\n" + "="*80)
     print("DDoS DETECTION PROJECT - ORCHESTRATOR MASTER")
     print("="*80 + "\n")
@@ -915,3 +919,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

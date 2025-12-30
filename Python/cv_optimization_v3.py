@@ -24,7 +24,6 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import f1_score, recall_score, precision_score
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
-
 os.environ['JOBLIB_PARALLEL_BACKEND'] = 'loky'
 NUM_CORES = multiprocessing.cpu_count()
 TRAIN_SIZES = np.array([0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95])
@@ -443,14 +442,11 @@ class CVOptimizationV3GUI:
 
 def main():
     try:
-        print('🔧 CV OPTIMIZATION V3 - FINAL')
+        print('"'"'🔧 CV OPTIMIZATION V3 - FINAL'"'"')
         root=tk.Tk()
         app=CVOptimizationV3GUI(root)
-        print('✅ Interface lancée')
+        print('"'"'✅ Interface lancée'"'"')
         root.mainloop()
     except Exception as e:
         print(f"❌ ERREUR: {e}")
         sys.exit(1)
-
-if __name__ == '__main__':
-    main()
