@@ -381,6 +381,7 @@ class ConsolidatorGUI:
         return widget
 
     def reset_file_progress(self):
+        # Clear all per-file widgets and reset scroll area
         for widget in self.file_progress_widgets.values():
             try:
                 widget['frame'].destroy()
@@ -388,6 +389,10 @@ class ConsolidatorGUI:
                 pass
         self.file_progress_widgets.clear()
         self.file_progress_order.clear()
+        try:
+            self.files_canvas.yview_moveto(0)
+        except Exception:
+            pass
 
     def update_file_progress(self, filename, percent, status_text):
         def _apply():
@@ -419,8 +424,31 @@ class ConsolidatorGUI:
                      font=('Arial', 9), fg='#bdc3c7', bg="#2c3e50").pack(side=tk.LEFT, padx=30)
             
             # MAIN GRID (progress + logs)
-            main = tk.Frame(self.root, bg='#f0f0f0')
-            main.grid(row=1, column=0, sticky='nsew', padx=8, pady=8)
+            container = tk.Frame(self.root, bg='#f0f0f0')
+            container.grid(row=1, column=0, sticky='nsew', padx=0, pady=0)
+            container.rowconfigure(0, weight=1)
+            container.columnconfigure(0, weight=1)
+
+            main_canvas = tk.Canvas(container, bg='#f0f0f0', highlightthickness=0)
+            main_canvas.grid(row=0, column=0, sticky='nsew', padx=8, pady=8)
+            vscroll = ttk.Scrollbar(container, orient='vertical', command=main_canvas.yview)
+            vscroll.grid(row=0, column=1, sticky='ns')
+            main_canvas.configure(yscrollcommand=vscroll.set)
+
+            main = tk.Frame(main_canvas, bg='#f0f0f0')
+            canvas_window = main_canvas.create_window((0, 0), window=main, anchor='nw')
+
+            def _on_frame_config(event):
+                main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+            main.bind("<Configure>", _on_frame_config)
+
+            def _on_canvas_config(event):
+                try:
+                    main_canvas.itemconfigure(canvas_window, width=event.width)
+                except Exception:
+                    pass
+            main_canvas.bind("<Configure>", _on_canvas_config)
+
             main.rowconfigure(0, weight=3)
             main.rowconfigure(1, weight=2)
             main.columnconfigure(0, weight=1)
@@ -475,9 +503,20 @@ class ConsolidatorGUI:
             files_container.grid(row=2, column=0, sticky='nsew', padx=6, pady=(0, 6))
             files_container.columnconfigure(0, weight=1)
             files_container.rowconfigure(0, weight=1)
-            
-            self.file_progress_container = tk.Frame(files_container, bg='white')
-            self.file_progress_container.grid(row=0, column=0, sticky='nsew')
+
+            # Scrollable area for many parallel file progress bars
+            self.files_canvas = tk.Canvas(files_container, bg='white', highlightthickness=0)
+            self.files_canvas.grid(row=0, column=0, sticky='nsew')
+            scrollbar = ttk.Scrollbar(files_container, orient='vertical', command=self.files_canvas.yview)
+            scrollbar.grid(row=0, column=1, sticky='ns')
+            self.files_canvas.configure(yscrollcommand=scrollbar.set)
+
+            self.file_progress_container = tk.Frame(self.files_canvas, bg='white')
+            self.files_canvas.create_window((0, 0), window=self.file_progress_container, anchor='nw')
+
+            def _on_config(event):
+                self.files_canvas.configure(scrollregion=self.files_canvas.bbox("all"))
+            self.file_progress_container.bind("<Configure>", _on_config)
             
             fusion_frame = tk.LabelFrame(progress_grid, text="Fusion finale",
                                          font=('Arial', 10, 'bold'),

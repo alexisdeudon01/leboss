@@ -25,6 +25,7 @@ import sys
 import warnings
 import time
 import pickle
+import threading
 from datetime import datetime
 
 from sklearn.cluster import KMeans
@@ -42,6 +43,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 warnings.filterwarnings('ignore')
+
+# Optional GUI integration
+try:
+    from progress_gui import GenericProgressGUI
+except ImportError:
+    GenericProgressGUI = None
+USE_GUI = os.getenv("USE_PROGRESS_GUI", "1") == "1"
 
 # ============================================================================
 # CONFIGURATION
@@ -64,7 +72,7 @@ CONFIG = {
 class AlgorithmsComparison:
     """Comparaison d'algorithmes"""
     
-    def __init__(self):
+    def __init__(self, ui=None):
         self.df = None
         self.X_train = None
         self.X_test = None
@@ -75,8 +83,19 @@ class AlgorithmsComparison:
         self.models = {}
         self.results = {}
         self.best_model_name = None
+        self.ui = ui
+        self.total_steps = 6  # load, prepare, train, eval, best, save/plot
         
-        self.print_header("COMPARAISON DES ALGORITHMES")
+        if self.ui:
+            self.ui.add_stage("load", "Chargement")
+            self.ui.add_stage("prep", "Préparation")
+            self.ui.add_stage("train", "Entraînement")
+            self.ui.add_stage("eval", "Évaluation")
+            self.ui.add_stage("best", "Meilleur modèle")
+            self.ui.add_stage("save", "Sauvegarde/Graphiques")
+            self.ui.log("UI prête pour comparaison", level="INFO")
+        else:
+            self.print_header("COMPARAISON DES ALGORITHMES")
     
     def print_header(self, text):
         print("\n" + "═" * 80)
@@ -99,6 +118,16 @@ class AlgorithmsComparison:
     # CHARGEMENT ET PRÉPARATION
     # ========================================================================
     
+    def _log_global(self, step_index, msg, eta=None):
+        if self.ui:
+            self.ui.update_global(step_index, self.total_steps, msg, eta)
+        else:
+            self.print_info(msg)
+
+    def _update_stage(self, key, current, total, msg="", eta=None):
+        if self.ui:
+            self.ui.update_stage(key, current, total, msg, eta)
+
     def load_data(self):
         """Charger les données"""
         self.print_section("CHARGEMENT DES DONNÉES")
@@ -124,10 +153,11 @@ class AlgorithmsComparison:
                 return False
             
             self.print_info(f"Chargement: {fichier_trouve}")
+            t0 = time.time()
             self.df = pd.read_csv(fichier_trouve, low_memory=False)
-            
-            self.print_success(f"Chargé: {len(self.df):,} lignes × {len(self.df.columns)} colonnes")
-            
+            self._update_stage("load", len(self.df), max(1, len(self.df)), "Lecture terminée")
+            self._log_global(1, f"Chargé {len(self.df):,} lignes", eta=None)
+            self.print_success(f"Chargé: {len(self.df):,} lignes × {len(self.df.columns)} colonnes ({time.time()-t0:.1f}s)")
             return True
         except Exception as e:
             self.print_error(f"Erreur chargement: {e}")
@@ -173,7 +203,8 @@ class AlgorithmsComparison:
             
             self.print_success(f"Train: {len(self.X_train):,} | Test: {len(self.X_test):,}")
             self.print_success("Features normalisées")
-            
+            self._update_stage("prep", len(self.X_train), max(1, len(self.df)), "Préparation ok")
+            self._log_global(2, "Préparation terminée")
             return True
         except Exception as e:
             self.print_error(f"Erreur préparation: {e}")
@@ -190,6 +221,7 @@ class AlgorithmsComparison:
         self.print_section("ENTRAÎNEMENT DES MODÈLES")
         
         try:
+            total = 4
             # 1. KMeans
             self.print_info("1. KMeans...")
             start = time.time()
@@ -198,6 +230,7 @@ class AlgorithmsComparison:
             km_time = time.time() - start
             self.models['KMeans'] = km
             self.print_success(f"   KMeans en {km_time:.2f}s")
+            self._update_stage("train", 1, total, "KMeans")
             
             # 2. Random Forest
             self.print_info("2. Random Forest...")
@@ -208,6 +241,7 @@ class AlgorithmsComparison:
             rf_time = time.time() - start
             self.models['Random Forest'] = rf
             self.print_success(f"   Random Forest en {rf_time:.2f}s")
+            self._update_stage("train", 2, total, "Random Forest")
             
             # 3. XGBoost (si disponible)
             if xgb:
@@ -219,8 +253,10 @@ class AlgorithmsComparison:
                 xgb_time = time.time() - start
                 self.models['XGBoost'] = xgb_model
                 self.print_success(f"   XGBoost en {xgb_time:.2f}s")
+                self._update_stage("train", 3, total, "XGBoost")
             else:
                 self.print_info("3. XGBoost... (non installé, installation: pip install xgboost)")
+                total -= 1  # ne compte pas dans la progression si absent
             
             # 4. Isolation Forest
             self.print_info("4. Isolation Forest...")
@@ -230,6 +266,8 @@ class AlgorithmsComparison:
             iso_time = time.time() - start
             self.models['Isolation Forest'] = iso
             self.print_success(f"   Isolation Forest en {iso_time:.2f}s")
+            self._update_stage("train", total, total, "Isolation Forest")
+            self._log_global(3, "Entraînement terminé")
             
             return True
         except Exception as e:
@@ -272,7 +310,8 @@ class AlgorithmsComparison:
                 
                 print(f"     Accuracy: {accuracy:.4f} | Precision: {precision:.4f} | "
                       f"Recall: {recall:.4f} | F1: {f1:.4f} | Time: {avg_time_ms:.4f}ms")
-            
+            self._update_stage("eval", len(self.models), max(1, len(self.models)), "Évaluations terminées")
+            self._log_global(4, "Évaluation OK")
             return True
         except Exception as e:
             self.print_error(f"Erreur évaluation: {e}")
@@ -308,6 +347,8 @@ class AlgorithmsComparison:
             self.print_info(f"  Recall:    {best_metrics['Recall']:.4f}")
             self.print_info(f"  F1-Score:  {best_metrics['F1-Score']:.4f}")
             self.print_info(f"  Time (ms): {best_metrics['Time (ms)']:.4f}")
+            self._update_stage("best", 1, 1, self.best_model_name)
+            self._log_global(5, "Meilleur modèle sélectionné")
             
             return True
         except Exception as e:
@@ -376,12 +417,14 @@ class AlgorithmsComparison:
             df_results = pd.DataFrame(self.results).T
             df_results.to_csv(CONFIG['OUTPUT_METRICS'])
             self.print_success(f"Métriques sauvegardées: {CONFIG['OUTPUT_METRICS']}")
-            
+            self._update_stage("save", 2, 3, "CSV sauvegardé")
             # Meilleur modèle
             best_model_obj = self.models[self.best_model_name]
             with open(CONFIG['OUTPUT_BEST_MODEL'], 'wb') as f:
                 pickle.dump(best_model_obj, f)
             self.print_success(f"Modèle sauvegardé: {CONFIG['OUTPUT_BEST_MODEL']}")
+            self._update_stage("save", 3, 3, "Sauvegardes terminées")
+            self._log_global(6, "Sauvegarde OK")
             
             return True
         except Exception as e:
@@ -472,21 +515,36 @@ class AlgorithmsComparison:
 
 def main():
     try:
-        comp = AlgorithmsComparison()
-        success = comp.run()
-        
-        if success:
-            print("\n" + "=" * 80)
-            print("📁 FICHIERS GÉNÉRÉS:")
-            print("=" * 80)
-            print(f"  1. {CONFIG['OUTPUT_RESULTS']}")
-            print(f"  2. {CONFIG['OUTPUT_METRICS']}")
-            print(f"  3. {CONFIG['OUTPUT_BEST_MODEL']}")
-            print(f"  4. {CONFIG['OUTPUT_CHART']}")
-            print("=" * 80 + "\n")
-            sys.exit(0)
+        if GenericProgressGUI and USE_GUI:
+            ui = GenericProgressGUI(title="Comparaison Algorithmes",
+                                    header_info=f"Fichier: {CONFIG['INPUT_FILE']}",
+                                    max_workers=4)
+            comp = AlgorithmsComparison(ui=ui)
+
+            def worker():
+                success = comp.run()
+                if success:
+                    ui.log_alert("Comparaison terminée", level="success")
+                else:
+                    ui.log_alert("Erreur durant la comparaison", level="error")
+            threading.Thread(target=worker, daemon=True).start()
+            ui.start()
         else:
-            sys.exit(1)
+            comp = AlgorithmsComparison(ui=None)
+            success = comp.run()
+            
+            if success:
+                print("\n" + "=" * 80)
+                print("📁 FICHIERS GÉNÉRÉS:")
+                print("=" * 80)
+                print(f"  1. {CONFIG['OUTPUT_RESULTS']}")
+                print(f"  2. {CONFIG['OUTPUT_METRICS']}")
+                print(f"  3. {CONFIG['OUTPUT_BEST_MODEL']}")
+                print(f"  4. {CONFIG['OUTPUT_CHART']}")
+                print("=" * 80 + "\n")
+                sys.exit(0)
+            else:
+                sys.exit(1)
     except Exception as e:
         print(f"\n❌ Erreur: {e}")
         import traceback
