@@ -601,7 +601,7 @@ FICHIERS FINAUX GÉNÉRÉS
             if self.cv_splits:
                 report += "\n" + "="*80 + "\nCV OPTIMIZATION RESULTS\n" + "="*80 + "\n"
                 for model, config in sorted(self.cv_splits.items()):
-                    report += f"  {model:<25} F1={config['f1_score']>7.4f}+/-{config.get('f1_std',0):>6.4f}  Train:{config['train_size']*100:>5.0f}%\n"
+                    report += f"  {model:<25} F1={config['f1_score']:>7.4f}+/-{config.get('f1_std',0):>6.4f}  Train:{config['train_size']*100:>5.0f}%\n"
             
             if self.ml_results:
                 report += "\n" + "="*80 + "\nML EVALUATION RESULTS\n" + "="*80 + "\n"
