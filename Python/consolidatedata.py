@@ -675,12 +675,11 @@ class ConsolidatorGUI:
             chunk_index = 0
             start_time = time.time()
 
+            # ✅ FIX 1: Supprimer dtype_backend et memory_map
             reader = pd.read_csv(
                 csv_file,
                 low_memory=False,
                 chunksize=chunk_size,
-                dtype_backend='numpy_nullable',
-                memory_map=True,
             )
 
             for chunk in reader:
@@ -778,9 +777,9 @@ class ConsolidatorGUI:
                 chunk_idx = 0
                 chunks = []
 
+                # ✅ FIX 2: Supprimer usecols lambda
                 read_kwargs = {
                     'low_memory': False,
-                    'usecols': lambda c: c in wanted_cols,
                 }
 
                 if file_size_gb > 1.0:
@@ -789,6 +788,8 @@ class ConsolidatorGUI:
                         if not self.running:
                             return
                         chunk_idx += 1
+                        # ✅ FIX 2: Filtrer les colonnes APRÈS la lecture
+                        chunk = chunk[[col for col in wanted_cols if col in chunk.columns]]
                         processed_rows += len(chunk)
                         chunks.append(chunk)
                         self.update_stage_progress('ton_read', processed_rows, max(ton_est, processed_rows), f"Chunk {chunk_idx}")
@@ -798,6 +799,8 @@ class ConsolidatorGUI:
                     df_ton = pd.concat(chunks, ignore_index=True)
                 else:
                     df_ton = pd.read_csv(self.ton_iot_path, **read_kwargs)
+                    # ✅ FIX 2: Filtrer les colonnes APRÈS la lecture
+                    df_ton = df_ton[[col for col in wanted_cols if col in df_ton.columns]]
 
                 self.ton_rows_total = len(df_ton)
                 self.update_stage_progress('ton_read', self.ton_rows_total, max(ton_est, self.ton_rows_total), f"Lecture terminee ({self.ton_rows_total:,})")
