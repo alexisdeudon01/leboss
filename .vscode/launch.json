@@ -2,10 +2,10 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "debugpy: test.py (envMaster)",
+      "name": "debugpy: consolidatedata${cwd}.py (envMaster)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/test.py",
+      "program": "${workspaceFolder}/consolidatedata.py",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/envMaster/Scripts/python.exe",

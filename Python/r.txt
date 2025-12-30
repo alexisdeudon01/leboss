@@ -1,7 +1,29 @@
-pandas>=1.3.0
-numpy>=1.21.0
-psutil>=5.8.0
-scikit-learn>=1.0.0
-matplotlib>=3.4.0
-seaborn>=0.11.0
-xgboost>=1.5.0
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "debugpy: test.py (envMaster)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/envMaster/Scripts/python.exe",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/.."
+      }
+    },
+    {
+      "name": "debugpy: current file (envMaster)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/envMaster/Scripts/python.exe",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/.."
+      }
+    }
+  ]
+}

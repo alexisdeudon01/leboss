@@ -907,10 +907,13 @@ class ConsolidatorGUI:
             self.log("TRAITEMENT CIC (MULTI)", 'INFO')
             self.update_stage_progress('cic_files', 0, max(1, len(self.cic_files)), "CIC en attente")
             self.cic_rows_total = 0
+            self.log(f"Fichiers CIC à traiter: {len(self.cic_files)} | threads: {self.max_workers}", 'INFO')
 
             if not self.cic_files:
                 self.log_alert("Aucun fichier CIC!", 'warning')
             else:
+                cic_success = 0
+                cic_failed = 0
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = {executor.submit(self.process_cic_file, csv_file): csv_file for csv_file in self.cic_files}
 
@@ -933,14 +936,23 @@ class ConsolidatorGUI:
                                 write_header = not os.path.exists(CONFIG['TEMP_CIC'])
                                 df_res.to_csv(CONFIG['TEMP_CIC'], mode='a', header=write_header, index=False)
                                 self.cic_rows_total += rows
+                                cic_success += 1
                                 self.log(f"[CIC] {os.path.basename(csv_file)} -> {rows:,} lignes ecrites", 'OK')
                                 del df_res
                                 gc.collect()
+                            else:
+                                cic_failed += 1
+                                self.log_alert(f"{os.path.basename(csv_file)}: aucune donnée retournée", 'warning')
                         except Exception as e:
+                            cic_failed += 1
+                            self.update_file_progress(os.path.basename(csv_file), 100, "Erreur")
                             self.log_alert(f"{os.path.basename(csv_file)}: {e}", 'warning')
 
                 self.update_stage_progress('cic_files', len(self.cic_files), max(1, len(self.cic_files)), "CIC termine")
-                self.log(f"CIC total: {self.cic_rows_total:,} lignes", 'INFO')
+                self.log(f"CIC total: {self.cic_rows_total:,} lignes | ok={cic_success} | erreurs={cic_failed}", 'INFO')
+                if os.path.exists(CONFIG['TEMP_CIC']):
+                    temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC']) / (1024 ** 3)
+                    self.log(f"Temp CIC écrit: {temp_cic_size:.2f} GB -> {CONFIG['TEMP_CIC']}", 'INFO')
 
             if not self.running:
                 return
@@ -950,39 +962,72 @@ class ConsolidatorGUI:
             self.update_progress(2, steps_total, "Fusion finale...")
             fusion_total = self.ton_rows_total + self.cic_rows_total
             self.fusion_rows_total = fusion_total
+            self.reset_file_progress()
+            self.update_file_progress("Fusion TON_IoT", 0, "Préparation fusion TON_IoT")
+            if self.cic_rows_total:
+                self.update_file_progress("Fusion CIC", 0, f"En attente ({self.cic_rows_total:,} lignes)")
             self.update_stage_progress('fusion', 0, max(1, fusion_total), "Fusion en cours...")
 
             try:
-                df_ton = pd.read_csv(CONFIG['TEMP_TON'], low_memory=False)
-                df_ton = df_ton.astype(np.float32)
-                df_ton.to_csv(CONFIG['FUSION_OUTPUT'], index=False)
-                written_rows = len(df_ton)
-                self.update_stage_progress('fusion', written_rows, max(1, fusion_total), f"TON_IoT {written_rows:,}/{fusion_total or written_rows}")
-                self.log(f"TON_IoT ecrit: {written_rows:,} lignes", 'OK')
+                temp_ton_size = os.path.getsize(CONFIG['TEMP_TON']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_TON']) else 0
+                temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_CIC']) else 0
+                self.log(f"Fusion: TON {self.ton_rows_total:,} lignes ({temp_ton_size:.2f} GB) + CIC {self.cic_rows_total:,} ({temp_cic_size:.2f} GB) => total {fusion_total:,}", 'INFO')
+                fusion_start = time.time()
+                written_rows = 0
 
-                del df_ton
-                gc.collect()
+                # Ecriture TON_IoT (stream + progress)
+                ton_chunk_size = max(50000, min(200000, self.ram.chunk_size // 4))
+                ton_start = time.time()
+                for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_TON'], chunksize=ton_chunk_size, low_memory=False), start=1):
+                    if not self.running:
+                        return
+                    chunk = chunk.astype(np.float32)
+                    chunk_rows = len(chunk)
+                    mode = 'w' if chunk_idx == 1 else 'a'
+                    header = chunk_idx == 1
+                    chunk.to_csv(CONFIG['FUSION_OUTPUT'], mode=mode, header=header, index=False)
+                    written_rows += chunk_rows
+                    self.update_file_progress("Fusion TON_IoT", self._progress_percent(written_rows, max(1, self.ton_rows_total)), f"Chunk {chunk_idx}: {written_rows:,}/{self.ton_rows_total:,}")
+                    self.update_stage_progress('fusion', written_rows, max(1, fusion_total), f"TON_IoT {written_rows:,}/{fusion_total or written_rows}")
+                    progress_value = min(3, 2 + (written_rows / max(1, fusion_total)))
+                    self.update_progress(progress_value, steps_total, f"Fusion {written_rows:,}/{fusion_total:,}")
+                    if chunk_idx % 2 == 0:
+                        elapsed = time.time() - ton_start
+                        self.log(f"[Fusion][TON] chunk {chunk_idx} +{chunk_rows:,} (total {written_rows:,}) | {elapsed:.1f}s", 'PROGRESS')
+                    del chunk
+                    gc.collect()
+                self.update_file_progress("Fusion TON_IoT", 100, f"TON_IoT écrit ({written_rows:,})")
+                self.log(f"TON_IoT ecrit: {written_rows:,} lignes en {time.time() - ton_start:.1f}s", 'OK')
 
-                if os.path.exists(CONFIG['TEMP_CIC']):
+                # Append CIC into fusion file
+                cic_written = 0
+                if os.path.exists(CONFIG['TEMP_CIC']) and self.cic_rows_total:
                     cic_chunk_size = max(50000, min(150000, self.ram.chunk_size // 8))
-                    cic_written = 0
-
-                    for chunk in pd.read_csv(CONFIG['TEMP_CIC'], chunksize=cic_chunk_size, low_memory=False):
+                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC'], chunksize=cic_chunk_size, low_memory=False), start=1):
                         if not self.running:
                             return
                         chunk = chunk.astype(np.float32)
+                        chunk_rows = len(chunk)
                         chunk.to_csv(CONFIG['FUSION_OUTPUT'], mode='a', header=False, index=False)
-                        cic_written += len(chunk)
-                        written_rows += len(chunk)
+                        cic_written += chunk_rows
+                        written_rows += chunk_rows
+                        self.update_file_progress("Fusion CIC", self._progress_percent(cic_written, max(1, self.cic_rows_total)), f"Chunk {chunk_idx}: {cic_written:,}/{self.cic_rows_total:,}")
                         self.update_stage_progress('fusion', written_rows, max(1, fusion_total), f"CIC {cic_written:,}/{self.cic_rows_total:,}")
-                        self.log(f"[Fusion] CIC +{len(chunk):,} lignes (total {written_rows:,})", 'PROGRESS')
+                        progress_value = min(3, 2 + (written_rows / max(1, fusion_total)))
+                        self.update_progress(progress_value, steps_total, f"Fusion {written_rows:,}/{fusion_total:,}")
+                        if chunk_idx == 1 or chunk_idx % 4 == 0:
+                            elapsed = time.time() - fusion_start
+                            self.log(f"[Fusion][CIC] chunk {chunk_idx} +{chunk_rows:,} (total {cic_written:,}) | global {written_rows:,} | {elapsed:.1f}s", 'PROGRESS')
                         del chunk
                         gc.collect()
-
+                    self.update_file_progress("Fusion CIC", 100, f"CIC écrit ({cic_written:,})")
                     self.log(f"CIC ajoute: {cic_written:,} lignes", 'OK')
+                elif self.cic_rows_total == 0:
+                    self.update_file_progress("Fusion CIC", 100, "Aucun fichier CIC")
 
                 self.update_stage_progress('fusion', fusion_total or written_rows, max(1, fusion_total or written_rows), "Fusion terminee")
                 self.update_progress(3, steps_total, "Termine!")
+                self.log(f"Fusion terminee en {time.time() - fusion_start:.1f}s", 'OK')
 
                 # Nettoyage des fichiers temporaires
                 for temp_path in [CONFIG['TEMP_TON'], CONFIG['TEMP_CIC']]:
