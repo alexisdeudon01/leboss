@@ -45,9 +45,11 @@ warnings.filterwarnings('ignore')
 CONFIG = {
     'TON_IOT_INPUT': None,
     'CIC_DIR': None,
-    'FUSION_OUTPUT': 'fusion_ton_iot_cic_final_smart4.csv',
+    'FUSION_TRAIN_OUTPUT': 'fusion_train_smart4.csv',
+    'FUSION_TEST_OUTPUT': 'fusion_test_smart4.csv',
     'TEMP_TON': 'temp_ton_iot.csv',
-    'TEMP_CIC': 'temp_cic.csv',
+    'TEMP_CIC_TRAIN': 'temp_cic_train.csv',
+    'TEMP_CIC_TEST': 'temp_cic_test.csv',
 }
 
 # ============================================================================
@@ -294,6 +296,7 @@ class ConsolidatorGUI:
             self.cic_processed = 0
             self.cic_total = len(self.cic_files)
             self.cic_rows_total = 0
+            self.cic_rows_total_test = 0
             self.ton_rows_total = 0
             self.fusion_rows_total = 0
             self.logs = deque(maxlen=500)
@@ -708,6 +711,20 @@ class ConsolidatorGUI:
             self.log(f"[CIC] {filename}: {file_size_gb:.2f} GB | ~{est_rows:,} lignes estimees", 'INFO')
             self.update_file_progress(filename, 0, "Lecture en cours...")
 
+            # Déterminer split à partir de la date dans le nom (201811 = train, 201812 = test)
+            split = 'unknown'
+            try:
+                parts = filename.split('_')
+                date_part = parts[1] if len(parts) > 1 else ''
+                if date_part.startswith('201811'):
+                    split = 'train'
+                elif date_part.startswith('201812'):
+                    split = 'test'
+            except Exception:
+                split = 'unknown'
+            if split == 'unknown':
+                self.log_alert(f"[CIC][{filename}] Split inconnu (attendu 201811/201812)", 'warning')
+
             chunk_size = max(20000, min(150000, self.ram.chunk_size // 3))
             chunks = []
             processed_rows = 0
@@ -726,10 +743,18 @@ class ConsolidatorGUI:
                     return None
 
                 chunk_index += 1
+                # Filtre DDoS uniquement
+                if 'Label' in chunk.columns:
+                    chunk = chunk[chunk['Label'].astype(str).str.upper().str.contains('DDOS', na=False)]
+                if chunk.empty:
+                    continue
                 numeric_cols = chunk.select_dtypes(include=[np.number]).columns.tolist()
 
                 if numeric_cols:
                     chunk_features = chunk[numeric_cols].astype(np.float32)
+                    chunk_features['Label'] = 'DDoS'
+                    chunk_features['Split'] = split
+                    chunk_features['Dataset'] = 'CICDDoS2019'
                     chunks.append(chunk_features)
                     processed_rows += len(chunk_features)
 
@@ -745,15 +770,14 @@ class ConsolidatorGUI:
 
             if chunks:
                 df_features = pd.concat(chunks, ignore_index=True)
-                df_features['Dataset'] = 'CICDDoS2019'
                 total_rows = len(df_features)
 
-                self.log(f"[CIC][{filename}] {total_rows:,} lignes numeriques (float32)", 'OK')
+                self.log(f"[CIC][{filename}] {total_rows:,} lignes DDoS (float32) [{split.upper()}]", 'OK')
                 self.update_file_progress(filename, 100, f"Termine: {total_rows:,} lignes")
 
                 del chunks
                 gc.collect()
-                return {'data': df_features, 'rows': total_rows, 'filename': filename}
+                return {'data': df_features, 'rows': total_rows, 'filename': filename, 'split': split}
 
             self.update_file_progress(filename, 100, "Aucune colonne numerique")
             return None
@@ -774,7 +798,7 @@ class ConsolidatorGUI:
             self.log("DEMARRAGE CONSOLIDATION", 'INFO')
             self.log("=" * 60, 'INFO')
 
-            for temp_path in [CONFIG['TEMP_TON'], CONFIG['TEMP_CIC']]:
+            for temp_path in [CONFIG['TEMP_TON'], CONFIG['TEMP_CIC_TRAIN'], CONFIG['TEMP_CIC_TEST']]:
                 if os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
@@ -949,6 +973,7 @@ class ConsolidatorGUI:
             self.log("TRAITEMENT CIC (MULTI)", 'INFO')
             self.update_stage_progress('cic_files', 0, max(1, len(self.cic_files)), "CIC en attente")
             self.cic_rows_total = 0
+            self.cic_rows_total_test = 0
             self.log(f"Fichiers CIC à traiter: {len(self.cic_files)} | threads: {self.max_workers}", 'INFO')
 
             if not self.cic_files:
@@ -975,11 +1000,16 @@ class ConsolidatorGUI:
                             if res and res.get('data') is not None:
                                 df_res = res['data']
                                 rows = res.get('rows', len(df_res))
-                                write_header = not os.path.exists(CONFIG['TEMP_CIC'])
-                                df_res.to_csv(CONFIG['TEMP_CIC'], mode='a', header=write_header, index=False)
-                                self.cic_rows_total += rows
+                                split = res.get('split', 'train')
+                                target_path = CONFIG['TEMP_CIC_TEST'] if split == 'test' else CONFIG['TEMP_CIC_TRAIN']
+                                write_header = not os.path.exists(target_path)
+                                df_res.to_csv(target_path, mode='a', header=write_header, index=False)
+                                if split == 'test':
+                                    self.cic_rows_total_test += rows
+                                else:
+                                    self.cic_rows_total += rows
                                 cic_success += 1
-                                self.log(f"[CIC] {os.path.basename(csv_file)} -> {rows:,} lignes ecrites", 'OK')
+                                self.log(f"[CIC] {os.path.basename(csv_file)} -> {rows:,} lignes ecrites [{split}]", 'OK')
                                 del df_res
                                 gc.collect()
                             else:
@@ -991,10 +1021,13 @@ class ConsolidatorGUI:
                             self.log_alert(f"{os.path.basename(csv_file)}: {e}", 'warning')
 
                 self.update_stage_progress('cic_files', len(self.cic_files), max(1, len(self.cic_files)), "CIC termine")
-                self.log(f"CIC total: {self.cic_rows_total:,} lignes | ok={cic_success} | erreurs={cic_failed}", 'INFO')
-                if os.path.exists(CONFIG['TEMP_CIC']):
-                    temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC']) / (1024 ** 3)
-                    self.log(f"Temp CIC écrit: {temp_cic_size:.2f} GB -> {CONFIG['TEMP_CIC']}", 'INFO')
+                self.log(f"CIC total: train={self.cic_rows_total:,} | test={self.cic_rows_total_test:,} | ok={cic_success} | erreurs={cic_failed}", 'INFO')
+                if os.path.exists(CONFIG['TEMP_CIC_TRAIN']):
+                    temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC_TRAIN']) / (1024 ** 3)
+                    self.log(f"Temp CIC train écrit: {temp_cic_size:.2f} GB -> {CONFIG['TEMP_CIC_TRAIN']}", 'INFO')
+                if os.path.exists(CONFIG['TEMP_CIC_TEST']):
+                    temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC_TEST']) / (1024 ** 3)
+                    self.log(f"Temp CIC test écrit: {temp_cic_size:.2f} GB -> {CONFIG['TEMP_CIC_TEST']}", 'INFO')
 
             if not self.running:
                 return
@@ -1002,22 +1035,23 @@ class ConsolidatorGUI:
             # --- ETAPE 3: FUSION FINALE ---
             self.log("FUSION FINALE", 'INFO')
             self.update_progress(2, steps_total, "Fusion finale...")
-            fusion_total = self.ton_rows_total + self.cic_rows_total
-            self.fusion_rows_total = fusion_total
             self.reset_file_progress()
-            self.update_file_progress("Fusion TON_IoT", 0, "Préparation fusion TON_IoT")
-            if self.cic_rows_total:
-                self.update_file_progress("Fusion CIC", 0, f"En attente ({self.cic_rows_total:,} lignes)")
-            self.update_stage_progress('fusion', 0, max(1, fusion_total), "Fusion en cours...")
+            fusion_train_total = self.ton_rows_total + self.cic_rows_total
+            fusion_test_total = self.cic_rows_total_test
+            self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", 0, "Préparation fusion train")
+            self.update_file_progress("Fusion TEST (CIC_Dec)", 0, "Préparation fusion test")
+            self.update_stage_progress('fusion', 0, max(1, fusion_train_total + fusion_test_total), "Fusion en cours...")
 
             try:
                 temp_ton_size = os.path.getsize(CONFIG['TEMP_TON']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_TON']) else 0
-                temp_cic_size = os.path.getsize(CONFIG['TEMP_CIC']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_CIC']) else 0
-                self.log(f"Fusion: TON {self.ton_rows_total:,} lignes ({temp_ton_size:.2f} GB) + CIC {self.cic_rows_total:,} ({temp_cic_size:.2f} GB) => total {fusion_total:,}", 'INFO')
+                temp_cic_train_size = os.path.getsize(CONFIG['TEMP_CIC_TRAIN']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_CIC_TRAIN']) else 0
+                temp_cic_test_size = os.path.getsize(CONFIG['TEMP_CIC_TEST']) / (1024 ** 3) if os.path.exists(CONFIG['TEMP_CIC_TEST']) else 0
+                self.log(f"Fusion TRAIN: TON {self.ton_rows_total:,} + CIC_Nov {self.cic_rows_total:,} => {fusion_train_total:,}", 'INFO')
+                self.log(f"Fusion TEST: CIC_Dec {self.cic_rows_total_test:,}", 'INFO')
                 fusion_start = time.time()
-                written_rows = 0
 
-                # Ecriture TON_IoT (stream + progress)
+                # Fusion TRAIN = TON_IoT + CIC novembre (train)
+                written_rows = 0
                 ton_chunk_size = max(50000, min(200000, self.ram.chunk_size // 4))
                 ton_start = time.time()
                 for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_TON'], chunksize=ton_chunk_size, low_memory=False), start=1):
@@ -1027,57 +1061,83 @@ class ConsolidatorGUI:
                     chunk_rows = len(chunk)
                     mode = 'w' if chunk_idx == 1 else 'a'
                     header = chunk_idx == 1
-                    chunk.to_csv(CONFIG['FUSION_OUTPUT'], mode=mode, header=header, index=False)
+                    chunk.to_csv(CONFIG['FUSION_TRAIN_OUTPUT'], mode=mode, header=header, index=False)
                     written_rows += chunk_rows
-                    self.update_file_progress("Fusion TON_IoT", self._progress_percent(written_rows, max(1, self.ton_rows_total)), f"Chunk {chunk_idx}: {written_rows:,}/{self.ton_rows_total:,}")
-                    self.update_stage_progress('fusion', written_rows, max(1, fusion_total), f"TON_IoT {written_rows:,}/{fusion_total or written_rows}")
-                    progress_value = min(3, 2 + (written_rows / max(1, fusion_total)))
-                    self.update_progress(progress_value, steps_total, f"Fusion {written_rows:,}/{fusion_total:,}")
+                    self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", self._progress_percent(written_rows, max(1, fusion_train_total)), f"TON chunk {chunk_idx}: {written_rows:,}")
+                    self.update_stage_progress('fusion', written_rows, max(1, fusion_train_total + fusion_test_total), f"Train {written_rows:,}")
+                    progress_value = min(3, 2 + (written_rows / max(1, fusion_train_total + fusion_test_total)))
+                    self.update_progress(progress_value, steps_total, f"Fusion train {written_rows:,}/{fusion_train_total:,}")
                     if chunk_idx % 2 == 0:
                         elapsed = time.time() - ton_start
                         self.log(f"[Fusion][TON] chunk {chunk_idx} +{chunk_rows:,} (total {written_rows:,}) | {elapsed:.1f}s", 'PROGRESS')
                     del chunk
                     gc.collect()
-                self.update_file_progress("Fusion TON_IoT", 100, f"TON_IoT écrit ({written_rows:,})")
+                self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", self._progress_percent(written_rows, max(1, fusion_train_total)), f"TON écrit ({written_rows:,})")
                 self.log(f"TON_IoT ecrit: {written_rows:,} lignes en {time.time() - ton_start:.1f}s", 'OK')
 
-                # Append CIC into fusion file
+                # Append CIC train
                 cic_written = 0
-                if os.path.exists(CONFIG['TEMP_CIC']) and self.cic_rows_total:
+                if os.path.exists(CONFIG['TEMP_CIC_TRAIN']) and self.cic_rows_total:
                     cic_chunk_size = max(50000, min(150000, self.ram.chunk_size // 8))
-                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC'], chunksize=cic_chunk_size, low_memory=False), start=1):
+                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC_TRAIN'], chunksize=cic_chunk_size, low_memory=False), start=1):
                         if not self.running:
                             return
                         chunk = chunk.astype(np.float32)
                         chunk_rows = len(chunk)
-                        chunk.to_csv(CONFIG['FUSION_OUTPUT'], mode='a', header=False, index=False)
+                        chunk.to_csv(CONFIG['FUSION_TRAIN_OUTPUT'], mode='a', header=False, index=False)
                         cic_written += chunk_rows
                         written_rows += chunk_rows
-                        self.update_file_progress("Fusion CIC", self._progress_percent(cic_written, max(1, self.cic_rows_total)), f"Chunk {chunk_idx}: {cic_written:,}/{self.cic_rows_total:,}")
-                        self.update_stage_progress('fusion', written_rows, max(1, fusion_total), f"CIC {cic_written:,}/{self.cic_rows_total:,}")
-                        progress_value = min(3, 2 + (written_rows / max(1, fusion_total)))
-                        self.update_progress(progress_value, steps_total, f"Fusion {written_rows:,}/{fusion_total:,}")
+                        self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", self._progress_percent(written_rows, max(1, fusion_train_total)), f"CIC chunk {chunk_idx}: {written_rows:,}/{fusion_train_total:,}")
+                        self.update_stage_progress('fusion', written_rows, max(1, fusion_train_total + fusion_test_total), f"Train {written_rows:,}")
+                        progress_value = min(3, 2 + (written_rows / max(1, fusion_train_total + fusion_test_total)))
+                        self.update_progress(progress_value, steps_total, f"Fusion train {written_rows:,}/{fusion_train_total:,}")
                         if chunk_idx == 1 or chunk_idx % 4 == 0:
                             elapsed = time.time() - fusion_start
                             self.log(f"[Fusion][CIC] chunk {chunk_idx} +{chunk_rows:,} (total {cic_written:,}) | global {written_rows:,} | {elapsed:.1f}s", 'PROGRESS')
                         del chunk
                         gc.collect()
-                    self.update_file_progress("Fusion CIC", 100, f"CIC écrit ({cic_written:,})")
+                    self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", 100, f"Train écrit ({written_rows:,})")
                     self.log(f"CIC ajoute: {cic_written:,} lignes", 'OK')
-                elif self.cic_rows_total == 0:
-                    self.update_file_progress("Fusion CIC", 100, "Aucun fichier CIC")
+                else:
+                    self.update_file_progress("Fusion TRAIN (TON + CIC_Nov)", 100, f"Train écrit ({written_rows:,})")
 
-                self.update_stage_progress('fusion', fusion_total or written_rows, max(1, fusion_total or written_rows), "Fusion terminee")
+                # Fusion TEST = CIC décembre uniquement
+                test_written = 0
+                if os.path.exists(CONFIG['TEMP_CIC_TEST']) and self.cic_rows_total_test:
+                    test_chunk_size = max(50000, min(150000, self.ram.chunk_size // 8))
+                    for chunk_idx, chunk in enumerate(pd.read_csv(CONFIG['TEMP_CIC_TEST'], chunksize=test_chunk_size, low_memory=False), start=1):
+                        if not self.running:
+                            return
+                        chunk = chunk.astype(np.float32)
+                        chunk_rows = len(chunk)
+                        mode = 'w' if chunk_idx == 1 else 'a'
+                        header = chunk_idx == 1
+                        chunk.to_csv(CONFIG['FUSION_TEST_OUTPUT'], mode=mode, header=header, index=False)
+                        test_written += chunk_rows
+                        self.update_file_progress("Fusion TEST (CIC_Dec)", self._progress_percent(test_written, max(1, fusion_test_total)), f"Chunk {chunk_idx}: {test_written:,}/{fusion_test_total:,}")
+                        self.update_stage_progress('fusion', written_rows + test_written, max(1, fusion_train_total + fusion_test_total), f"Test {test_written:,}")
+                        progress_value = min(3, 2 + ((written_rows + test_written) / max(1, fusion_train_total + fusion_test_total)))
+                        self.update_progress(progress_value, steps_total, f"Fusion test {test_written:,}/{fusion_test_total:,}")
+                        if chunk_idx == 1 or chunk_idx % 4 == 0:
+                            elapsed = time.time() - fusion_start
+                            self.log(f"[Fusion][TEST] chunk {chunk_idx} +{chunk_rows:,} (total {test_written:,}) | {elapsed:.1f}s", 'PROGRESS')
+                        del chunk
+                        gc.collect()
+                    self.update_file_progress("Fusion TEST (CIC_Dec)", 100, f"Test écrit ({test_written:,})")
+                else:
+                    self.update_file_progress("Fusion TEST (CIC_Dec)", 100, "Aucun fichier test")
+
+                self.update_stage_progress('fusion', fusion_train_total + fusion_test_total, max(1, fusion_train_total + fusion_test_total), "Fusion terminee")
                 self.update_progress(3, steps_total, "Termine!")
                 self.log(f"Fusion terminee en {time.time() - fusion_start:.1f}s", 'OK')
 
                 # Nettoyage des fichiers temporaires
-                for temp_path in [CONFIG['TEMP_TON'], CONFIG['TEMP_CIC']]:
+                for temp_path in [CONFIG['TEMP_TON'], CONFIG['TEMP_CIC_TRAIN'], CONFIG['TEMP_CIC_TEST']]:
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
                         self.log(f"Supprime: {temp_path}", 'OK')
 
-                self.log_success(f"SUCCES: {CONFIG['FUSION_OUTPUT']} ({written_rows:,} lignes)")
+                self.log_success(f"SUCCES: {CONFIG['FUSION_TRAIN_OUTPUT']} ({fusion_train_total:,} lignes) & {CONFIG['FUSION_TEST_OUTPUT']} ({fusion_test_total:,} lignes)")
             except Exception as e:
                 self.log_error(f"Erreur fusion: {e}")
                 return

@@ -16,12 +16,12 @@ import numpy as np
 import pandas as pd
 import multiprocessing
 import threading
-from sklearn.model_selection import KFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score, recall_score, precision_score, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
 
 try:
     from progress_gui import GenericProgressGUI

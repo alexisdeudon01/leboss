@@ -232,7 +232,7 @@ class CVOptimizationV3GUI:
 
     def load_data(self):
         try:
-            files = ['fusion_ton_iot_cic_final_smart.csv','fusion_ton_iot_cic_final_smart4.csv','fusion_ton_iot_cic_final_smart3.csv']
+            files = ['fusion_train_smart4.csv','fusion_ton_iot_cic_final_smart4.csv','fusion_ton_iot_cic_final_smart.csv','fusion_ton_iot_cic_final_smart3.csv']
             fichier = None
             for f in files:
                 if os.path.exists(f): fichier=f; break
