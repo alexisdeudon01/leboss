@@ -93,6 +93,7 @@ SMALL_FONT_BOLD = ("Arial", 9, "bold")
 
 TARGET_FLOAT_DTYPE = np.float32
 NPZ_FLOAT_DTYPE = np.float64  # safer for very large magnitudes during NPZ build
+THROUGHPUT_TARGET = 200_000.0  # rows/s target to normalize AI score
 
 # ============================================================
 # Helpers
@@ -194,19 +195,7 @@ class DualColorProgressBar:
         self.prev_value = float(self.variable.get() or 0.0)
         self.curr_value = float(self.variable.get() or 0.0)
 
-        bg = "#ffffff"
-        try:
-            if hasattr(parent, "cget"):
-                for key in ("background", "bg"):
-                    try:
-                        candidate = parent.cget(key)
-                        if candidate:
-                            bg = candidate
-                            break
-                    except tk.TclError:
-                        continue
-        except Exception:
-            pass
+        bg = "#ffffff"  # avoid cget on ttk frames (can raise)
         self.canvas = tk.Canvas(parent, height=self.height + 4, highlightthickness=0, bg=bg)
         self._trace = self.variable.trace_add("write", self._on_change)
         self.canvas.bind("<Configure>", lambda _e: self._draw())
@@ -467,6 +456,8 @@ class OptimizedDataProcessor:
         self.last_worker_reason = "init"
         self.last_chunk_reason = "init"
         self.last_ai_action = "init"
+        self.last_chunk_delta = 0
+        self.last_worker_delta = 0
 
         self._log(
             f"Caps: RAM={ram_gb:.1f}GB | max_chunk={self.max_chunk_size:,} | max_threads={self.max_threads} | FULL_RUN={FULL_RUN} | SAMPLE_ROWS={SAMPLE_ROWS}",
@@ -648,6 +639,7 @@ class OptimizedDataProcessor:
         tuned = int(current_size * mult)
         tuned = max(self.min_chunk_size, min(self.max_chunk_size, tuned))
         self.last_chunk_reason = f"{current_size:,}->{tuned:,} | RAM {ram:.1f}% score {score:.1f} | mult {mult:.2f} | " + "; ".join(reason)
+        self.last_chunk_delta = tuned - current_size
         return tuned
 
     def _rebalance_chunk_size(self, current_size: int, *, workers_cap: int, per_row: float) -> int:
@@ -906,6 +898,14 @@ class ConsolidationGUIEnhanced:
             "reward": [],
         }
         self.metrics_content_height = 360
+        self.metric_views = ["score", "cap", "chunk_mult", "reward", "throughput"]
+        self.metric_view_idx = 0
+        self._throughput_state = {
+            "per_thread": {},
+            "history_t": [],
+            "history_score": [],
+        }
+        self._prev_throughput = 0.0
 
         # UI vars
         self.status_var = tk.StringVar(value="Idle")
@@ -1085,26 +1085,16 @@ class ConsolidationGUIEnhanced:
         ai_frame = ttk.LabelFrame(mid, text="AI evolution (time series)", padding=6)
         ai_frame.pack(side="left", fill="both", expand=True)
 
-        self.score_history_canvas = tk.Canvas(
-            ai_frame, width=520, height=150, bg="#0b1220", highlightthickness=1, highlightbackground="#334155"
-        )
-        self.score_history_canvas.pack(fill="both", expand=True, padx=4, pady=(4, 3))
+        toggle_bar = ttk.Frame(ai_frame)
+        toggle_bar.pack(fill="x", padx=4, pady=(2, 0))
+        ttk.Label(toggle_bar, text="Graph view:", font=SMALL_FONT_BOLD).pack(side="left")
+        self.metric_toggle_btn = ttk.Button(toggle_bar, text="Changer", command=self._toggle_metric_view, width=12)
+        self.metric_toggle_btn.pack(side="left", padx=6)
 
-        metrics_holder = ttk.Frame(ai_frame)
-        metrics_holder.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        self.metrics_history_canvas = tk.Canvas(
-            metrics_holder,
-            width=520,
-            height=140,
-            bg="#0b1220",
-            highlightthickness=1,
-            highlightbackground="#334155",
-            yscrollcommand=lambda *args: self.metrics_scroll.set(*args),
-            scrollregion=(0, 0, 520, self.metrics_content_height),
+        self.metric_canvas = tk.Canvas(
+            ai_frame, width=520, height=260, bg="#0b1220", highlightthickness=1, highlightbackground="#334155"
         )
-        self.metrics_scroll = ttk.Scrollbar(metrics_holder, orient="vertical", command=self.metrics_history_canvas.yview)
-        self.metrics_history_canvas.pack(side="left", fill="both", expand=True)
-        self.metrics_scroll.pack(side="right", fill="y")
+        self.metric_canvas.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Logs
         logs_frame = ttk.LabelFrame(lower, text="Logs (VERY verbose)", padding=6)
@@ -1190,7 +1180,14 @@ class ConsolidationGUIEnhanced:
         colors = {"ERROR": "#ef4444", "WARN": "#f59e0b", "INFO": "#e2e8f0", "DEBUG": "#94a3b8", "OK": "#22c55e"}
         color = colors.get(level.upper(), "#e2e8f0")
         ts = datetime.now().strftime("%H:%M:%S")
-        msg = f"[{ts}] {message}"
+        th = threading.current_thread().name
+        if th == "MainThread":
+            tag = "MAIN"
+        elif th.startswith("T"):
+            tag = th
+        else:
+            tag = th.split("-")[-1]
+        msg = f"[{tag}] [{ts}] {message}"
         self.root.after(0, lambda: self.log_feed.add(level.upper(), msg, color))
 
     # ---------------- Thread bars ----------------
@@ -1260,6 +1257,27 @@ class ConsolidationGUIEnhanced:
         except Exception:
             pass
 
+    # ---------------- Throughput score (rows in last 5s) ----------------
+
+    def _record_throughput(self, thread_id: int, rows: int) -> None:
+        now = time.time()
+        dq = self._throughput_state["per_thread"].setdefault(int(thread_id), [])
+        dq.append((now, int(rows)))
+        # prune
+        cutoff = now - 5.0
+        dq[:] = [(t, r) for (t, r) in dq if t >= cutoff]
+        total_speed = 0.0
+        for _, rows_list in self._throughput_state["per_thread"].items():
+            rows_5s = sum(r for (t, r) in rows_list if t >= cutoff)
+            total_speed += rows_5s / 5.0
+        self.current_score = total_speed  # raw rows/s over last 5s
+        # history for graph
+        self._throughput_state["history_t"].append(now)
+        self._throughput_state["history_score"].append(total_speed)
+        if len(self._throughput_state["history_t"]) > 240:
+            self._throughput_state["history_t"] = self._throughput_state["history_t"][-240:]
+            self._throughput_state["history_score"] = self._throughput_state["history_score"][-240:]
+
     # ---------------- Score + panels ----------------
 
     def _ewma(self, value: float, prev: float | None, alpha: float = 0.20) -> float:
@@ -1283,15 +1301,16 @@ class ConsolidationGUIEnhanced:
         self.score_state["overall"] = overall
         return float(overall)
 
-    def _draw_score_panel(self, ram: float, cpu: float, score: float, rps: float) -> None:
+    def _draw_score_panel(self, ram: float, cpu: float, score_rows: float, rps: float) -> None:
         c = self.score_canvas
         c.delete("all")
         w = int(c["width"])
 
-        c.create_text(10, 10, anchor="nw", text="SCORE (RAM near ceiling + CPU bonus) | refresh=1s", font=SMALL_FONT_BOLD)
-        c.create_text(10, 30, anchor="nw", text=f"RAM {ram:.1f}%  CPU {cpu:.1f}%  Rows/s {rps:,.0f}  Score {score:.1f}", font=UI_FONT_BOLD)
+        c.create_text(10, 10, anchor="nw", text="SCORE = débit total (rows/s sur 5s)", font=SMALL_FONT_BOLD)
+        c.create_text(10, 30, anchor="nw", text=f"RAM {ram:.1f}%  CPU {cpu:.1f}%  Rows/s {score_rows:,.0f}", font=UI_FONT_BOLD)
 
-        bar_w = int((score / 100.0) * (w - 20))
+        score_norm = min(100.0, (score_rows / THROUGHPUT_TARGET) * 100.0)
+        bar_w = int((score_norm / 100.0) * (w - 20))
         c.create_rectangle(10, 55, w - 10, 70, outline="#94a3b8")
         c.create_rectangle(10, 55, 10 + bar_w, 70, fill="#22c55e", outline="")
 
@@ -1305,29 +1324,60 @@ class ConsolidationGUIEnhanced:
         c.create_text(10, 10, anchor="nw", text="WORKER CAP (AI + guard rails)", font=SMALL_FONT_BOLD)
         c.create_text(10, 30, anchor="nw", text=f"cap={cap} / max={self.processor.max_threads}", font=UI_FONT_BOLD)
         c.create_text(10, 55, anchor="nw", text=f"Reason: {self.processor.last_worker_reason}", font=SMALL_FONT, width=int(c["width"]) - 20)
+        w = int(c["width"])
+        y_mid = 78
+        c.create_rectangle(10, y_mid - 6, w - 10, y_mid + 6, outline="#cbd5e1", fill="#e5e7eb")
+        center = (w - 20) / 2 + 10
+        delta = max(-1.0, min(1.0, self.processor.last_worker_delta / max(self.processor.max_threads, 1)))
+        if delta >= 0:
+            fill_to = center + delta * (w - 20) / 2
+            c.create_rectangle(center, y_mid - 6, fill_to, y_mid + 6, outline="", fill="#22c55e")
+        else:
+            fill_to = center + delta * (w - 20) / 2
+            c.create_rectangle(fill_to, y_mid - 6, center, y_mid + 6, outline="", fill="#ef4444")
+        c.create_line(center, y_mid - 8, center, y_mid + 8, fill="#475569")
+        c.create_text(10, y_mid + 12, anchor="nw", text="← cap - | cap + →", font=SMALL_FONT)
 
     def _draw_chunk_panel(self) -> None:
         c = self.chunk_canvas
         c.delete("all")
         c.create_text(10, 10, anchor="nw", text="CHUNK (tuning log)", font=SMALL_FONT_BOLD)
         c.create_text(10, 30, anchor="nw", text=self.processor.last_chunk_reason, font=SMALL_FONT, width=int(c["width"]) - 20)
+        w = int(c["width"])
+        y_mid = 70
+        c.create_rectangle(10, y_mid - 6, w - 10, y_mid + 6, outline="#cbd5e1", fill="#e5e7eb")
+        center = (w - 20) / 2 + 10
+        delta = max(-1.0, min(1.0, self.processor.last_chunk_delta / max(self.processor.max_chunk_size, 1)))
+        if delta >= 0:
+            fill_to = center + delta * (w - 20) / 2
+            c.create_rectangle(center, y_mid - 6, fill_to, y_mid + 6, outline="", fill="#22c55e")
+        else:
+            fill_to = center + delta * (w - 20) / 2
+            c.create_rectangle(fill_to, y_mid - 6, center, y_mid + 6, outline="", fill="#ef4444")
+        c.create_line(center, y_mid - 8, center, y_mid + 8, fill="#475569")
+        c.create_text(10, y_mid + 12, anchor="nw", text="← shrink | grow →", font=SMALL_FONT)
 
-    def _draw_score_timeseries(self) -> None:
-        c = self.score_history_canvas
+    def _toggle_metric_view(self) -> None:
+        self.metric_view_idx = (self.metric_view_idx + 1) % len(self.metric_views)
+        self._draw_ai_graph()
+
+    def _draw_metric_panel(self, series_key: str, label: str, color: str, bounds: tuple[float, float] | None = None) -> None:
+        c = self.metric_canvas
         c.delete("all")
         w = max(int(c.winfo_width()), int(c["width"]))
         h = max(int(c.winfo_height()), int(c["height"]))
-
         x0, x1 = 46, w - 14
-        y0, y1 = 24, h - 28
-        c.create_rectangle(x0 - 30, y0 - 12, x1 + 6, y1 + 12, outline="#334155")
-        c.create_text(x0 - 28, y0 - 20, anchor="w", text="Score (y) / Temps (x)", fill="#e2e8f0", font=SMALL_FONT_BOLD)
+        y0, y1 = 26, h - 32
 
         t = self._ai_history["t"][-240:]
-        scores = self._ai_history["score"][-240:]
-        if len(t) < 2:
-            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
+        vals_raw = self._ai_history.get(series_key, [])[-240:]
+        if len(t) < 2 or len(vals_raw) < 2:
+            c.create_text(w / 2, h / 2, text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
             return
+
+        # axis frame
+        c.create_rectangle(x0 - 30, y0 - 12, x1 + 6, y1 + 18, outline="#334155")
+        c.create_text(x0 - 28, y0 - 20, anchor="w", text=f"{label} (y) / Temps (x)", fill="#e2e8f0", font=SMALL_FONT_BOLD)
 
         t0 = t[0]
         times = [ti - t0 for ti in t]
@@ -1335,105 +1385,100 @@ class ConsolidationGUIEnhanced:
         if max_t <= 0:
             max_t = 1.0
 
-        pts = []
-        for tm, sc in zip(times, scores):
-            x = x0 + (tm / max_t) * (x1 - x0)
-            y = y1 - (max(0.0, min(100.0, sc)) / 100.0) * (y1 - y0)
-            pts.extend([x, y])
-
-        c.create_line(*pts, fill="#22c55e", width=2)
-        c.create_line(x0, y1, x1, y1, fill="#475569", dash=(2, 3))
-        c.create_line(x0, y0, x0, y1, fill="#475569", dash=(2, 3))
-        c.create_text(x1, y0 - 20, anchor="e", text=f"{scores[-1]:.1f}", fill="#22c55e", font=SMALL_FONT_BOLD)
-        c.create_text((x0 + x1) / 2, h - 12, text=f"Temps (s) | span ~{max_t:.0f}s", fill="#94a3b8", font=SMALL_FONT)
-
-        for pct in (25, 50, 75):
-            y_line = y1 - (pct / 100.0) * (y1 - y0)
-            c.create_line(x0, y_line, x1, y_line, fill="#1f2937", dash=(2, 4))
-            c.create_text(x0 - 4, y_line, anchor="e", text=f"{pct}", fill="#94a3b8", font=SMALL_FONT)
-
-    def _draw_metrics_timeseries(self) -> None:
-        c = self.metrics_history_canvas
-        c.delete("all")
-        w = max(int(c.winfo_width()), int(c["width"]))
-        h = max(self.metrics_content_height, int(c.winfo_height()), int(c["height"]))
-        try:
-            c.configure(scrollregion=(0, 0, max(w, 1), max(h, 1)))
-        except Exception:
-            pass
-
-        t = self._ai_history["t"][-240:]
-        if len(t) < 2:
-            c.create_text(w / 2, h / 2, text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
-            return
-
-        times = [ti - t[0] for ti in t]
-        max_t = max(times)
-        if max_t <= 0:
-            max_t = 1.0
-
-        x0, x1 = 46, w - 14
-        area_h = (h - 26) / 3
-        series = [
-            ("cap", self._ai_history["cap"][-240:], (1.0, float(self.processor.max_threads)), "#38bdf8"),
-            ("chunkx", self._ai_history["chunk_mult"][-240:], (0.60, 1.40), "#a78bfa"),
-            ("reward", self._ai_history["reward"][-240:], None, "#f59e0b"),
-        ]
-
-        for idx, (label, vals, bounds, color) in enumerate(series):
-            y_top = 14 + idx * area_h
-            y_bottom = y_top + area_h - 12
-            c.create_rectangle(x0 - 30, y_top - 8, x1 + 6, y_bottom + 8, outline="#334155")
-            c.create_text(x0 - 28, y_top - 8, anchor="w", text=f"{label} (y)", fill=color, font=SMALL_FONT_BOLD)
-
-            if not vals:
-                continue
-
-            if bounds is None:
-                lo = min(vals + [-1.0])
-                hi = max(vals + [1.0])
-            else:
-                lo, hi = bounds
-                lo = min(lo, min(vals))
-                hi = max(hi, max(vals))
+        if bounds is None:
+            lo = min(vals_raw)
+            hi = max(vals_raw)
             if hi - lo < 1e-6:
                 hi = lo + 1.0
+        else:
+            lo, hi = bounds
 
-            pts = []
-            for tm, v in zip(times, vals):
-                x = x0 + (tm / max_t) * (x1 - x0)
-                y = y_bottom - ((v - lo) / (hi - lo)) * (y_bottom - y_top)
-                pts.extend([x, y])
-            c.create_line(*pts, fill=color, width=2)
-            c.create_line(x0, y_bottom, x1, y_bottom, fill="#475569", dash=(2, 3))
-            c.create_text(x1 + 4, y_top - 8, anchor="e", text=f"{vals[-1]:.2f}", fill=color, font=SMALL_FONT)
+        pts = []
+        for tm, v in zip(times, vals_raw):
+            x = x0 + (tm / max_t) * (x1 - x0)
+            y = y1 - ((v - lo) / (hi - lo)) * (y1 - y0)
+            pts.extend([x, y])
+        c.create_line(*pts, fill=color, width=2)
 
-        c.create_text((x0 + x1) / 2, h - 6, text="Temps (s)", fill="#94a3b8", font=SMALL_FONT)
+        # axes + grid
+        c.create_line(x0, y1, x1, y1, fill="#475569", dash=(2, 3))
+        c.create_line(x0, y0, x0, y1, fill="#475569", dash=(2, 3))
+        c.create_text((x0 + x1) / 2, y1 + 14, text=f"Temps (s) | span ~{max_t:.0f}s", fill="#94a3b8", font=SMALL_FONT)
+
+        # Now marker
+        now_x = x1
+        c.create_line(now_x, y1, now_x, y1 + 10, fill="#eab308", width=2)
+        c.create_text(now_x, y1 + 14, anchor="n", text="Now", fill="#eab308", font=SMALL_FONT_BOLD)
+        last_y = pts[-1] if len(pts) >= 2 else y1
+        c.create_oval(now_x - 4, last_y - 4, now_x + 4, last_y + 4, fill="#ef4444", outline="")
+
+        # Additional marker at Now - 30s (best-effort)
+        marker_sec = min(30.0, max_t * 0.5)
+        if marker_sec > 0:
+            target_t = max(t) - marker_sec
+            if target_t > t0:
+                # find closest point
+                closest_idx = min(range(len(t)), key=lambda i: abs(t[i] - target_t))
+                x_mark = x0 + (times[closest_idx] / max_t) * (x1 - x0)
+                c.create_line(x_mark, y1, x_mark, y1 + 10, fill="#22c55e", width=1)
+                c.create_text(x_mark, y1 + 24, anchor="n", text=f"Now-{int(marker_sec)}s", fill="#22c55e", font=SMALL_FONT)
+
+        # y ticks
+        for frac in (0.25, 0.5, 0.75):
+            y_line = y1 - frac * (y1 - y0)
+            c.create_line(x0, y_line, x1, y_line, fill="#1f2937", dash=(2, 4))
+            val = lo + frac * (hi - lo)
+            c.create_text(x0 - 6, y_line, anchor="e", text=f"{val:.2f}", fill="#94a3b8", font=SMALL_FONT)
+
+        c.create_text(x1, y0 - 14, anchor="e", text=f"{vals_raw[-1]:.2f}", fill=color, font=SMALL_FONT_BOLD)
 
     def _draw_ai_graph(self) -> None:
-        self._draw_score_timeseries()
-        self._draw_metrics_timeseries()
+        view = self.metric_views[self.metric_view_idx]
+        if view == "score" or view == "throughput":
+            label = "Score (rows/s sur 5s)"
+            series = self._throughput_state["history_score"][-240:]
+            times = self._throughput_state["history_t"][-240:]
+            self._ai_history["t"] = times
+            self._ai_history["score"] = series
+            self.metric_canvas.delete("all")
+            if len(times) < 2:
+                self.metric_canvas.create_text(
+                    int(self.metric_canvas["width"]) / 2,
+                    int(self.metric_canvas["height"]) / 2,
+                    text="(waiting for data...)",
+                    fill="#94a3b8",
+                    font=SMALL_FONT,
+                )
+                return
+            # temporarily map into _ai_history to reuse drawing
+            self._draw_metric_panel("score", label, "#22c55e", bounds=None)
+        elif view == "cap":
+            self._draw_metric_panel("cap", "Cap workers", "#38bdf8", bounds=(1.0, float(self.processor.max_threads)))
+        elif view == "chunk_mult":
+            self._draw_metric_panel("chunk_mult", "Chunk mult", "#a78bfa", bounds=(0.60, 1.40))
+        elif view == "reward":
+            self._draw_metric_panel("reward", "Reward", "#f59e0b", bounds=None)
 
     # ---------------- Monitoring loop (1 second) ----------------
 
     def start_monitoring_loop(self) -> None:
         try:
             ram, cpu = self.monitor.record_metric()
-            rps = self.monitor.update_throughput()
+            _ = self.monitor.update_throughput()
             stats = self.monitor.get_stats()
 
             self.ram_var.set(f"{ram:.1f}% (peak {stats['ram_peak']:.1f}%)")
             self.cpu_var.set(f"{cpu:.1f}% (peak {stats['cpu_peak']:.1f}%)")
-            self.rps_var.set(f"Rows/s: {rps:,.0f}")
+            total_speed = self.current_score if hasattr(self, "current_score") else 0.0
+            self.rps_var.set(f"Rows/s (5s): {total_speed:,.0f}")
             self.rows_var.set(f"Rows seen: {stats['rows_seen']:,}")
             self.files_var.set(f"Files done: {stats['files_done']:,}")
 
-            score = self._calc_score(ram, cpu)
-            self.current_score = score
-            self.processor.current_score = score
+            score_norm = min(100.0, (total_speed / THROUGHPUT_TARGET) * 100.0)
+            self.processor.current_score = score_norm
 
             # Online AI: reward = throughput gain - RAM penalty
-            reward = (rps - self._prev_rps) / max(self._prev_rps + 1.0, 1.0)
+            reward = (total_speed - self._prev_throughput) / max(self._prev_throughput + 1.0, 1.0)
             if ram >= self.processor.max_ram_percent:
                 reward -= 2.0
             elif ram >= (self.processor.max_ram_percent - 3):
@@ -1466,6 +1511,7 @@ class ConsolidationGUIEnhanced:
                 reason = f"AI: Δcap={action.d_workers} chunk×={chunk_mult:.2f}"
 
             cap_new = int(max(1, min(self.processor.max_threads, cap_new)))
+            self.processor.last_worker_delta = cap_new - cap
             self.processor.current_worker_cap = cap_new
             self.processor.chunk_multiplier = float(max(0.60, min(1.40, chunk_mult)))
             self.processor.last_worker_reason = reason
@@ -1475,25 +1521,24 @@ class ConsolidationGUIEnhanced:
             self.ensure_thread_bars(cap_new)
 
             # panels
-            self._draw_score_panel(ram, cpu, score, rps)
+            self._draw_score_panel(ram, cpu, total_speed, total_speed)
             self._draw_chunk_panel()
             self._draw_worker_panel()
 
             # history + graph
             self._ai_history["t"].append(time.time())
-            self._ai_history["score"].append(score)
+            self._ai_history["score"].append(total_speed)
             self._ai_history["cap"].append(cap_new)
             self._ai_history["chunk_mult"].append(self.processor.chunk_multiplier)
             self._ai_history["reward"].append(reward)
+            for k in ["t", "score", "cap", "chunk_mult", "reward"]:
+                if len(self._ai_history[k]) > 240:
+                    self._ai_history[k] = self._ai_history[k][-240:]
             self._draw_ai_graph()
 
             # soft alerts
-            if ram >= self.processor.max_ram_percent:
-                self.add_alert(f"RAM ceiling hit: {ram:.1f}% >= {self.processor.max_ram_percent}%", "ERROR")
-            elif ram >= (self.processor.max_ram_percent - 3):
-                self.add_alert(f"RAM near ceiling: {ram:.1f}%", "WARN")
-
-            self._prev_rps = rps
+            # pas d'alert flood; on garde juste le statut visuel
+            self._prev_throughput = total_speed
         except Exception:
             self.log(f"monitoring loop exception:\n{traceback.format_exc()}", "ERROR")
 
@@ -1763,6 +1808,7 @@ class ConsolidationGUIEnhanced:
             msg = action or f"{stage} chunk {chunk_idx} ({rows:,} rows)"
             self.update_thread_progress(int(thread_id), float(progress), msg)
             self._set_progress_async(stage_var, float(progress))
+            self._record_throughput(int(thread_id), int(rows))
             # overall weighted
             overall = (
                 0.15 * self._progress_cache["ton"]
