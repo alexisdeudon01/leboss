@@ -11,10 +11,11 @@
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_LDAP.csv",
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_MSSQL.csv",
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_DNS.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NTP.csv"
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NTP.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NetBIOS.csv"
   ],
   "stage": "cic",
   "rows_written_train": 0,
   "rows_written_test": 0,
-  "last_update_ts": "2025-12-31 13:12:12"
+  "last_update_ts": "2025-12-31 14:50:02"
 }

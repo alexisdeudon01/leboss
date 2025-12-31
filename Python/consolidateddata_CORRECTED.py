@@ -1486,11 +1486,13 @@ class ConsolidationGUIEnhanced:
 
             # update previous action with reward, then choose next
             self.policy.update(reward)
+            rps_val = total_speed
+            score_val = score_norm
             x = np.array([
                 min(ram / 100.0, 1.0),
                 min(cpu / 100.0, 1.0),
-                min(rps / 200_000.0, 1.0),
-                min(score / 100.0, 1.0),
+                min(rps_val / THROUGHPUT_TARGET, 1.0),
+                min(score_val / 100.0, 1.0),
                 1.0 if (time.time() - self.monitor.start_time) < WARM_START_SECONDS else 0.0,
             ], dtype=np.float64)
             action, _p = self.policy.choose(x)
