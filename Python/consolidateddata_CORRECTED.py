@@ -997,8 +997,8 @@ class ConsolidationGUIEnhanced:
 
         upper = ttk.Frame(paned)
         lower = ttk.Frame(paned)
-        paned.add(upper, weight=2)
-        paned.add(lower, weight=3)
+        paned.add(upper, weight=1)
+        paned.add(lower, weight=4)
 
         # Monitoring + progress bars
         monitor_frame = ttk.LabelFrame(upper, text="Monitoring + Progress", padding=8)
@@ -1074,12 +1074,22 @@ class ConsolidationGUIEnhanced:
 
         decision_frame = ttk.LabelFrame(mid, text="Dynamic decisions (verbose)", padding=6)
         decision_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        # scrollable container for decision canvases
+        decision_holder = tk.Canvas(decision_frame, highlightthickness=0)
+        decision_scroll = ttk.Scrollbar(decision_frame, orient="vertical", command=decision_holder.yview)
+        decision_holder.configure(yscrollcommand=decision_scroll.set)
+        decision_inner = ttk.Frame(decision_holder)
+        decision_inner.bind("<Configure>", lambda e: decision_holder.configure(scrollregion=decision_holder.bbox("all")))
+        decision_holder_window = decision_holder.create_window((0, 0), window=decision_inner, anchor="nw")
+        decision_holder.bind("<Configure>", lambda e: decision_holder.itemconfigure(decision_holder_window, width=e.width))
+        decision_holder.pack(side="left", fill="both", expand=True)
+        decision_scroll.pack(side="right", fill="y")
 
-        self.score_canvas = tk.Canvas(decision_frame, width=480, height=140, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
+        self.score_canvas = tk.Canvas(decision_inner, width=480, height=180, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
         self.score_canvas.pack(fill="x", padx=4, pady=(4, 6))
-        self.chunk_canvas = tk.Canvas(decision_frame, width=480, height=90, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
+        self.chunk_canvas = tk.Canvas(decision_inner, width=480, height=120, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
         self.chunk_canvas.pack(fill="x", padx=4, pady=(0, 6))
-        self.worker_canvas = tk.Canvas(decision_frame, width=480, height=90, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
+        self.worker_canvas = tk.Canvas(decision_inner, width=480, height=120, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
         self.worker_canvas.pack(fill="x", padx=4, pady=(0, 4))
 
         ai_frame = ttk.LabelFrame(mid, text="AI evolution (time series)", padding=6)
@@ -1091,10 +1101,16 @@ class ConsolidationGUIEnhanced:
         self.metric_toggle_btn = ttk.Button(toggle_bar, text="Changer", command=self._toggle_metric_view, width=12)
         self.metric_toggle_btn.pack(side="left", padx=6)
 
+        metric_holder = ttk.Frame(ai_frame)
+        metric_holder.pack(fill="both", expand=True, padx=4, pady=4)
         self.metric_canvas = tk.Canvas(
-            ai_frame, width=520, height=260, bg="#0b1220", highlightthickness=1, highlightbackground="#334155"
+            metric_holder, width=520, height=320, bg="#0b1220", highlightthickness=1, highlightbackground="#334155",
+            yscrollcommand=lambda *args: self.metric_scroll.set(*args)
         )
-        self.metric_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        self.metric_scroll = ttk.Scrollbar(metric_holder, orient="vertical", command=self.metric_canvas.yview)
+        self.metric_canvas.pack(side="left", fill="both", expand=True)
+        self.metric_scroll.pack(side="right", fill="y")
+        self.metric_canvas.bind("<Configure>", lambda e: self.metric_canvas.configure(scrollregion=self.metric_canvas.bbox("all")))
 
         # Logs
         logs_frame = ttk.LabelFrame(lower, text="Logs (VERY verbose)", padding=6)
@@ -1102,7 +1118,7 @@ class ConsolidationGUIEnhanced:
 
         log_container = tk.Frame(logs_frame, bg="#0f172a")
         log_container.pack(fill="both", expand=True)
-        self.log_feed = CanvasFeed(log_container, height=520, max_items=1600, bg="#0f172a", fg="#e2e8f0")
+        self.log_feed = CanvasFeed(log_container, height=640, max_items=1600, bg="#0f172a", fg="#e2e8f0")
         self.log_feed.pack(fill="both", expand=True)
 
         self.log("Log canvas ready", "INFO")
@@ -1316,6 +1332,10 @@ class ConsolidationGUIEnhanced:
 
         c.create_text(10, 80, anchor="nw", text=f"AI action: {self.processor.last_ai_action}", font=SMALL_FONT)
         c.create_text(10, 98, anchor="nw", text=f"Chunk reason: {self.processor.last_chunk_reason[:120]}", font=SMALL_FONT)
+        try:
+            c.configure(scrollregion=c.bbox("all"))
+        except Exception:
+            pass
 
     def _draw_worker_panel(self) -> None:
         c = self.worker_canvas
@@ -1431,6 +1451,10 @@ class ConsolidationGUIEnhanced:
             c.create_text(x0 - 6, y_line, anchor="e", text=f"{val:.2f}", fill="#94a3b8", font=SMALL_FONT)
 
         c.create_text(x1, y0 - 14, anchor="e", text=f"{vals_raw[-1]:.2f}", fill=color, font=SMALL_FONT_BOLD)
+        try:
+            c.configure(scrollregion=c.bbox("all"))
+        except Exception:
+            pass
 
     def _draw_ai_graph(self) -> None:
         view = self.metric_views[self.metric_view_idx]
