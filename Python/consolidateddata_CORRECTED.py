@@ -1,100 +1,128 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Data Consolidation GUI - DYNAMIC UTILIZATION EDITION v4
-======================================================
-Goals (per your spec):
-  - Start aggressive: MAX chunk + MAX workers, then stabilize down using score.
-  - Chunk size dynamic AND depends on score + RAM + worker cap.
-  - CIC files are also read in chunks in FULL_RUN mode.
-  - Scoring is dynamic and aims to maximize RAM and CPU utilization
-    while respecting RAM threshold (default 90%).
-  - Alerts/Errors shown in a canvas.
-  - Logs shown in a canvas (lots of logs).
-  - 4 napkin math graphs removed.
+Data Consolidation GUI - STREAMING + CHECKPOINT + ONLINE-AI v5
+=============================================================
 
-Defaults:
-  - SAMPLE mode ON by default: read first 1000 rows from TON_IoT and from each CIC file.
-  - FULL mode by env: FULL_RUN=1 (then dynamic chunking applies).
+What this version fixes vs v4:
+- ✅ No more "everything loaded then nothing": memory-heavy merge is removed.
+  We stream each CSV in chunks and write train/test parts to disk immediately.
+- ✅ CSV outputs are guaranteed to be created (and grow) during processing.
+- ✅ Monitoring/score refresh is exactly every 1 second.
+- ✅ Much more verbose logging in the canvas (file/chunk/throughput/decisions).
+- ✅ Progress bars are stage-aware + color-coded.
+- ✅ Thread bars are never empty (min 1).
+- ✅ Crash recovery: restart app and resume from the last completed file(s).
+- ✅ Adds a lightweight online contextual-bandit (LinUCB) that chooses actions
+  (worker cap + chunk multiplier) from live metrics, and plots its evolution.
 
-Outputs:
-  - fusion_train_smart4.csv
-  - fusion_test_smart4.csv
-  - preprocessed_dataset.npz
+Outputs (final):
+- fusion_train_smart5.csv
+- fusion_test_smart5.csv
+- preprocessed_dataset.npz  (best effort; falls back to memmap folder if too big)
 
 Python: 3.10+
+
+Notes:
+- FULL_RUN=1 (default) means full streaming processing.
+- FULL_RUN=0 means sample mode; SAMPLE_ROWS controls nrows per file.
+- Checkpoint + staging dir: ".run_state/" next to this script.
+
 """
 
 from __future__ import annotations
 
+import csv
 import gc
+import json
 import os
 import time
+import math
+import queue
+import shutil
+import hashlib
 import traceback
 import threading
-from collections import deque
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 import psutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedShuffleSplit
 
 # ============================================================
 # CONFIG
 # ============================================================
-MAX_RAM_PERCENT = int(os.getenv("MAX_RAM_PERCENT", "90"))          # hard ceiling
-MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "50000"))
-MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "750000"))
+
+APP_TITLE = "Data Consolidation - Streaming v5 (checkpoint + online AI)"
+PROGRESS_TITLE = "Overall progress"
+
+MAX_RAM_PERCENT = int(os.getenv("MAX_RAM_PERCENT", "90"))
+MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "50_000"))
+MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "750_000"))
 MAX_THREADS = int(os.getenv("MAX_THREADS", "12"))
 
-# keep sample runs heavier to stress CPU/RAM
-DEFAULT_SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", "10"))
-FULL_RUN = os.getenv("FULL_RUN", "1").strip() == "1"              # full processing if 1
-WARM_START_SECONDS = float(os.getenv("WARM_START_SECONDS", "12")) # aggressive period at beginning
+FULL_RUN = os.getenv("FULL_RUN", "1").strip() == "1"
+SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", "10_000"))  # used only when FULL_RUN=0
+WARM_START_SECONDS = float(os.getenv("WARM_START_SECONDS", "12"))
 
-TARGET_FLOAT_DTYPE = np.float32
+TRAIN_RATIO = float(os.getenv("TRAIN_RATIO", "0.60"))
+UI_REFRESH_MS = 1000  # exactly 1 second
 
-PROGRESS_TITLE = "Overall progress"
+RUN_STATE_DIR = Path(os.getenv("RUN_STATE_DIR", ".run_state")).resolve()
+CHECKPOINT_FILE = RUN_STATE_DIR / "checkpoint.json"
+UNION_COLS_FILE = RUN_STATE_DIR / "union_cols.json"
+PARTS_DIR = RUN_STATE_DIR / "parts"
+
+FINAL_TRAIN = Path("fusion_train_smart5.csv").resolve()
+FINAL_TEST = Path("fusion_test_smart5.csv").resolve()
+
+NPZ_OUT = Path("preprocessed_dataset.npz").resolve()
+NPZ_FALLBACK_DIR = Path("preprocessed_dataset_memmap").resolve()
 
 UI_FONT = ("Arial", 10)
 UI_FONT_BOLD = ("Arial", 10, "bold")
 SMALL_FONT = ("Arial", 9)
 SMALL_FONT_BOLD = ("Arial", 9, "bold")
 
-# ============================================================
-# Utility: safe wrappers
-# ============================================================
-
-def _safe(func):
-    """Decorator: catch exceptions, return None if fails (caller should handle)."""
-    def wrap(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            # attempt to log via self._log if available
-            try:
-                self = args[0]
-                if hasattr(self, "_log"):
-                    self._log(f"[EXC] {func.__name__}:\n{traceback.format_exc()}", level="ERROR")
-            except Exception:
-                pass
-            return None
-    return wrap
+TARGET_FLOAT_DTYPE = np.float32
 
 # ============================================================
-# UI helpers: Canvas-based alerts & logs
+# Helpers
+# ============================================================
+
+def _now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:10]
+
+def _safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _human_bytes(n: float) -> str:
+    unit = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while n >= 1024 and i < len(unit) - 1:
+        n /= 1024
+        i += 1
+    return f"{n:.1f}{unit[i]}"
+
+# ============================================================
+# UI Canvas Feed
 # ============================================================
 
 class CanvasFeed:
-    """Scrollable canvas feed (alerts/logs)."""
+    """Scrollable feed based on Canvas -> Frame -> Labels (fast enough for logs)."""
 
-    def __init__(self, parent, *, height=140, max_items=400, bg="#ffffff", fg="#2c3e50"):
-        self.max_items = max_items
+    def __init__(self, parent, *, height=140, max_items=600, bg="#ffffff", fg="#2c3e50"):
+        self.max_items = int(max_items)
         self.bg = bg
         self.fg = fg
         self.canvas = tk.Canvas(parent, height=height, bg=bg, highlightthickness=1, highlightbackground="#ccc")
@@ -104,29 +132,23 @@ class CanvasFeed:
         self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
-    def grid(self, **kwargs):
-        self.canvas.grid(**kwargs)
-        self.scroll.grid(**{**kwargs, "column": kwargs.get("column", 0) + 1, "sticky": "ns"})
-
     def pack(self, **kwargs):
         kwargs_canvas = dict(kwargs)
         kwargs_canvas.setdefault("side", "left")
         kwargs_canvas.setdefault("fill", "both")
         kwargs_canvas.setdefault("expand", True)
         self.canvas.pack(**kwargs_canvas)
-
-        kwargs_scroll = {"side": "right", "fill": "y"}
-        self.scroll.pack(**kwargs_scroll)
+        self.scroll.pack(side="right", fill="y")
 
     def add(self, label: str, message: str, color: str | None = None):
         color = color or self.fg
         row = tk.Frame(self.inner, bg=self.bg)
-        tk.Label(row, text=label, fg=color, width=10, font=SMALL_FONT_BOLD, bg=self.bg).pack(side="left", padx=4)
+        tk.Label(row, text=label, fg=color, width=8, font=SMALL_FONT_BOLD, bg=self.bg).pack(side="left", padx=4)
         tk.Label(
             row,
             text=message,
             fg=color,
-            wraplength=1200,
+            wraplength=1300,
             anchor="w",
             justify="left",
             font=SMALL_FONT,
@@ -147,7 +169,63 @@ class CanvasFeed:
             pass
 
 # ============================================================
-# Monitor
+# Checkpointing
+# ============================================================
+
+@dataclass
+class Checkpoint:
+    run_id: str
+    toniot_file: str | None
+    cic_dir: str | None
+    full_run: bool
+    sample_rows: int
+    union_cols_ready: bool
+    union_cols_hash: str | None
+    completed_files: list[str]
+    stage: str
+    rows_written_train: int
+    rows_written_test: int
+    last_update_ts: str
+
+    @classmethod
+    def fresh(cls) -> "Checkpoint":
+        return cls(
+            run_id=_sha1(str(time.time())),
+            toniot_file=None,
+            cic_dir=None,
+            full_run=FULL_RUN,
+            sample_rows=SAMPLE_ROWS,
+            union_cols_ready=False,
+            union_cols_hash=None,
+            completed_files=[],
+            stage="idle",
+            rows_written_train=0,
+            rows_written_test=0,
+            last_update_ts=_now_ts(),
+        )
+
+class CheckpointManager:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+
+    def load(self) -> Checkpoint:
+        if not self.path.exists():
+            return Checkpoint.fresh()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return Checkpoint(**data)
+        except Exception:
+            return Checkpoint.fresh()
+
+    def save(self, ckpt: Checkpoint) -> None:
+        with self.lock:
+            ckpt.last_update_ts = _now_ts()
+            _safe_mkdir(self.path.parent)
+            self.path.write_text(json.dumps(ckpt.__dict__, indent=2), encoding="utf-8")
+
+# ============================================================
+# Monitor (metrics + throughput)
 # ============================================================
 
 class AdvancedMonitor:
@@ -155,9 +233,12 @@ class AdvancedMonitor:
         self.start_time = time.time()
         self.ram_peak = 0.0
         self.cpu_peak = 0.0
-        self.total_data_loaded = 0
-        self.total_files = 0
+        self.total_rows_seen = 0
+        self.total_files_done = 0
         self.lock = threading.Lock()
+        self._prev_rows = 0
+        self._prev_t = time.time()
+        self.rows_per_sec = 0.0
 
     def record_metric(self) -> tuple[float, float]:
         vm = psutil.virtual_memory()
@@ -167,62 +248,131 @@ class AdvancedMonitor:
             self.cpu_peak = max(self.cpu_peak, cpu)
         return vm.percent, cpu
 
-    def track_data(self, rows: int) -> None:
+    def track_rows(self, rows: int) -> None:
         with self.lock:
-            self.total_data_loaded += int(rows)
+            self.total_rows_seen += int(rows)
 
-    def track_file(self) -> None:
+    def track_file_done(self) -> None:
         with self.lock:
-            self.total_files += 1
+            self.total_files_done += 1
 
-    def get_stats(self) -> dict:
+    def update_throughput(self) -> float:
+        with self.lock:
+            now = time.time()
+            dt = max(now - self._prev_t, 1e-6)
+            dr = self.total_rows_seen - self._prev_rows
+            self.rows_per_sec = dr / dt
+            self._prev_rows = self.total_rows_seen
+            self._prev_t = now
+            return self.rows_per_sec
+
+    def get_stats(self) -> dict[str, Any]:
         with self.lock:
             elapsed = time.time() - self.start_time
             return {
                 "elapsed": elapsed,
                 "ram_peak": self.ram_peak,
                 "cpu_peak": self.cpu_peak,
-                "data_loaded": self.total_data_loaded,
-                "files": self.total_files,
+                "rows_seen": self.total_rows_seen,
+                "files_done": self.total_files_done,
+                "rows_per_sec": self.rows_per_sec,
             }
 
 # ============================================================
-# Processor (chunking + workers)
+# Online AI (Contextual Bandit - LinUCB)
+# ============================================================
+
+@dataclass(frozen=True)
+class Action:
+    d_workers: int
+    chunk_mult: float
+
+class LinUCBPolicy:
+    """
+    Contextual bandit:
+      x -> choose action a
+      reward r observed -> update A[a], b[a]
+
+    Features x are already scaled to ~[0,1].
+    """
+
+    def __init__(self, feature_dim: int, alpha: float = 1.2) -> None:
+        self.d = int(feature_dim)
+        self.alpha = float(alpha)
+        self.actions: list[Action] = [
+            Action(-2, 0.80),
+            Action(-1, 0.90),
+            Action(0, 1.00),
+            Action(+1, 1.10),
+            Action(+2, 1.25),
+        ]
+        self.A = [np.eye(self.d, dtype=np.float64) for _ in self.actions]
+        self.b = [np.zeros((self.d, 1), dtype=np.float64) for _ in self.actions]
+        self.last_choice: int | None = None
+        self.last_x: np.ndarray | None = None
+
+        self.t = 0
+        self.cum_reward = 0.0
+
+    def choose(self, x: np.ndarray) -> tuple[Action, float]:
+        x = x.reshape(self.d, 1).astype(np.float64, copy=False)
+        best_i = 0
+        best_p = -1e18
+        for i in range(len(self.actions)):
+            A_inv = np.linalg.inv(self.A[i])
+            theta = A_inv @ self.b[i]
+            p = float((theta.T @ x)[0, 0] + self.alpha * math.sqrt(max(float((x.T @ A_inv @ x)[0, 0]), 0.0)))
+            if p > best_p:
+                best_p = p
+                best_i = i
+        self.last_choice = best_i
+        self.last_x = x
+        return self.actions[best_i], best_p
+
+    def update(self, reward: float) -> None:
+        if self.last_choice is None or self.last_x is None:
+            return
+        i = self.last_choice
+        x = self.last_x
+        self.A[i] = self.A[i] + (x @ x.T)
+        self.b[i] = self.b[i] + float(reward) * x
+        self.t += 1
+        self.cum_reward += float(reward)
+
+# ============================================================
+# Processor (streaming writers + dynamic chunking)
 # ============================================================
 
 class OptimizedDataProcessor:
-    def __init__(self, monitor: AdvancedMonitor, max_ram_percent: int = MAX_RAM_PERCENT, logger=None) -> None:
+    def __init__(self, monitor: AdvancedMonitor, logger=None) -> None:
         self.monitor = monitor
-        self.max_ram_percent = int(max_ram_percent)
-        self.min_chunk_size = int(MIN_CHUNK_SIZE)
-
-        self.processed_rows = 0
-        self.start_time = time.time()
         self.logger = logger
 
-        # live knobs from GUI
-        self.current_score = 100.0
-        self.current_worker_cap = 1
-        self.last_worker_reason = "init"
-        self.last_chunk_reason = "init"
-
-        # label column (set during merge/clean)
-        self.label_col: str | None = None
+        self.max_ram_percent = MAX_RAM_PERCENT
+        self.min_chunk_size = MIN_CHUNK_SIZE
+        self.max_chunk_size = MAX_CHUNK_SIZE
+        self.max_threads = MAX_THREADS
 
         vm = psutil.virtual_memory()
         ram_gb = vm.total / (1024**3)
         if ram_gb < 8:
-            self.max_chunk_size = min(MAX_CHUNK_SIZE, 300_000)
-            self.max_threads = min(MAX_THREADS, 4)
+            self.max_chunk_size = min(self.max_chunk_size, 300_000)
+            self.max_threads = min(self.max_threads, 4)
         elif ram_gb < 16:
-            self.max_chunk_size = min(MAX_CHUNK_SIZE, 500_000)
-            self.max_threads = min(MAX_THREADS, 8)
-        else:
-            self.max_chunk_size = MAX_CHUNK_SIZE
-            self.max_threads = MAX_THREADS
+            self.max_chunk_size = min(self.max_chunk_size, 500_000)
+            self.max_threads = min(self.max_threads, 8)
+
+        # dynamic knobs set by GUI+AI (updated every 1s)
+        self.current_score = 100.0
+        self.current_worker_cap = 1
+        self.chunk_multiplier = 1.0
+        self.last_worker_reason = "init"
+        self.last_chunk_reason = "init"
+        self.last_ai_action = "init"
 
         self._log(
-            f"Caps: RAM={ram_gb:.1f}GB | max_chunk={self.max_chunk_size:,} | max_threads={self.max_threads} | FULL_RUN={FULL_RUN} | SAMPLE_ROWS={DEFAULT_SAMPLE_ROWS}"
+            f"Caps: RAM={ram_gb:.1f}GB | max_chunk={self.max_chunk_size:,} | max_threads={self.max_threads} | FULL_RUN={FULL_RUN} | SAMPLE_ROWS={SAMPLE_ROWS}",
+            "INFO",
         )
 
     def _log(self, msg: str, level: str = "DEBUG") -> None:
@@ -232,13 +382,9 @@ class OptimizedDataProcessor:
             except Exception:
                 pass
 
-    def _wait_for_ram(self, target: float) -> None:
-        try:
-            while psutil.virtual_memory().percent >= target:
-                gc.collect()
-                time.sleep(0.15)
-        except Exception:
-            pass
+    # --------------------------
+    # dtype optimization + label
+    # --------------------------
 
     def _optimize_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
         try:
@@ -253,60 +399,64 @@ class OptimizedDataProcessor:
 
             for col in obj_cols:
                 try:
-                    numeric = pd.to_numeric(df[col], errors="coerce")
-                    numeric_ratio = float(numeric.notna().mean())
-                except Exception:
-                    numeric = None
-                    numeric_ratio = 0.0
-
-                if numeric is not None and numeric_ratio > 0.5:
-                    df[col] = pd.to_numeric(numeric, downcast="float").astype(TARGET_FLOAT_DTYPE)
-                    continue
-
-                # categorical wins for repeated strings
-                try:
                     nunq = int(df[col].nunique(dropna=False))
                     if nunq / max(len(df[col]), 1) < 0.5 or nunq < 50:
                         df[col] = df[col].astype("category")
                 except Exception:
                     pass
-
             return df
         except Exception:
             self._log(f"optimize_dtypes failed:\n{traceback.format_exc()}", "WARN")
             return df
 
-    # --------------------------
-    # Label normalization
-    # --------------------------
-    def detect_label_column(self, df: pd.DataFrame) -> str | None:
+    def ensure_label_is_standard(self, df: pd.DataFrame) -> pd.DataFrame:
         try:
             for c in df.columns:
                 if str(c).strip().lower() == "label":
-                    return c
-            return None
-        except Exception:
-            return None
-
-    def ensure_label_is_standard(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Renames any label-like column to exact 'Label' for downstream compatibility."""
-        try:
-            c = self.detect_label_column(df)
-            if c is None:
-                self.label_col = None
-                return df
-            if c != "Label":
-                df = df.rename(columns={c: "Label"})
-                self._log(f"[LABEL] Renamed '{c}' -> 'Label'", "INFO")
-            self.label_col = "Label"
+                    if c != "Label":
+                        df = df.rename(columns={c: "Label"})
+                    return df
             return df
         except Exception:
-            self._log(f"ensure_label_is_standard failed:\n{traceback.format_exc()}", "WARN")
             return df
 
     # --------------------------
-    # Dynamic chunking helpers
+    # union columns (schema)
     # --------------------------
+
+    def build_union_columns(self, toniot: str, cic_files: list[str], sample_rows: int | None) -> list[str]:
+        cols: set[str] = set()
+
+        def _add_cols(path: str) -> None:
+            try:
+                df0 = pd.read_csv(path, nrows=0, low_memory=False)
+                cols.update([str(c) for c in df0.columns])
+            except Exception:
+                self._log(f"[SCHEMA] failed header read: {Path(path).name}", "WARN")
+
+        _add_cols(toniot)
+        for p in cic_files:
+            _add_cols(p)
+
+        # normalize label name in schema
+        cols_norm = []
+        has_label = False
+        for c in cols:
+            if c.strip().lower() == "label":
+                has_label = True
+            else:
+                cols_norm.append(c)
+        if has_label:
+            cols_norm.append("Label")
+
+        # stable order: keep Label at end if present
+        cols_norm = sorted(set(cols_norm), key=lambda x: (x == "Label", x.lower()))
+        return cols_norm
+
+    # --------------------------
+    # chunk sizing
+    # --------------------------
+
     def _estimate_bytes_per_row(self, filepath: str) -> float:
         try:
             sample = pd.read_csv(filepath, nrows=2000, low_memory=False, memory_map=True)
@@ -314,379 +464,254 @@ class OptimizedDataProcessor:
             b = float(sample.memory_usage(deep=True).sum())
             return b / max(len(sample), 1)
         except Exception:
-            return 512.0  # fallback guess
+            return 512.0
 
     def _estimate_chunk_size(self, filepath: str, workers_hint: int) -> int:
         vm = psutil.virtual_memory()
         headroom = max((self.max_ram_percent / 100 * vm.total) - vm.used, vm.available * 0.5)
-        budget = max(headroom * 0.6, 64 * 1024 * 1024)
+        budget = max(headroom * 0.55, 64 * 1024 * 1024)
 
         per_row = self._estimate_bytes_per_row(filepath)
-        parallel_penalty = 1.0 + 0.12 * max(workers_hint - 1, 0)  # more workers => smaller chunks
+        parallel_penalty = 1.0 + 0.12 * max(workers_hint - 1, 0)
         est = int((budget / max(per_row, 1.0)) / parallel_penalty)
 
+        # AI chunk multiplier
+        est = int(est * float(self.chunk_multiplier))
+
         # safety by current RAM
-        if vm.percent > 60:
-            est = int(est * 0.6)
         if vm.percent > 70:
-            est = int(est * 0.5)
+            est = int(est * 0.50)
+        elif vm.percent > 60:
+            est = int(est * 0.65)
 
         chunk = max(self.min_chunk_size, min(self.max_chunk_size, est))
-        self._log(
-            f"[CHUNK_INIT] {os.path.basename(filepath)} -> {chunk:,} rows | per_rowâ‰ˆ{per_row:.0f}B | workers_hint={workers_hint} | RAM={vm.percent:.1f}%",
-            "DEBUG",
-        )
         return chunk
 
-    def _tune_chunk_size(self, current_size: int, *, ram: float, cpu: float, score: float, workers_cap: int) -> int:
+    def _tune_chunk_size(self, current_size: int, *, ram: float, score: float, workers_cap: int) -> int:
         mult = 1.0
-        reason_parts = []
+        reason = []
 
         target_ram = float(self.max_ram_percent) - 1.0
-
-        # RAM-driven adjustments (aim near target, avoid ceiling)
         if ram >= self.max_ram_percent:
-            mult *= 0.45
-            reason_parts.append("RAM>=ceiling => hard shrink")
+            mult *= 0.40
+            reason.append("RAM>=ceiling => hard shrink")
         elif ram > target_ram + 2:
             mult *= 0.65
-            reason_parts.append("RAM>target => shrink")
+            reason.append("RAM>target => shrink")
         elif ram < target_ram - 10:
             mult *= 1.25
-            reason_parts.append("RAM<<target => grow")
+            reason.append("RAM<<target => grow")
         elif ram < target_ram - 4:
             mult *= 1.12
-            reason_parts.append("RAM<target => grow")
+            reason.append("RAM<target => grow")
 
-        # score nudges stability (no CPU ceiling)
-        if score >= 90 and ram < target_ram:
-            mult *= 1.08
-            reason_parts.append("score>=90 => mild grow")
-        elif score <= 55:
-            mult *= 0.82
-            reason_parts.append("score<=55 => shrink")
+        if score <= 55:
+            mult *= 0.85
+            reason.append("score<=55 => stabilize")
 
-        # more workers => reduce chunk to avoid peak RAM
         mult /= (1.0 + 0.10 * max(workers_cap - 1, 0))
         if workers_cap > 1:
-            reason_parts.append(f"workers_cap={workers_cap} => penalty")
+            reason.append(f"workers_cap={workers_cap} => penalty")
 
         tuned = int(current_size * mult)
         tuned = max(self.min_chunk_size, min(self.max_chunk_size, tuned))
-        if tuned == self.max_chunk_size:
-            reason_parts.append("hit MAX_CHUNK_SIZE")
-        if tuned == self.min_chunk_size:
-            reason_parts.append("hit MIN_CHUNK_SIZE")
-        self.last_chunk_reason = (
-            f"chunk_tune {current_size:,}->{tuned:,} | RAM {ram:.1f}% score {score:.1f} | cap {workers_cap} | mult {mult:.2f} | "
-            + "; ".join(reason_parts)
-        )
+        self.last_chunk_reason = f"{current_size:,}->{tuned:,} | RAM {ram:.1f}% score {score:.1f} | mult {mult:.2f} | " + "; ".join(reason)
         return tuned
 
     # --------------------------
-    # Dynamic worker cap
+    # splitting (streaming stratified-ish)
     # --------------------------
-    def compute_worker_cap(self, *, base_threads: int, file_count: int, ram: float, cpu: float, score: float, warm: bool) -> tuple[int, str]:
-        # start aggressive
-        if warm and ram < (self.max_ram_percent - 8):
-            cap = self.max_threads
-            return cap, f"warmstart<{WARM_START_SECONDS:.0f}s & RAM safe => cap={cap}"
 
-        # hard RAM ceiling
-        if ram >= self.max_ram_percent:
-            return 1, f"RAM {ram:.1f}% >= ceiling {self.max_ram_percent}%"
+    @staticmethod
+    def _split_train_test_streaming(df: pd.DataFrame, train_ratio: float, counters: dict[str, tuple[int, int]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Per-label streaming split:
+          counters[label] = (train_count, test_count)
+        Rule: push to the side that is behind target ratio.
+        """
+        if "Label" not in df.columns:
+            mask = np.random.RandomState(42).rand(len(df)) < train_ratio
+            return df[mask].copy(), df[~mask].copy()
 
-        # near ceiling, clamp hard
-        if ram >= (self.max_ram_percent - 3):
-            cap = max(1, min(2, base_threads))
-            return cap, f"near RAM ceiling (>= {self.max_ram_percent-3}%) => cap={cap}"
+        train_idx = []
+        test_idx = []
+        for i, lab in enumerate(df["Label"].astype(str).tolist()):
+            tr, te = counters.get(lab, (0, 0))
+            total = tr + te
+            desired_tr = int(round((total + 1) * train_ratio))
+            if tr < desired_tr:
+                train_idx.append(i)
+                counters[lab] = (tr + 1, te)
+            else:
+                test_idx.append(i)
+                counters[lab] = (tr, te + 1)
 
-        ram_headroom = max(0.0, (self.max_ram_percent - ram))
-        cap = base_threads
-
-        # grow when we have room; CPU encourages growth
-        if ram_headroom >= 12:
-            cap = min(self.max_threads, base_threads + 5)
-            return cap, f"headroom {ram_headroom:.1f}% => +5"
-        if ram_headroom >= 8:
-            cap = min(self.max_threads, base_threads + 3)
-            return cap, f"headroom {ram_headroom:.1f}% => +3"
-        if ram_headroom >= 4 and cpu < 95:
-            cap = min(self.max_threads, base_threads + 2)
-            return cap, f"CPU {cpu:.1f}% & headroom {ram_headroom:.1f}% => +2"
-        if ram_headroom >= 2 and cpu < 85:
-            cap = min(self.max_threads, base_threads + 1)
-            return cap, f"CPU {cpu:.1f}% low & headroom {ram_headroom:.1f}% => +1"
-
-        # back off only if score is low AND almost no headroom
-        if score < 50 and ram_headroom < 2:
-            cap = max(1, min(base_threads, 2))
-            return cap, f"score {score:.1f} low & headroom {ram_headroom:.1f}% => reduce cap={cap}"
-
-        cap = min(self.max_threads, max(1, base_threads))
-        return cap, f"stable: cap={cap}"
+        return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
 
     # --------------------------
-    # Loaders
+    # parts writing helpers
     # --------------------------
-    def _read_csv_chunked(self, filepath: str, *, workers_hint: int, callback=None, thread_id: int = 0) -> pd.DataFrame:
-        # initial
-        chunk_size = self._estimate_chunk_size(filepath, workers_hint=workers_hint)
-        chunks: list[pd.DataFrame] = []
-        processed = 0
 
-        # estimate total rows for progress from file size / bytes per row
+    @staticmethod
+    def _write_csv_append(path: Path, df: pd.DataFrame) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not path.exists() or path.stat().st_size == 0
+        df.to_csv(path, mode="a", header=write_header, index=False, encoding="utf-8")
+
+    # --------------------------
+    # main per-file worker
+    # --------------------------
+
+    def process_file_to_parts(
+        self,
+        *,
+        filepath: str,
+        union_cols: list[str],
+        out_dir: Path,
+        sample_rows: int | None,
+        callback=None,
+        thread_id: int = 0,
+        stop_flag: threading.Event | None = None,
+    ) -> tuple[str, int, int]:
+        """
+        Streams one CSV into 2 part files (train/test). Returns (filepath, train_rows, test_rows).
+        Safe for parallel execution because output is per-file.
+        """
+        p = Path(filepath)
+        file_key = _sha1(str(p.resolve()))
+        train_part = out_dir / f"train__{file_key}__{p.name}.csv"
+        test_part = out_dir / f"test__{file_key}__{p.name}.csv"
+
+        # If parts already exist, we consider it done (resume).
+        if train_part.exists() and test_part.exists() and train_part.stat().st_size > 0:
+            # count rows quickly (best effort)
+            tr = self._count_csv_rows_fast(train_part)
+            te = self._count_csv_rows_fast(test_part)
+            self._log(f"[RESUME] skip {p.name} (parts exist) train~{tr:,} test~{te:,}", "INFO")
+            return filepath, tr, te
+
+        counters: dict[str, tuple[int, int]] = {}
+        train_written = 0
+        test_written = 0
+
+        per_row = self._estimate_bytes_per_row(filepath)
         try:
-            per_row = self._estimate_bytes_per_row(filepath)
-            fsize = float(os.path.getsize(filepath))
-            est_total_rows = max(int(fsize / max(per_row, 1.0)), 1)
+            fsize = float(p.stat().st_size)
         except Exception:
-            est_total_rows = 1
+            fsize = 1.0
 
-        reader = pd.read_csv(filepath, chunksize=chunk_size, low_memory=False, memory_map=True)
-        for idx, chunk in enumerate(reader, 1):
-            self._wait_for_ram(self.max_ram_percent - 1)
-            chunk = self._optimize_dtypes(chunk)
-            chunks.append(chunk)
+        workers_hint = max(1, int(self.current_worker_cap))
+        chunk_size = self._estimate_chunk_size(filepath, workers_hint=workers_hint)
 
-            processed += len(chunk)
-            self.processed_rows += len(chunk)
-            self.monitor.track_data(len(chunk))
-            ram, cpu = self.monitor.record_metric()
+        self._log(f"[FILE] start {p.name} | chunk={chunk_size:,} | est_row≈{per_row:.0f}B | size={_human_bytes(fsize)} | T{thread_id}", "INFO")
 
-            # callback/progress
+        t0 = time.time()
+        bytes_done = 0.0
+        last_tick = time.time()
+        last_rows = 0
+
+        def _progress(chunk_i: int, rows_i: int) -> None:
+            nonlocal bytes_done, last_tick, last_rows
+            bytes_done = min(fsize, bytes_done + rows_i * per_row)
+            pct = 100.0 * (bytes_done / max(fsize, 1.0))
+            now = time.time()
+            dt = max(now - last_tick, 1e-6)
+            rps = (rows_i + last_rows) / dt
+            last_rows = 0
+            last_tick = now
+
             if callback:
-                # keep progress moving even if estimate is off
-                prog_est = (processed / est_total_rows) * 100.0
-                prog = min(100.0, max(prog_est, idx * 0.3))
-                callback(idx, len(chunk), prog, thread_id, f"{os.path.basename(filepath)} chunk {idx}")
+                callback(chunk_i, rows_i, min(100.0, pct), thread_id, f"{p.name} chunk {chunk_i} ({rows_i:,} rows) r/s≈{rps:,.0f}")
 
-            # aggressively concat buffered chunks to free memory
-            if len(chunks) >= 2 or psutil.virtual_memory().percent > (self.max_ram_percent - 6):
+        # sample mode
+        if sample_rows is not None:
+            df = pd.read_csv(filepath, nrows=sample_rows, low_memory=False, memory_map=True)
+            df = self._optimize_dtypes(self.ensure_label_is_standard(df))
+            df = df.reindex(columns=union_cols)
+            if "Label" in df.columns:
+                df = df.dropna(subset=["Label"])
+            tr_df, te_df = self._split_train_test_streaming(df, TRAIN_RATIO, counters)
+            if len(tr_df) > 0:
+                self._write_csv_append(train_part, tr_df)
+            if len(te_df) > 0:
+                self._write_csv_append(test_part, te_df)
+            train_written += len(tr_df)
+            test_written += len(te_df)
+            self.monitor.track_rows(len(df))
+            ram, cpu = self.monitor.record_metric()
+            self._log(f"[FILE] sample done {p.name} rows={len(df):,} -> train={train_written:,} test={test_written:,} | RAM {ram:.1f}% CPU {cpu:.1f}%", "OK")
+            _progress(1, len(df))
+            return filepath, train_written, test_written
+
+        # full streaming
+        chunk_i = 0
+        try:
+            reader = pd.read_csv(filepath, chunksize=chunk_size, low_memory=False, memory_map=True)
+            for chunk in reader:
+                if stop_flag and stop_flag.is_set():
+                    self._log(f"[STOP] requested, stop reading {p.name}", "WARN")
+                    break
+
+                chunk_i += 1
+                chunk = self._optimize_dtypes(self.ensure_label_is_standard(chunk))
+                chunk = chunk.reindex(columns=union_cols)
+                if "Label" in chunk.columns:
+                    chunk = chunk.dropna(subset=["Label"])
+
+                tr_df, te_df = self._split_train_test_streaming(chunk, TRAIN_RATIO, counters)
+                if len(tr_df) > 0:
+                    self._write_csv_append(train_part, tr_df)
+                if len(te_df) > 0:
+                    self._write_csv_append(test_part, te_df)
+
+                train_written += len(tr_df)
+                test_written += len(te_df)
+
+                self.monitor.track_rows(len(chunk))
+                ram, cpu = self.monitor.record_metric()
+                score = float(getattr(self, "current_score", 100.0))
+                workers_cap = max(1, int(getattr(self, "current_worker_cap", workers_hint)))
+                chunk_size = self._tune_chunk_size(chunk_size, ram=ram, score=score, workers_cap=workers_cap)
                 try:
-                    self._log(
-                        f"[CHUNK] concat buffered ({len(chunks)} parts) at idx {idx} | RAM {psutil.virtual_memory().percent:.1f}%",
-                        "DEBUG",
-                    )
+                    reader.chunksize = chunk_size
                 except Exception:
                     pass
-                chunks = [pd.concat(chunks, ignore_index=True, copy=False)]
-                gc.collect()
 
-            # dynamic tune
-            workers_cap = max(1, int(getattr(self, "current_worker_cap", workers_hint)))
-            score = float(getattr(self, "current_score", 100.0))
-            chunk_size = self._tune_chunk_size(chunk_size, ram=ram, cpu=cpu, score=score, workers_cap=workers_cap)
-            try:
-                reader.chunksize = chunk_size
-            except Exception:
-                pass
+                _progress(chunk_i, len(chunk))
 
-        out = pd.concat(chunks, ignore_index=True, copy=False) if chunks else pd.DataFrame()
-        gc.collect()
-        return out
-
-    def load_toniot(self, filepath: str, callback=None, sample_rows: int | None = None) -> pd.DataFrame:
-        try:
-            if sample_rows:
-                self._log(f"[TON] sample nrows={sample_rows}", "INFO")
-                df = pd.read_csv(filepath, nrows=sample_rows, low_memory=False, memory_map=True)
-                df = self._optimize_dtypes(df)
-                return df
-
-            self._log("[TON] full chunked read", "INFO")
-            return self._read_csv_chunked(filepath, workers_hint=max(1, self.current_worker_cap), callback=callback, thread_id=0)
-        except Exception:
-            self._log(f"load_toniot failed:\n{traceback.format_exc()}", "ERROR")
-            return pd.DataFrame()
-
-    def _load_cic_file(self, filepath: str, sample_rows: int | None, callback=None, thread_id: int = 0) -> tuple[pd.DataFrame | None, str]:
-        try:
-            if sample_rows:
-                df = pd.read_csv(filepath, nrows=sample_rows, low_memory=False, memory_map=True)
-                df = self._optimize_dtypes(df)
-                return df, filepath
-
-            # FULL_RUN => chunked read too
-            df = self._read_csv_chunked(filepath, workers_hint=max(1, self.current_worker_cap), callback=callback, thread_id=thread_id)
-            return df, filepath
-        except Exception:
-            self._log(f"_load_cic_file failed for {os.path.basename(filepath)}:\n{traceback.format_exc()}", "WARN")
-            return None, filepath
-
-    def load_cic_folder(self, folder: str, callback=None, threads_hook=None, sample_rows: int | None = None, worker_policy=None) -> tuple[list[pd.DataFrame], int, int]:
-        # discover
-        cic_files = []
-        sizes_mb = []
-        try:
-            for root, _, files in os.walk(folder):
-                for f in files:
-                    if f.lower().endswith(".csv"):
-                        path = os.path.join(root, f)
-                        cic_files.append(path)
-                        try:
-                            sizes_mb.append(os.path.getsize(path) / (1024 * 1024))
-                        except OSError:
-                            sizes_mb.append(0.0)
-        except Exception:
-            self._log(f"[CIC] os.walk failed:\n{traceback.format_exc()}", "ERROR")
-
-        cic_files.sort()
-        avg_mb = (sum(sizes_mb) / len(sizes_mb)) if sizes_mb else 0.0
-        self._log(f"[CIC] found {len(cic_files)} file(s) | avgâ‰ˆ{avg_mb:.1f}MB | sample_rows={sample_rows}", "INFO")
-
-        base_threads = min(self.max_threads, max(1, (psutil.cpu_count(logical=True) or 4), len(cic_files)))
-        chosen = base_threads
-
-        if threads_hook:
-            try:
-                threads_hook(chosen)
-            except Exception:
-                pass
-
-        dfs: list[pd.DataFrame] = []
-        failures: list[str] = []
-
-        active = 0
-        cap_prev = 0
-        start = time.time()
-
-        # executor always uses max_threads; we gate submissions ourselves
-        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-            futures = {}
-
-            for idx_file, path in enumerate(cic_files, 1):
-                while True:
-                    ram, cpu = self.monitor.record_metric()
-                    warm = (time.time() - start) < WARM_START_SECONDS
-                    score = float(getattr(self, "current_score", 100.0))
-
-                    cap, reason = self.compute_worker_cap(
-                        base_threads=chosen,
-                        file_count=len(cic_files),
-                        ram=ram,
-                        cpu=cpu,
-                        score=score,
-                        warm=warm,
+                # extra-verbose decision log (every chunk)
+                if chunk_i % 1 == 0:
+                    elapsed = max(time.time() - t0, 1e-6)
+                    self._log(
+                        f"[CHUNK] {p.name}#{chunk_i} rows={len(chunk):,} train+={len(tr_df):,} test+={len(te_df):,} "
+                        f"| tot_train={train_written:,} tot_test={test_written:,} | RAM {ram:.1f}% CPU {cpu:.1f}% "
+                        f"| chunk_next={chunk_size:,} | cap={workers_cap} | score={score:.1f}",
+                        "DEBUG",
                     )
-                    cap = min(cap, len(cic_files))
-                    self.current_worker_cap = cap
-                    self.last_worker_reason = reason
 
-                    if cap != cap_prev:
-                        cap_prev = cap
-                        self._log(f"[CIC] cap -> {cap} ({reason})", "INFO")
-                        if threads_hook:
-                            try:
-                                threads_hook(cap)
-                            except Exception:
-                                pass
-
-                    if active < cap:
-                        break
-
-                    time.sleep(0.08)
-
-                # thread id is assigned round-robin just for UI
-                tid = (idx_file - 1) % max(1, cap_prev)
-                fut = executor.submit(self._load_cic_file, path, sample_rows, callback, tid)
-                futures[fut] = path
-                active += 1
-
-            for done_idx, fut in enumerate(as_completed(futures), 1):
-                try:
-                    df, path = fut.result()
-                except Exception:
-                    df, path = None, futures.get(fut, "unknown")
-                    self._log(f"[CIC] future crashed for {path}:\n{traceback.format_exc()}", "ERROR")
-
-                active = max(active - 1, 0)
-
-                if df is not None:
-                    dfs.append(df)
-                    self.monitor.track_file()
-                    self.monitor.track_data(len(df))
-                    self._log(f"[CIC] done {done_idx}/{len(cic_files)} -> {os.path.basename(path)} rows={len(df):,}", "DEBUG")
-                else:
-                    failures.append(path)
-                    self._log(f"[CIC] failed {os.path.basename(path)}", "WARN")
-
-                if callback:
-                    try:
-                        progress = (done_idx / max(len(cic_files), 1)) * 100
-                        callback(done_idx, len(cic_files), progress, done_idx % max(1, self.current_worker_cap), f"Loaded {os.path.basename(path)}")
-                    except Exception:
-                        pass
-
-                if psutil.virtual_memory().percent > self.max_ram_percent:
+                if ram >= self.max_ram_percent:
                     gc.collect()
+                    time.sleep(0.15)
 
-        if failures:
-            self._log(f"[CIC] failures={len(failures)} -> {[os.path.basename(x) for x in failures][:10]}", "WARN")
-        gc.collect()
-        return dfs, len(cic_files), chosen
-
-    # --------------------------
-    # Merge / clean / split
-    # --------------------------
-    def merge(self, dfs_list: list[pd.DataFrame]) -> pd.DataFrame:
-        try:
-            if not dfs_list:
-                return pd.DataFrame()
-            mem_before = sum(float(df.memory_usage(deep=True).sum()) for df in dfs_list) / (1024 * 1024)
-            self._log(f"[MERGE] inputs={len(dfs_list)} memâ‰ˆ{mem_before:.1f}MB", "INFO")
-            df = pd.concat(dfs_list, ignore_index=True, copy=False)
-            df = self._optimize_dtypes(df)
-            df = self.ensure_label_is_standard(df)
-            mem_after = float(df.memory_usage(deep=True).sum()) / (1024 * 1024) if not df.empty else 0.0
-            self._log(f"[MERGE] out rows={len(df):,} cols={len(df.columns)} memâ‰ˆ{mem_after:.1f}MB label_col={self.label_col}", "INFO")
-            gc.collect()
-            return df
         except Exception:
-            self._log(f"merge failed:\n{traceback.format_exc()}", "ERROR")
-            return pd.DataFrame()
+            self._log(f"[FILE] crashed {p.name}:\n{traceback.format_exc()}", "ERROR")
 
-    def clean(self, df: pd.DataFrame) -> pd.DataFrame:
+        elapsed = time.time() - t0
+        self._log(f"[FILE] done {p.name} in {elapsed:.1f}s -> train={train_written:,} test={test_written:,}", "OK")
+        return filepath, train_written, test_written
+
+    @staticmethod
+    def _count_csv_rows_fast(path: Path, max_lines: int = 2_000_000) -> int:
+        # Best-effort: count lines minus header (capped for speed)
         try:
-            df = df.drop_duplicates()
-            df = self.ensure_label_is_standard(df)
-            if "Label" in df.columns:
-                before = len(df)
-                df = df.dropna(subset=["Label"])
-                self._log(f"[CLEAN] dropna Label: {before:,}->{len(df):,}", "INFO")
-            else:
-                self._log("[CLEAN] no Label column found", "WARN")
-            gc.collect()
-            return df
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                n = 0
+                for n, _ in enumerate(f, 1):
+                    if n >= max_lines:
+                        return max_lines
+            return max(0, n - 1)
         except Exception:
-            self._log(f"clean failed:\n{traceback.format_exc()}", "ERROR")
-            return df
-
-    def split(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        try:
-            df = self.ensure_label_is_standard(df)
-            if "Label" not in df.columns:
-                # fallback random split
-                self._log("[SPLIT] no Label => random 60/40", "WARN")
-                n = len(df)
-                train_size = int(n * 0.6)
-                idx = np.arange(n)
-                np.random.seed(42)
-                np.random.shuffle(idx)
-                train_idx = idx[:train_size]
-                test_idx = idx[train_size:]
-                return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
-
-            # stratified
-            sss = StratifiedShuffleSplit(n_splits=1, train_size=0.6, test_size=0.4, random_state=42)
-            for train_idx, test_idx in sss.split(df, df["Label"]):
-                self._log(f"[SPLIT] stratified ok: train={len(train_idx):,} test={len(test_idx):,}", "INFO")
-                return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
-
-            return df.copy(), df.copy()
-        except Exception:
-            self._log(f"split failed:\n{traceback.format_exc()}", "ERROR")
-            return df.copy(), df.copy()
+            return 0
 
 # ============================================================
 # GUI
@@ -695,383 +720,535 @@ class OptimizedDataProcessor:
 class ConsolidationGUIEnhanced:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Data Consolidation - Dynamic v4")
-        self.root.geometry("1400x1050")
-        self.root.minsize(1300, 950)
-
-        self.toniot_file: str | None = None
-        self.cic_dir: str | None = None
-        self.is_running = False
-        self.start_time: float | None = None
-        self.start_ts = time.time()
+        self.root.title(APP_TITLE)
+        self.root.geometry("1500x1050")
+        self.root.minsize(1350, 950)
 
         self.monitor = AdvancedMonitor()
         self.processor = OptimizedDataProcessor(self.monitor, logger=self.log)
-        self.processor.gui_hook_merge_progress = None
 
-        # live ui vars
-        self.progress_var = tk.DoubleVar(value=0)
+        self.ckpt_mgr = CheckpointManager(CHECKPOINT_FILE)
+        self.ckpt = self.ckpt_mgr.load()
+
+        self.toniot_file: str | None = self.ckpt.toniot_file
+        self.cic_dir: str | None = self.ckpt.cic_dir
+
+        self.is_running = False
+        self.stop_event = threading.Event()
+
+        # AI
+        self.policy = LinUCBPolicy(feature_dim=5, alpha=1.1)
+        self._prev_reward = 0.0
+        self._prev_rps = 0.0
+        self._ai_history = {
+            "t": [],
+            "score": [],
+            "cap": [],
+            "chunk_mult": [],
+            "reward": [],
+        }
+
+        # UI vars
         self.status_var = tk.StringVar(value="Idle")
         self.ram_var = tk.StringVar(value="-- %")
         self.cpu_var = tk.StringVar(value="-- %")
-        self.rows_var = tk.StringVar(value="Rows: 0")
-        self.files_var = tk.StringVar(value="Files: 0")
+        self.rps_var = tk.StringVar(value="Rows/s: --")
+        self.rows_var = tk.StringVar(value="Rows seen: 0")
+        self.files_var = tk.StringVar(value="Files done: 0")
 
-        self.thread_bars: dict[int, dict[str, tk.Variable | ttk.Label]] = {}
+        self.progress_overall = tk.DoubleVar(value=0.0)
+        self.progress_ton = tk.DoubleVar(value=0.0)
+        self.progress_cic = tk.DoubleVar(value=0.0)
+        self.progress_finalize = tk.DoubleVar(value=0.0)
+        self.progress_npz = tk.DoubleVar(value=0.0)
+
+        self.thread_bars: dict[int, dict[str, Any]] = {}
         self.current_score = 100.0
-        self.score_state: dict[str, float | None] = {"ram": None, "cpu": None, "overall": None}
+        self.score_state = {"ram": None, "cpu": None, "overall": None}
+
+        self._style = ttk.Style()
+        self._init_styles()
 
         self.setup_ui()
-        self.processor.gui_hook_merge_progress = self._merge_progress
+        self._restore_ui_from_checkpoint()
         self.start_monitoring_loop()
 
+    # ---------------- Styles ----------------
+
+    def _init_styles(self) -> None:
+        # Best effort: color works on most ttk themes.
+        self._style.configure("StageTON.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#2563eb")
+        self._style.configure("StageCIC.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#16a34a")
+        self._style.configure("StageFIN.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#f59e0b")
+        self._style.configure("StageNPZ.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#7c3aed")
+        self._style.configure("StageALL.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#0ea5e9")
+
     # ---------------- UI ----------------
+
     def setup_ui(self) -> None:
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", padx=10, pady=8)
+
         # Input
-        file_frame = ttk.LabelFrame(self.root, text="Input", padding=8)
-        file_frame.pack(fill="x", padx=10, pady=8)
+        input_frame = ttk.LabelFrame(top, text="Input", padding=8)
+        input_frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-        ttk.Label(file_frame, text="TON_IoT CSV:", font=UI_FONT_BOLD).grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.toniot_path_label = ttk.Label(file_frame, text="No file selected", font=UI_FONT)
-        self.toniot_path_label.grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=self.select_toniot).grid(row=0, column=2, sticky="e", padx=5, pady=5)
+        ttk.Label(input_frame, text="TON_IoT CSV:", font=UI_FONT_BOLD).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self.toniot_path_label = ttk.Label(input_frame, text=self.toniot_file or "No file selected", font=UI_FONT)
+        self.toniot_path_label.grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ttk.Button(input_frame, text="Browse", command=self.select_toniot).grid(row=0, column=2, sticky="e", padx=5, pady=3)
 
-        ttk.Label(file_frame, text="CIC Folder:", font=UI_FONT_BOLD).grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.cic_path_label = ttk.Label(file_frame, text="No folder selected", font=UI_FONT)
-        self.cic_path_label.grid(row=1, column=1, sticky="w", padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=self.select_cic).grid(row=1, column=2, sticky="e", padx=5, pady=5)
+        ttk.Label(input_frame, text="CIC Folder:", font=UI_FONT_BOLD).grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self.cic_path_label = ttk.Label(input_frame, text=self.cic_dir or "No folder selected", font=UI_FONT)
+        self.cic_path_label.grid(row=1, column=1, sticky="w", padx=5, pady=3)
+        ttk.Button(input_frame, text="Browse", command=self.select_cic).grid(row=1, column=2, sticky="e", padx=5, pady=3)
+
+        input_frame.columnconfigure(1, weight=1)
 
         # Controls
-        control_frame = ttk.Frame(self.root)
-        control_frame.pack(fill="x", padx=10, pady=5)
-        self.start_button = ttk.Button(control_frame, text="â–¶ Start", command=self.start_consolidation)
-        self.start_button.pack(side="left", padx=5)
-        self.stop_button = ttk.Button(control_frame, text="â¹ Stop", command=self.stop_consolidation, state=tk.DISABLED)
-        self.stop_button.pack(side="left", padx=5)
+        control_frame = ttk.LabelFrame(top, text="Controls", padding=8)
+        control_frame.pack(side="left", fill="x")
+
+        self.start_button = ttk.Button(control_frame, text="▶ Start / Resume", command=self.start_consolidation)
+        self.start_button.grid(row=0, column=0, padx=6, pady=4, sticky="ew")
+
+        self.stop_button = ttk.Button(control_frame, text="⏹ Stop", command=self.stop_consolidation, state=tk.DISABLED)
+        self.stop_button.grid(row=0, column=1, padx=6, pady=4, sticky="ew")
+
+        self.reset_button = ttk.Button(control_frame, text="Reset state", command=self.reset_state)
+        self.reset_button.grid(row=1, column=0, columnspan=2, padx=6, pady=4, sticky="ew")
 
         # Alerts
         alerts_frame = ttk.LabelFrame(self.root, text="Alerts / Errors", padding=6)
-        alerts_frame.pack(fill="both", padx=10, pady=6)
-        self.alert_feed = CanvasFeed(alerts_frame, height=110, max_items=120)
+        alerts_frame.pack(fill="x", padx=10, pady=6)
+        self.alert_feed = CanvasFeed(alerts_frame, height=110, max_items=200)
         self.alert_feed.pack(fill="both", expand=True)
 
-        # Monitoring
-        monitor_frame = ttk.LabelFrame(self.root, text="Monitoring", padding=8)
-        monitor_frame.pack(fill="x", padx=10, pady=8)
+        # Main Paned layout (user wanted better repartition / adjustable sizes)
+        paned = ttk.PanedWindow(self.root, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        upper = ttk.Frame(paned)
+        lower = ttk.Frame(paned)
+        paned.add(upper, weight=2)
+        paned.add(lower, weight=3)
+
+        # Monitoring + progress bars
+        monitor_frame = ttk.LabelFrame(upper, text="Monitoring + Progress", padding=8)
+        monitor_frame.pack(fill="x", pady=(0, 6))
+
         ttk.Label(monitor_frame, text="RAM:", font=UI_FONT_BOLD).grid(row=0, column=0, sticky="w")
         ttk.Label(monitor_frame, textvariable=self.ram_var, font=UI_FONT).grid(row=0, column=1, sticky="w", padx=8)
         ttk.Label(monitor_frame, text="CPU:", font=UI_FONT_BOLD).grid(row=0, column=2, sticky="w")
         ttk.Label(monitor_frame, textvariable=self.cpu_var, font=UI_FONT).grid(row=0, column=3, sticky="w", padx=8)
+        ttk.Label(monitor_frame, textvariable=self.rps_var, font=UI_FONT).grid(row=0, column=4, sticky="w", padx=12)
 
-        ttk.Label(monitor_frame, textvariable=self.rows_var, font=UI_FONT).grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Label(monitor_frame, textvariable=self.files_var, font=UI_FONT).grid(row=1, column=2, columnspan=2, sticky="w")
+        ttk.Label(monitor_frame, textvariable=self.rows_var, font=UI_FONT).grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(monitor_frame, textvariable=self.files_var, font=UI_FONT).grid(row=1, column=3, columnspan=2, sticky="w")
 
         ttk.Label(monitor_frame, text="Status:", font=UI_FONT_BOLD).grid(row=2, column=0, sticky="w")
-        ttk.Label(monitor_frame, textvariable=self.status_var, font=UI_FONT).grid(row=2, column=1, columnspan=3, sticky="w")
+        ttk.Label(monitor_frame, textvariable=self.status_var, font=UI_FONT).grid(row=2, column=1, columnspan=4, sticky="w")
 
+        # Overall + stage bars (color-coded)
         ttk.Label(monitor_frame, text=PROGRESS_TITLE + ":", font=UI_FONT_BOLD).grid(row=3, column=0, sticky="w")
-        self.progress_bar = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_var)
-        self.progress_bar.grid(row=3, column=1, columnspan=3, sticky="ew", padx=5, pady=6)
+        self.pb_overall = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_overall, style="StageALL.Horizontal.TProgressbar")
+        self.pb_overall.grid(row=3, column=1, columnspan=4, sticky="ew", padx=5, pady=3)
 
-        self.progress_detail = ttk.Label(monitor_frame, text="", anchor="w", font=SMALL_FONT)
-        self.progress_detail.grid(row=4, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        ttk.Label(monitor_frame, text="TON:", font=SMALL_FONT_BOLD).grid(row=4, column=0, sticky="w")
+        self.pb_ton = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_ton, style="StageTON.Horizontal.TProgressbar")
+        self.pb_ton.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(monitor_frame, text="CIC:", font=SMALL_FONT_BOLD).grid(row=4, column=2, sticky="w")
+        self.pb_cic = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_cic, style="StageCIC.Horizontal.TProgressbar")
+        self.pb_cic.grid(row=4, column=3, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(monitor_frame, text="Finalize:", font=SMALL_FONT_BOLD).grid(row=5, column=0, sticky="w")
+        self.pb_fin = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_finalize, style="StageFIN.Horizontal.TProgressbar")
+        self.pb_fin.grid(row=5, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(monitor_frame, text="NPZ:", font=SMALL_FONT_BOLD).grid(row=5, column=2, sticky="w")
+        self.pb_npz = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_npz, style="StageNPZ.Horizontal.TProgressbar")
+        self.pb_npz.grid(row=5, column=3, sticky="ew", padx=5, pady=2)
+
         monitor_frame.columnconfigure(1, weight=1)
         monitor_frame.columnconfigure(3, weight=1)
 
-        # Threads + tuning panel
-        mid = ttk.Frame(self.root)
-        mid.pack(fill="x", padx=10, pady=6)
+        # Mid: thread bars + decisions + AI graph
+        mid = ttk.Frame(upper)
+        mid.pack(fill="both", expand=True)
 
-        threads_frame = ttk.LabelFrame(mid, text="Thread progress", padding=6)
-        threads_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        threads_frame = ttk.LabelFrame(mid, text="Thread progress (never empty)", padding=6)
+        threads_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
         self.thread_container = ttk.Frame(threads_frame)
         self.thread_container.pack(fill="both", expand=True)
 
-        tuning_frame = ttk.LabelFrame(mid, text="Dynamic decisions", padding=6)
-        tuning_frame.pack(side="left", fill="both", expand=True)
+        decision_frame = ttk.LabelFrame(mid, text="Dynamic decisions (verbose)", padding=6)
+        decision_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
-        # canvases with scrollbars
-        score_wrap = ttk.Frame(tuning_frame)
-        score_wrap.pack(fill="both", expand=True, padx=4, pady=4)
-        self.score_canvas = tk.Canvas(score_wrap, width=450, height=170, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
-        score_scroll = ttk.Scrollbar(score_wrap, orient="vertical", command=self.score_canvas.yview)
-        self.score_canvas.configure(yscrollcommand=score_scroll.set)
-        self.score_canvas.pack(side="left", fill="both", expand=True)
-        score_scroll.pack(side="right", fill="y")
+        self.score_canvas = tk.Canvas(decision_frame, width=480, height=140, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
+        self.score_canvas.pack(fill="x", padx=4, pady=(4, 6))
+        self.chunk_canvas = tk.Canvas(decision_frame, width=480, height=90, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
+        self.chunk_canvas.pack(fill="x", padx=4, pady=(0, 6))
+        self.worker_canvas = tk.Canvas(decision_frame, width=480, height=90, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
+        self.worker_canvas.pack(fill="x", padx=4, pady=(0, 4))
 
-        chunk_wrap = ttk.Frame(tuning_frame)
-        chunk_wrap.pack(fill="both", expand=True, padx=4, pady=4)
-        self.chunk_canvas = tk.Canvas(chunk_wrap, width=450, height=120, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
-        chunk_scroll = ttk.Scrollbar(chunk_wrap, orient="vertical", command=self.chunk_canvas.yview)
-        self.chunk_canvas.configure(yscrollcommand=chunk_scroll.set)
-        self.chunk_canvas.pack(side="left", fill="both", expand=True)
-        chunk_scroll.pack(side="right", fill="y")
+        ai_frame = ttk.LabelFrame(mid, text="AI evolution (score/cap/chunk_mult)", padding=6)
+        ai_frame.pack(side="left", fill="both", expand=True)
 
-        worker_wrap = ttk.Frame(tuning_frame)
-        worker_wrap.pack(fill="both", expand=True, padx=4, pady=4)
-        self.worker_canvas = tk.Canvas(worker_wrap, width=450, height=110, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
-        worker_scroll = ttk.Scrollbar(worker_wrap, orient="vertical", command=self.worker_canvas.yview)
-        self.worker_canvas.configure(yscrollcommand=worker_scroll.set)
-        self.worker_canvas.pack(side="left", fill="both", expand=True)
-        worker_scroll.pack(side="right", fill="y")
+        self.ai_canvas = tk.Canvas(ai_frame, width=520, height=260, bg="#0b1220", highlightthickness=1, highlightbackground="#334155")
+        self.ai_canvas.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # Logs (canvas)
-        logs_frame = ttk.LabelFrame(self.root, text="Logs (canvas)", padding=6)
-        logs_frame.pack(fill="both", padx=10, pady=8, expand=True)
-        logs_frame.update_idletasks()
+        # Logs
+        logs_frame = ttk.LabelFrame(lower, text="Logs (VERY verbose)", padding=6)
+        logs_frame.pack(fill="both", expand=True)
 
-        log_container = tk.Frame(logs_frame, height=420, bg="#0f172a")
+        log_container = tk.Frame(logs_frame, bg="#0f172a")
         log_container.pack(fill="both", expand=True)
-        log_container.pack_propagate(False)
-
-        self.log_feed = CanvasFeed(log_container, height=420, max_items=1200, bg="#0f172a", fg="#e2e8f0")
+        self.log_feed = CanvasFeed(log_container, height=520, max_items=1600, bg="#0f172a", fg="#e2e8f0")
         self.log_feed.pack(fill="both", expand=True)
-        # ensure log area starts visible
+
         self.log("Log canvas ready", "INFO")
 
+        self.ensure_thread_bars(max(1, int(self.processor.current_worker_cap)))
+
     # ---------------- UI events ----------------
+
+    def _restore_ui_from_checkpoint(self) -> None:
+        if self.toniot_file:
+            self.toniot_path_label.config(text=self.toniot_file)
+        if self.cic_dir:
+            self.cic_path_label.config(text=self.cic_dir)
+
+        if CHECKPOINT_FILE.exists():
+            self.add_alert(f"Checkpoint found: stage={self.ckpt.stage} | completed_files={len(self.ckpt.completed_files)} | last={self.ckpt.last_update_ts}", "INFO")
+
     def select_toniot(self) -> None:
-        try:
-            filepath = filedialog.askopenfilename(title="Select TON_IoT CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-            if filepath:
-                self.toniot_file = filepath
-                self.toniot_path_label.config(text=filepath)
-                self.add_alert("TON_IoT selected", "OK")
-        except Exception as e:
-            self.add_alert(f"Select TON failed: {e}", "ERROR")
+        filepath = filedialog.askopenfilename(title="Select TON_IoT CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if filepath:
+            self.toniot_file = filepath
+            self.toniot_path_label.config(text=filepath)
+            self.add_alert("TON_IoT selected", "OK")
+            self._update_ckpt_inputs()
 
     def select_cic(self) -> None:
+        folder = filedialog.askdirectory(title="Select CIC folder")
+        if folder:
+            self.cic_dir = folder
+            self.cic_path_label.config(text=folder)
+            self.add_alert("CIC folder selected", "OK")
+            self._update_ckpt_inputs()
+
+    def reset_state(self) -> None:
+        if self.is_running:
+            messagebox.showwarning("Running", "Stop first.")
+            return
+
         try:
-            folder = filedialog.askdirectory(title="Select CIC folder")
-            if folder:
-                self.cic_dir = folder
-                self.cic_path_label.config(text=folder)
-                self.add_alert("CIC folder selected", "OK")
-        except Exception as e:
-            self.add_alert(f"Select CIC failed: {e}", "ERROR")
+            if RUN_STATE_DIR.exists():
+                shutil.rmtree(RUN_STATE_DIR, ignore_errors=True)
+            for p in [FINAL_TRAIN, FINAL_TEST, NPZ_OUT]:
+                if p.exists():
+                    p.unlink()
+            if NPZ_FALLBACK_DIR.exists():
+                shutil.rmtree(NPZ_FALLBACK_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
+        self.ckpt = Checkpoint.fresh()
+        self.ckpt_mgr.save(self.ckpt)
+        self.progress_overall.set(0)
+        self.progress_ton.set(0)
+        self.progress_cic.set(0)
+        self.progress_finalize.set(0)
+        self.progress_npz.set(0)
+        self.add_alert("State reset. Ready.", "OK")
+        self.log("State reset. Ready.", "OK")
+
+    def _update_ckpt_inputs(self) -> None:
+        self.ckpt.toniot_file = self.toniot_file
+        self.ckpt.cic_dir = self.cic_dir
+        self.ckpt.full_run = FULL_RUN
+        self.ckpt.sample_rows = SAMPLE_ROWS
+        self.ckpt_mgr.save(self.ckpt)
+
+    # ---------------- Logs/alerts ----------------
 
     def add_alert(self, message: str, level: str = "INFO") -> None:
-        colors = {"ERROR": "#c0392b", "WARN": "#d35400", "INFO": "#2980b9", "OK": "#27ae60"}
-        color = colors.get(level.upper(), "#2c3e50")
-        try:
-            self.root.after(0, lambda: self.alert_feed.add(level.upper(), message, color))
-        except Exception:
-            pass
+        colors = {"ERROR": "#ef4444", "WARN": "#f59e0b", "INFO": "#38bdf8", "OK": "#22c55e"}
+        color = colors.get(level.upper(), "#e2e8f0")
+        self.root.after(0, lambda: self.alert_feed.add(level.upper(), message, color))
 
     def log(self, message: str, level: str = "INFO") -> None:
-        colors = {"ERROR": "#c0392b", "WARN": "#d35400", "INFO": "#2c3e50", "DEBUG": "#7f8c8d", "OK": "#27ae60"}
-        color = colors.get(level.upper(), "#2c3e50")
+        colors = {"ERROR": "#ef4444", "WARN": "#f59e0b", "INFO": "#e2e8f0", "DEBUG": "#94a3b8", "OK": "#22c55e"}
+        color = colors.get(level.upper(), "#e2e8f0")
         ts = datetime.now().strftime("%H:%M:%S")
         msg = f"[{ts}] {message}"
-        try:
-            self.root.after(0, lambda: self.log_feed.add(level.upper(), msg, color))
-        except Exception:
-            pass
+        self.root.after(0, lambda: self.log_feed.add(level.upper(), msg, color))
 
     # ---------------- Thread bars ----------------
+
     def ensure_thread_bars(self, count: int) -> None:
-        # remove bars that are above the current cap
+        count = max(1, int(count))  # NEVER empty
+        # remove extra
         for tid in sorted([k for k in self.thread_bars.keys() if k >= count], reverse=True):
             entry = self.thread_bars.pop(tid, None)
-            try:
-                row = entry.get("row") or entry["label"].master  # type: ignore[arg-type]
-                row.destroy()
-            except Exception:
-                pass
-            self.log(f"[UI] Removed thread bar T{tid}", "DEBUG")
+            if entry:
+                try:
+                    entry["row"].destroy()
+                except Exception:
+                    pass
+                self.log(f"[UI] Removed thread bar T{tid}", "DEBUG")
 
-        # create missing bars up to count-1
+        # add missing
         for tid in range(count):
             if tid in self.thread_bars:
                 continue
             var = tk.DoubleVar(value=0)
             row = ttk.Frame(self.thread_container)
             ttk.Label(row, text=f"T{tid}", font=UI_FONT_BOLD, width=4).pack(side="left", padx=4)
-            bar = ttk.Progressbar(row, maximum=100, variable=var)
+            bar = ttk.Progressbar(row, maximum=100, variable=var, style="StageALL.Horizontal.TProgressbar")
             bar.pack(side="left", fill="x", expand=True, padx=4, pady=2)
-            label = ttk.Label(row, text="Idle", width=52, font=SMALL_FONT)
+            label = ttk.Label(row, text="Idle", width=62, font=SMALL_FONT)
             label.pack(side="left", padx=4)
             row.pack(fill="x", padx=2, pady=2)
             self.thread_bars[tid] = {"var": var, "label": label, "row": row}
             self.log(f"[UI] Added thread bar T{tid}", "DEBUG")
 
-    def reset_thread_bars(self) -> None:
-        for entry in self.thread_bars.values():
-            try:
-                entry["var"].set(0)
-                entry["label"].config(text="Idle")
-            except Exception:
-                pass
-
     def update_thread_progress(self, thread_id: int, progress: float, text: str | None = None) -> None:
-        entry = self.thread_bars.get(thread_id)
+        entry = self.thread_bars.get(int(thread_id))
         if not entry:
             return
 
         def _update():
             try:
-                entry["var"].set(progress)
+                entry["var"].set(float(progress))
                 if text:
-                    entry["label"].config(text=text[:90])
+                    entry["label"].config(text=text[:115])
             except Exception:
                 pass
 
-        try:
-            self.root.after(0, _update)
-        except Exception:
-            pass
+        self.root.after(0, _update)
 
-    def _merge_progress(self, idx: int, total: int, rows: int, pct: int) -> None:
-        """Hook from processor.merge to show progress on thread bar 0."""
-        try:
-            self.ensure_thread_bars(1)
-            msg = f"MERGE {idx}/{total} ({rows:,} rows)"
-            self.update_thread_progress(0, pct, msg)
-            self.progress_detail.config(text=msg)
-        except Exception:
-            pass
+    # ---------------- Score + panels ----------------
 
-    # ---------------- Dynamic scoring ----------------
-    def _clamp(self, x: float, lo: float = 0.0, hi: float = 100.0) -> float:
-        return max(lo, min(hi, x))
-
-    def _ewma(self, value: float, prev: float | None, alpha: float = 0.25) -> float:
+    def _ewma(self, value: float, prev: float | None, alpha: float = 0.20) -> float:
         return value if prev is None else (prev + alpha * (value - prev))
 
-    def _target_score(self, value: float, target: float, tol: float, hard_max: float | None = None) -> float:
-        """
-        Score is highest when value is near target.
-        If hard_max is set and value > hard_max => score=0.
-        """
-        if hard_max is not None and value >= hard_max:
-            return 0.0
-        # normalized distance
-        d = abs(value - target)
-        # inside tolerance => near-100
-        if d <= tol:
-            return 100.0 - (d / max(tol, 1e-6)) * 10.0  # 100..90
-        # outside tol => drop faster
-        return self._clamp(90.0 - (d - tol) * 2.2, 0.0, 100.0)
-
-    def _calc_scores(self, ram: float, cpu: float) -> tuple[float, float, float]:
-        target_ram = float(self.processor.max_ram_percent) - 1.0  # aim just below the ceiling
+    def _calc_score(self, ram: float, cpu: float) -> float:
+        target_ram = float(self.processor.max_ram_percent) - 1.0
         delta = abs(ram - target_ram)
 
         if ram >= self.processor.max_ram_percent:
-            ram_score_raw = 0.0
+            ram_raw = 0.0
         else:
-            ram_score_raw = max(0.0, 100.0 - delta * 5.0)
+            ram_raw = max(0.0, 100.0 - delta * 5.0)
             if ram < target_ram and delta <= 12:
-                ram_score_raw = min(100.0, ram_score_raw + (target_ram - ram) * 1.2)
+                ram_raw = min(100.0, ram_raw + (target_ram - ram) * 1.2)
 
-        cpu_bonus = min(max(cpu, 0.0), 100.0) * 0.35  # target 100% CPU, bonus only
-        overall_raw = 0.65 * ram_score_raw + 0.35 * cpu_bonus
+        cpu_bonus = min(max(cpu, 0.0), 100.0) * 0.35
+        overall_raw = 0.65 * ram_raw + 0.35 * cpu_bonus
 
-        ram_s = self._ewma(ram_score_raw, self.score_state["ram"], alpha=0.20)
-        cpu_s = self._ewma(cpu_bonus, self.score_state["cpu"], alpha=0.20)
-        overall_s = self._ewma(overall_raw, self.score_state["overall"], alpha=0.20)
+        overall = self._ewma(overall_raw, self.score_state["overall"], alpha=0.20)
+        self.score_state["overall"] = overall
+        return float(overall)
 
-        self.score_state["ram"] = ram_s
-        self.score_state["cpu"] = cpu_s
-        self.score_state["overall"] = overall_s
-        return ram_s, cpu_s, overall_s
-
-    def _draw_score_panel(self, ram: float, cpu: float, score: float) -> None:
+    def _draw_score_panel(self, ram: float, cpu: float, score: float, rps: float) -> None:
         c = self.score_canvas
         c.delete("all")
         w = int(c["width"])
-        y = 10
 
-        c.create_text(10, y, anchor="nw", text="SCORE (target RAM near ceiling, CPU bonus to 100%)", font=SMALL_FONT_BOLD)
-        y += 18
-        c.create_text(10, y, anchor="nw", text=f"RAM: {ram:.1f}%   CPU: {cpu:.1f}%   Score: {score:.1f}", font=UI_FONT_BOLD)
-        y += 20
+        c.create_text(10, 10, anchor="nw", text="SCORE (RAM near ceiling + CPU bonus) | refresh=1s", font=SMALL_FONT_BOLD)
+        c.create_text(10, 30, anchor="nw", text=f"RAM {ram:.1f}%  CPU {cpu:.1f}%  Rows/s {rps:,.0f}  Score {score:.1f}", font=UI_FONT_BOLD)
 
         bar_w = int((score / 100.0) * (w - 20))
-        c.create_rectangle(10, y, w - 10, y + 16, outline="#bdc3c7")
-        c.create_rectangle(10, y, 10 + bar_w, y + 16, fill="#27ae60", outline="")
-        y += 24
+        c.create_rectangle(10, 55, w - 10, 70, outline="#94a3b8")
+        c.create_rectangle(10, 55, 10 + bar_w, 70, fill="#22c55e", outline="")
 
-        c.create_text(10, y, anchor="nw", text=f"Targets: RAM near {self.processor.max_ram_percent-1:.0f}% (CPU bonus only)", font=SMALL_FONT)
-        y += 14
-        c.create_text(10, y, anchor="nw", text="CPU is never capped; RAM drives chunk/worker adjustments.", font=SMALL_FONT)
-
-    def _draw_chunk_panel(self) -> None:
-        c = self.chunk_canvas
-        c.delete("all")
-        txt = self.processor.last_chunk_reason or "chunk: n/a"
-        c.create_text(10, 10, anchor="nw", text="CHUNK DECISION", font=SMALL_FONT_BOLD)
-        c.create_text(10, 30, anchor="nw", text=txt, font=SMALL_FONT, width=int(c["width"]) - 20)
+        c.create_text(10, 80, anchor="nw", text=f"AI action: {self.processor.last_ai_action}", font=SMALL_FONT)
+        c.create_text(10, 98, anchor="nw", text=f"Chunk reason: {self.processor.last_chunk_reason[:120]}", font=SMALL_FONT)
 
     def _draw_worker_panel(self) -> None:
         c = self.worker_canvas
         c.delete("all")
-        cap = getattr(self.processor, "current_worker_cap", 1)
-        reason = getattr(self.processor, "last_worker_reason", "")
-        c.create_text(10, 10, anchor="nw", text="WORKER CAP DECISION", font=SMALL_FONT_BOLD)
+        cap = max(1, int(self.processor.current_worker_cap))
+        c.create_text(10, 10, anchor="nw", text="WORKER CAP (AI + guard rails)", font=SMALL_FONT_BOLD)
         c.create_text(10, 30, anchor="nw", text=f"cap={cap} / max={self.processor.max_threads}", font=UI_FONT_BOLD)
-        c.create_text(10, 55, anchor="nw", text=f"Reason: {reason}", font=SMALL_FONT, width=int(c["width"]) - 20)
+        c.create_text(10, 55, anchor="nw", text=f"Reason: {self.processor.last_worker_reason}", font=SMALL_FONT, width=int(c["width"]) - 20)
 
-    # ---------------- Monitoring loop ----------------
+    def _draw_chunk_panel(self) -> None:
+        c = self.chunk_canvas
+        c.delete("all")
+        c.create_text(10, 10, anchor="nw", text="CHUNK (tuning log)", font=SMALL_FONT_BOLD)
+        c.create_text(10, 30, anchor="nw", text=self.processor.last_chunk_reason, font=SMALL_FONT, width=int(c["width"]) - 20)
+
+    def _draw_ai_graph(self) -> None:
+        c = self.ai_canvas
+        c.delete("all")
+        w = int(c["width"])
+        h = int(c["height"])
+
+        # frame
+        c.create_rectangle(10, 10, w - 10, h - 10, outline="#334155")
+        c.create_text(14, 12, anchor="nw", text="Evolution (last ~120 points)", fill="#e2e8f0", font=SMALL_FONT_BOLD)
+
+        t = self._ai_history["t"][-120:]
+        if len(t) < 2:
+            c.create_text(14, 40, anchor="nw", text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
+            return
+
+        score = self._ai_history["score"][-120:]
+        cap = self._ai_history["cap"][-120:]
+        mult = self._ai_history["chunk_mult"][-120:]
+        reward = self._ai_history["reward"][-120:]
+
+        # normalize helpers
+        def _norm(vals: list[float], lo: float, hi: float) -> list[float]:
+            span = max(hi - lo, 1e-6)
+            return [(v - lo) / span for v in vals]
+
+        # y bands
+        pad = 25
+        x0, y0 = 15, 30
+        x1, y1 = w - 15, h - 15
+        xs = np.linspace(x0, x1, len(t)).tolist()
+
+        sc = _norm(score, 0.0, 100.0)
+        capn = _norm([float(x) for x in cap], 1.0, float(max(2, self.processor.max_threads)))
+        multn = _norm([float(x) for x in mult], 0.6, 1.4)
+        rwdn = _norm([float(x) for x in reward], min(reward), max(reward) + 1e-6)
+
+        def _plot_line(norm_y: list[float], color: str, label: str, y_shift: float) -> None:
+            pts = []
+            for xi, ny in zip(xs, norm_y):
+                yi = y1 - (ny * (y1 - y0 - pad)) - y_shift
+                pts.extend([xi, yi])
+            c.create_line(*pts, fill=color, width=2)
+            c.create_text(w - 16, y0 + y_shift, anchor="ne", text=label, fill=color, font=SMALL_FONT)
+
+        # 4 lines
+        _plot_line(sc, "#22c55e", "score", 18)
+        _plot_line(capn, "#38bdf8", "cap", 36)
+        _plot_line(multn, "#a78bfa", "chunk×", 54)
+        _plot_line(rwdn, "#f59e0b", "reward", 72)
+
+    # ---------------- Monitoring loop (1 second) ----------------
+
     def start_monitoring_loop(self) -> None:
         try:
             ram, cpu = self.monitor.record_metric()
+            rps = self.monitor.update_throughput()
             stats = self.monitor.get_stats()
-            self.ram_var.set(f"{ram:.1f}%")
-            self.cpu_var.set(f"{cpu:.1f}%")
-            self.rows_var.set(f"Rows: {stats['data_loaded']:,}")
-            self.files_var.set(f"Files: {stats['files']:,}")
 
-            ram_s, cpu_s, overall = self._calc_scores(ram, cpu)
-            self.current_score = overall
-            self.processor.current_score = overall
+            self.ram_var.set(f"{ram:.1f}% (peak {stats['ram_peak']:.1f}%)")
+            self.cpu_var.set(f"{cpu:.1f}% (peak {stats['cpu_peak']:.1f}%)")
+            self.rps_var.set(f"Rows/s: {rps:,.0f}")
+            self.rows_var.set(f"Rows seen: {stats['rows_seen']:,}")
+            self.files_var.set(f"Files done: {stats['files_done']:,}")
 
-            # feed panels
-            self._draw_score_panel(ram, cpu, overall)
+            score = self._calc_score(ram, cpu)
+            self.current_score = score
+            self.processor.current_score = score
+
+            # Online AI: reward = throughput gain - RAM penalty
+            reward = (rps - self._prev_rps) / max(self._prev_rps + 1.0, 1.0)
+            if ram >= self.processor.max_ram_percent:
+                reward -= 2.0
+            elif ram >= (self.processor.max_ram_percent - 3):
+                reward -= 0.7
+
+            # update previous action with reward, then choose next
+            self.policy.update(reward)
+            x = np.array([
+                min(ram / 100.0, 1.0),
+                min(cpu / 100.0, 1.0),
+                min(rps / 200_000.0, 1.0),
+                min(score / 100.0, 1.0),
+                1.0 if (time.time() - self.monitor.start_time) < WARM_START_SECONDS else 0.0,
+            ], dtype=np.float64)
+            action, _p = self.policy.choose(x)
+
+            # guard rails
+            cap = max(1, int(self.processor.current_worker_cap))
+            cap_new = cap + action.d_workers
+            if ram >= self.processor.max_ram_percent:
+                cap_new = 1
+                chunk_mult = 0.75
+                reason = f"guard: RAM {ram:.1f}% >= ceiling => cap=1 chunk×=0.75"
+            elif ram >= (self.processor.max_ram_percent - 3):
+                cap_new = min(cap_new, 2)
+                chunk_mult = min(float(action.chunk_mult), 0.95)
+                reason = f"guard: near ceiling => cap<=2 chunk×<=0.95"
+            else:
+                chunk_mult = float(action.chunk_mult)
+                reason = f"AI: Δcap={action.d_workers} chunk×={chunk_mult:.2f}"
+
+            cap_new = int(max(1, min(self.processor.max_threads, cap_new)))
+            self.processor.current_worker_cap = cap_new
+            self.processor.chunk_multiplier = float(max(0.60, min(1.40, chunk_mult)))
+            self.processor.last_worker_reason = reason
+            self.processor.last_ai_action = f"d_workers={action.d_workers:+d} chunk×={self.processor.chunk_multiplier:.2f} | reward={reward:+.3f}"
+
+            # keep thread bars in sync (never empty)
+            self.ensure_thread_bars(cap_new)
+
+            # panels
+            self._draw_score_panel(ram, cpu, score, rps)
             self._draw_chunk_panel()
             self._draw_worker_panel()
+
+            # history + graph
+            self._ai_history["t"].append(time.time())
+            self._ai_history["score"].append(score)
+            self._ai_history["cap"].append(cap_new)
+            self._ai_history["chunk_mult"].append(self.processor.chunk_multiplier)
+            self._ai_history["reward"].append(reward)
+            self._draw_ai_graph()
 
             # soft alerts
             if ram >= self.processor.max_ram_percent:
                 self.add_alert(f"RAM ceiling hit: {ram:.1f}% >= {self.processor.max_ram_percent}%", "ERROR")
             elif ram >= (self.processor.max_ram_percent - 3):
                 self.add_alert(f"RAM near ceiling: {ram:.1f}%", "WARN")
+
+            self._prev_rps = rps
         except Exception:
-            # do not crash loop
             self.log(f"monitoring loop exception:\n{traceback.format_exc()}", "ERROR")
 
-        self.root.after(650, self.start_monitoring_loop)
+        self.root.after(UI_REFRESH_MS, self.start_monitoring_loop)
 
     # ---------------- Pipeline ----------------
+
     def start_consolidation(self) -> None:
         if not self.toniot_file or not self.cic_dir:
             messagebox.showerror("Missing input", "Select both TON_IoT CSV and CIC folder first.")
             self.add_alert("Select both TON_IoT CSV and CIC folder first.", "ERROR")
             return
 
+        if self.is_running:
+            return
+
         self.is_running = True
-        self.start_time = time.time()
-        self.start_ts = time.time()
-        self.progress_var.set(0)
-        self.status_var.set("Starting...")
+        self.stop_event.clear()
+
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
 
-        self.reset_thread_bars()
-        self.ensure_thread_bars(2)  # start with 2 bars shown
-        self.add_alert("Pipeline started", "INFO")
-        self.log("Pipeline started", "INFO")
+        self.add_alert("Pipeline started (streaming + checkpoint)", "INFO")
+        self.log(f"Mode: {'FULL_RUN' if FULL_RUN else 'SAMPLE'} | SAMPLE_ROWS={SAMPLE_ROWS}", "INFO")
 
-        threading.Thread(target=self.consolidate_worker, daemon=True).start()
+        self._update_ckpt_inputs()
+
+        t = threading.Thread(target=self._pipeline_worker, daemon=True)
+        t.start()
 
     def stop_consolidation(self) -> None:
-        self.is_running = False
+        if not self.is_running:
+            return
+        self.stop_event.set()
         self.status_var.set("Stopping...")
-        self.log("Stop requested (will stop after current step).", "WARN")
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
+        self.log("Stop requested: will stop after current chunk/file.", "WARN")
 
-    def consolidate_worker(self) -> None:
+    def _pipeline_worker(self) -> None:
         try:
             self._run_pipeline()
         except Exception as exc:
@@ -1079,139 +1256,435 @@ class ConsolidationGUIEnhanced:
             self.add_alert(f"Critical error: {exc}", "ERROR")
         finally:
             self.is_running = False
-            try:
-                self.start_button.config(state=tk.NORMAL)
-                self.stop_button.config(state=tk.DISABLED)
-            except Exception:
-                pass
+            self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
+
+    def _discover_cic_files(self, folder: str) -> list[str]:
+        files: list[str] = []
+        for root, _, names in os.walk(folder):
+            for n in names:
+                if n.lower().endswith(".csv"):
+                    files.append(str(Path(root) / n))
+        files.sort()
+        return files
 
     def _run_pipeline(self) -> None:
-        steps = 6
-        step = 0
+        _safe_mkdir(RUN_STATE_DIR)
+        _safe_mkdir(PARTS_DIR)
 
-        # sample by default, full only if env says so
-        sample_rows = None if FULL_RUN else max(DEFAULT_SAMPLE_ROWS, 100_000)
-        self.log(f"Mode: {'FULL_RUN' if FULL_RUN else 'SAMPLE'} | sample_rows={sample_rows}", "INFO")
-        self.add_alert(f"Mode: {'FULL' if FULL_RUN else 'SAMPLE'} (rows={sample_rows or 'ALL'})", "INFO")
-
-        # TON
-        self.status_var.set("Loading TON_IoT")
-        df_ton = self.processor.load_toniot(self.toniot_file, callback=self._progress_callback("TON"), sample_rows=sample_rows)
-        step += 1
-        self.progress_var.set(step / steps * 100)
-        self.log(f"TON loaded rows={len(df_ton):,}", "OK")
-        if not self.is_running:
+        # stage 0: discover files
+        cic_files = self._discover_cic_files(self.cic_dir or "")
+        if not cic_files:
+            self.add_alert("No CIC CSV files found.", "ERROR")
+            self.log("No CIC CSV files found.", "ERROR")
             return
 
-        # CIC
-        self.status_var.set("Loading CIC")
-        dfs_cic, total_files, base_threads = self.processor.load_cic_folder(
-            self.cic_dir,
-            callback=self._progress_callback("CIC"),
-            threads_hook=self.ensure_thread_bars,
-            sample_rows=sample_rows,
-        )
-        self.log(f"CIC loaded {len(dfs_cic)}/{total_files} file(s)", "OK")
-        if len(dfs_cic) != total_files:
-            self.add_alert(f"CIC missing/failed: {total_files - len(dfs_cic)}", "WARN")
-        step += 1
-        self.progress_var.set(step / steps * 100)
-        if not self.is_running:
+        # sample control
+        sample_rows = None if FULL_RUN else SAMPLE_ROWS
+
+        # stage 1: union columns (schema)
+        self.status_var.set("Schema: union columns")
+        if not self.ckpt.union_cols_ready or not UNION_COLS_FILE.exists():
+            self.ckpt.stage = "schema"
+            self.ckpt_mgr.save(self.ckpt)
+
+            union_cols = self.processor.build_union_columns(self.toniot_file, cic_files, sample_rows)
+            UNION_COLS_FILE.write_text(json.dumps(union_cols, indent=2), encoding="utf-8")
+            self.ckpt.union_cols_ready = True
+            self.ckpt.union_cols_hash = _sha1(json.dumps(union_cols))
+            self.ckpt_mgr.save(self.ckpt)
+
+            self.log(f"[SCHEMA] union cols={len(union_cols)} (Label={'yes' if 'Label' in union_cols else 'no'})", "OK")
+        else:
+            union_cols = json.loads(UNION_COLS_FILE.read_text(encoding="utf-8"))
+            self.log(f"[SCHEMA] loaded union cols={len(union_cols)}", "INFO")
+
+        # stage 2: stream TON -> parts
+        self.status_var.set("TON: streaming to parts")
+        self.ckpt.stage = "ton"
+        self.ckpt_mgr.save(self.ckpt)
+
+        ton_key = str(Path(self.toniot_file).resolve())
+        if ton_key not in self.ckpt.completed_files:
+            self._process_one_file(
+                filepath=self.toniot_file,
+                union_cols=union_cols,
+                part_dir=PARTS_DIR,
+                sample_rows=sample_rows,
+                stage_var=self.progress_ton,
+                stage_name="TON",
+            )
+            if not self.stop_event.is_set():
+                self.ckpt.completed_files.append(ton_key)
+                self.ckpt_mgr.save(self.ckpt)
+        else:
+            self.log("[RESUME] TON already completed (checkpoint).", "INFO")
+            self.progress_ton.set(100.0)
+
+        if self.stop_event.is_set():
+            self.status_var.set("Stopped")
+            self.add_alert("Stopped by user.", "WARN")
             return
 
-        # Merge + clean
-        self.status_var.set("Merging & cleaning")
-        combined = self.processor.merge([df_ton] + dfs_cic)
-        combined = self.processor.clean(combined)
-        step += 1
-        self.progress_var.set(step / steps * 100)
-        self.log(f"Merged rows={len(combined):,} cols={len(combined.columns)}", "INFO")
-        if not self.is_running:
+        # stage 3: stream CIC in parallel -> parts (dynamic worker cap)
+        self.status_var.set("CIC: streaming to parts")
+        self.ckpt.stage = "cic"
+        self.ckpt_mgr.save(self.ckpt)
+
+        remaining = [p for p in cic_files if str(Path(p).resolve()) not in set(self.ckpt.completed_files)]
+        done_already = len(cic_files) - len(remaining)
+        if done_already:
+            self.log(f"[RESUME] CIC already done: {done_already}/{len(cic_files)}", "INFO")
+
+        total = len(cic_files)
+        completed = done_already
+
+        # executor uses max_threads; submissions are gated by current_worker_cap
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        active = 0
+        futures: dict[Any, tuple[str, int]] = {}
+
+        start = time.time()
+        idx_iter = 0
+
+        with ThreadPoolExecutor(max_workers=self.processor.max_threads) as ex:
+            # submit loop
+            while idx_iter < len(cic_files):
+                if self.stop_event.is_set():
+                    break
+
+                # skip completed
+                p = cic_files[idx_iter]
+                idx_iter += 1
+                p_key = str(Path(p).resolve())
+                if p_key in set(self.ckpt.completed_files):
+                    continue
+
+                # gate by cap
+                while True:
+                    cap = max(1, int(self.processor.current_worker_cap))
+                    if active < cap:
+                        break
+                    time.sleep(0.05)
+                    if self.stop_event.is_set():
+                        break
+
+                if self.stop_event.is_set():
+                    break
+
+                tid = (len(futures) % max(1, int(self.processor.current_worker_cap)))
+                fut = ex.submit(
+                    self.processor.process_file_to_parts,
+                    filepath=p,
+                    union_cols=union_cols,
+                    out_dir=PARTS_DIR,
+                    sample_rows=sample_rows,
+                    callback=self._progress_callback(stage="CIC", stage_var=self.progress_cic, total_files=total),
+                    thread_id=tid,
+                    stop_flag=self.stop_event,
+                )
+                futures[fut] = (p, tid)
+                active += 1
+
+            # collect
+            for fut in as_completed(list(futures.keys())):
+                p, tid = futures.get(fut, ("unknown", 0))
+                active = max(0, active - 1)
+
+                try:
+                    file_path, tr_rows, te_rows = fut.result()
+                except Exception:
+                    self.log(f"[CIC] crash future {Path(p).name}:\n{traceback.format_exc()}", "ERROR")
+                    continue
+
+                completed += 1
+                self.monitor.track_file_done()
+
+                p_key = str(Path(file_path).resolve())
+                if p_key not in self.ckpt.completed_files:
+                    self.ckpt.completed_files.append(p_key)
+                self.ckpt_mgr.save(self.ckpt)
+
+                self.update_thread_progress(tid, 100.0, f"{Path(file_path).name} done (train={tr_rows:,} test={te_rows:,})")
+                self.log(f"[CIC] done {completed}/{total}: {Path(file_path).name} train={tr_rows:,} test={te_rows:,}", "OK")
+
+                self.progress_cic.set(100.0 * (completed / max(total, 1)))
+
+                # periodic checkpoint ping
+                if (time.time() - start) > 4.0:
+                    start = time.time()
+                    self.ckpt_mgr.save(self.ckpt)
+
+        if self.stop_event.is_set():
+            self.status_var.set("Stopped")
+            self.add_alert("Stopped by user.", "WARN")
             return
 
-        # Split
-        self.status_var.set("Splitting train/test")
-        df_train, df_test = self.processor.split(combined)
-        step += 1
-        self.progress_var.set(step / steps * 100)
-        self.log(f"Split train={len(df_train):,} test={len(df_test):,}", "INFO")
-        if not self.is_running:
-            return
+        self.progress_cic.set(100.0)
 
-        # Export CSV
-        self.status_var.set("Writing CSV")
-        try:
-            df_train.to_csv("fusion_train_smart4.csv", index=False, encoding="utf-8")
-            df_test.to_csv("fusion_test_smart4.csv", index=False, encoding="utf-8")
-            self.log("CSV written: fusion_train_smart4.csv / fusion_test_smart4.csv", "OK")
-        except Exception:
-            self.log(f"CSV export failed:\n{traceback.format_exc()}", "ERROR")
-            self.add_alert("CSV export failed", "ERROR")
-        step += 1
-        self.progress_var.set(step / steps * 100)
-        if not self.is_running:
-            return
+        # stage 4: finalize - concat parts into final train/test
+        self.status_var.set("Finalize: assembling final CSVs")
+        self.ckpt.stage = "finalize"
+        self.ckpt_mgr.save(self.ckpt)
+        self._finalize_from_parts(union_cols)
 
-        # Export NPZ
-        self.status_var.set("Writing NPZ")
-        try:
-            if "Label" not in df_train.columns:
-                self.log("NPZ skipped: no Label column", "WARN")
-            else:
-                numeric_cols = [c for c in df_train.columns if c != "Label" and np.issubdtype(df_train[c].dtype, np.number)]
-                if numeric_cols:
-                    X_train = df_train[numeric_cols].astype(np.float32)
-                    X_train = X_train.fillna(X_train.mean(numeric_only=True))
-                    y_train = df_train["Label"].astype(str)
+        # stage 5: NPZ (best effort)
+        self.status_var.set("NPZ: building (best effort)")
+        self.ckpt.stage = "npz"
+        self.ckpt_mgr.save(self.ckpt)
+        self._build_npz_best_effort(union_cols)
 
-                    scaler = StandardScaler()
-                    X_scaled = scaler.fit_transform(X_train).astype(np.float32)
-
-                    encoder = LabelEncoder()
-                    y_encoded = encoder.fit_transform(y_train)
-
-                    np.savez_compressed(
-                        "preprocessed_dataset.npz",
-                        X=X_scaled,
-                        y=y_encoded,
-                        classes=encoder.classes_,
-                        numeric_cols=np.array(numeric_cols, dtype=object),
-                    )
-                    self.log(f"NPZ written: {len(numeric_cols)} features", "OK")
-                else:
-                    self.log("NPZ skipped: no numeric columns", "WARN")
-        except Exception:
-            self.log(f"NPZ export failed:\n{traceback.format_exc()}", "ERROR")
-            self.add_alert("NPZ export failed", "ERROR")
-
-        step += 1
-        self.progress_var.set(100)
+        # done
+        self.progress_overall.set(100.0)
         self.status_var.set("Completed")
+        self.ckpt.stage = "done"
+        self.ckpt_mgr.save(self.ckpt)
 
-        elapsed = time.time() - (self.start_time or time.time())
-        self.log(f"Finished in {self._format_duration(elapsed)}", "INFO")
-        self.add_alert(f"Completed in {self._format_duration(elapsed)}", "OK")
+        self.add_alert(f"Completed. Train={FINAL_TRAIN.name} Test={FINAL_TEST.name}", "OK")
+        self.log(f"Completed. Train={FINAL_TRAIN} Test={FINAL_TEST}", "OK")
+        if NPZ_OUT.exists():
+            self.log(f"NPZ created: {NPZ_OUT} ({_human_bytes(NPZ_OUT.stat().st_size)})", "OK")
+        elif NPZ_FALLBACK_DIR.exists():
+            self.log(f"NPZ fallback created: {NPZ_FALLBACK_DIR}", "WARN")
 
-    def _format_duration(self, seconds: float) -> str:
-        mins, secs = divmod(int(seconds), 60)
-        hours, mins = divmod(mins, 60)
-        return f"{hours:02d}:{mins:02d}:{secs:02d}"
+    def _process_one_file(
+        self,
+        *,
+        filepath: str,
+        union_cols: list[str],
+        part_dir: Path,
+        sample_rows: int | None,
+        stage_var: tk.DoubleVar,
+        stage_name: str,
+    ) -> None:
+        stage_var.set(0.0)
+        cb = self._progress_callback(stage=stage_name, stage_var=stage_var, total_files=1)
+        fp, tr, te = self.processor.process_file_to_parts(
+            filepath=filepath,
+            union_cols=union_cols,
+            out_dir=part_dir,
+            sample_rows=sample_rows,
+            callback=cb,
+            thread_id=0,
+            stop_flag=self.stop_event,
+        )
+        self.monitor.track_file_done()
+        stage_var.set(100.0)
+        self.log(f"[{stage_name}] done {Path(fp).name} -> train={tr:,} test={te:,}", "OK")
 
-    def _progress_callback(self, name: str):
-        def _cb(idx, size, progress, thread_id, action=None):
-            if not self.is_running:
+    def _progress_callback(self, *, stage: str, stage_var: tk.DoubleVar, total_files: int):
+        def _cb(chunk_idx, rows, progress, thread_id, action=None):
+            if self.stop_event.is_set():
                 return
-            msg = action or f"{name} part {idx} ({size:,} rows)"
+            msg = action or f"{stage} chunk {chunk_idx} ({rows:,} rows)"
             self.update_thread_progress(int(thread_id), float(progress), msg)
-            # reduce spam: log every ~10 updates or major % step
-            if int(progress) % 10 == 0:
-                self.log(f"{name} {progress:.1f}% -> {msg}", "DEBUG")
-            try:
-                self.progress_detail.config(text=f"{name}: {msg} | {progress:.1f}%")
-                self.progress_var.set(progress)
-            except Exception:
-                pass
+            stage_var.set(float(progress))
+            # overall weighted
+            overall = (
+                0.15 * float(self.progress_ton.get())
+                + 0.65 * float(self.progress_cic.get())
+                + 0.15 * float(self.progress_finalize.get())
+                + 0.05 * float(self.progress_npz.get())
+            )
+            self.progress_overall.set(overall)
+
+            # intentionally verbose
+            if int(progress) % 5 == 0:
+                self.log(f"[{stage}] {progress:5.1f}% | {msg}", "DEBUG")
         return _cb
+
+    def _finalize_from_parts(self, union_cols: list[str]) -> None:
+        self.progress_finalize.set(0.0)
+
+        train_parts = sorted(PARTS_DIR.glob("train__*.csv"))
+        test_parts = sorted(PARTS_DIR.glob("test__*.csv"))
+        if not train_parts or not test_parts:
+            self.add_alert("No parts found to finalize. Did processing crash?", "ERROR")
+            self.log("No parts found to finalize. Did processing crash?", "ERROR")
+            return
+
+        self.log(f"[FINALIZE] parts: train={len(train_parts)} test={len(test_parts)}", "INFO")
+
+        def _concat(parts: list[Path], out_path: Path, label: str) -> None:
+            if out_path.exists():
+                out_path.unlink()
+            _safe_mkdir(out_path.parent)
+
+            total = len(parts)
+            written = 0
+            with out_path.open("w", encoding="utf-8", newline="") as out_f:
+                writer = None
+                for i, part in enumerate(parts, 1):
+                    if self.stop_event.is_set():
+                        break
+                    with part.open("r", encoding="utf-8", errors="ignore", newline="") as in_f:
+                        reader = csv.reader(in_f)
+                        header = next(reader, None)
+                        if header is None:
+                            continue
+                        if writer is None:
+                            writer = csv.writer(out_f)
+                            writer.writerow(header)
+                        for row in reader:
+                            writer.writerow(row)
+                            written += 1
+                    self.progress_finalize.set(100.0 * (i / max(total, 1)))
+                    self.progress_overall.set(
+                        0.15 * float(self.progress_ton.get())
+                        + 0.65 * float(self.progress_cic.get())
+                        + 0.15 * float(self.progress_finalize.get())
+                        + 0.05 * float(self.progress_npz.get())
+                    )
+                    self.log(f"[FINALIZE] {label} {i}/{total} part={part.name} (rows~{written:,})", "DEBUG")
+
+            self.log(f"[FINALIZE] wrote {label}: {out_path.name} rows~{written:,}", "OK")
+
+        _concat(train_parts, FINAL_TRAIN, "train")
+        _concat(test_parts, FINAL_TEST, "test")
+        self.progress_finalize.set(100.0)
+
+        if FINAL_TRAIN.exists():
+            self.log(f"[FINALIZE] train size={_human_bytes(FINAL_TRAIN.stat().st_size)}", "INFO")
+        if FINAL_TEST.exists():
+            self.log(f"[FINALIZE] test size={_human_bytes(FINAL_TEST.stat().st_size)}", "INFO")
+
+    def _build_npz_best_effort(self, union_cols: list[str]) -> None:
+        self.progress_npz.set(0.0)
+        self.progress_overall.set(
+            0.15 * float(self.progress_ton.get())
+            + 0.65 * float(self.progress_cic.get())
+            + 0.15 * float(self.progress_finalize.get())
+            + 0.05 * float(self.progress_npz.get())
+        )
+
+        if not FINAL_TRAIN.exists():
+            self.log("[NPZ] skipped: train CSV missing", "ERROR")
+            self.add_alert("NPZ skipped: train CSV missing", "ERROR")
+            return
+
+        # determine numeric columns by sampling
+        try:
+            sample = pd.read_csv(FINAL_TRAIN, nrows=5000, low_memory=False)
+        except Exception:
+            self.log(f"[NPZ] failed reading train sample:\n{traceback.format_exc()}", "ERROR")
+            return
+
+        if "Label" not in sample.columns:
+            self.log("[NPZ] skipped: no Label column", "WARN")
+            self.add_alert("NPZ skipped: no Label column", "WARN")
+            return
+
+        numeric_cols = [c for c in sample.columns if c != "Label" and np.issubdtype(sample[c].dtype, np.number)]
+        if not numeric_cols:
+            self.log("[NPZ] skipped: no numeric columns", "WARN")
+            self.add_alert("NPZ skipped: no numeric columns", "WARN")
+            return
+
+        self.log(f"[NPZ] numeric features={len(numeric_cols)} (2-pass streaming)", "INFO")
+
+        # Pass 1: partial_fit scaler and collect labels
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        le = LabelEncoder()
+        label_set: set[str] = set()
+
+        chunk_size = 150_000
+        total_rows = 0
+
+        try:
+            for i, chunk in enumerate(pd.read_csv(FINAL_TRAIN, chunksize=chunk_size, low_memory=False), 1):
+                if self.stop_event.is_set():
+                    return
+                y = chunk["Label"].astype(str)
+                label_set.update(y.unique().tolist())
+                X = chunk[numeric_cols].astype(np.float32, copy=False)
+                X = X.fillna(X.mean(numeric_only=True))
+                scaler.partial_fit(X)
+                total_rows += len(chunk)
+                if i % 1 == 0:
+                    self.progress_npz.set(min(45.0, 45.0 * (i / max(i + 1, 2))))
+                    self.progress_overall.set(
+                        0.15 * float(self.progress_ton.get())
+                        + 0.65 * float(self.progress_cic.get())
+                        + 0.15 * float(self.progress_finalize.get())
+                        + 0.05 * float(self.progress_npz.get())
+                    )
+                    self.log(f"[NPZ] pass1 chunk#{i} rows={len(chunk):,} total={total_rows:,}", "DEBUG")
+        except Exception:
+            self.log(f"[NPZ] pass1 failed:\n{traceback.format_exc()}", "ERROR")
+            return
+
+        # fit label encoder
+        le.fit(sorted(label_set))
+        n = total_rows
+        d = len(numeric_cols)
+
+        # Decide memory strategy
+        est_bytes = n * d * 4
+        use_memmap = est_bytes > (1.2 * psutil.virtual_memory().available)
+        if use_memmap:
+            _safe_mkdir(NPZ_FALLBACK_DIR)
+            X_path = NPZ_FALLBACK_DIR / "X_train.npy"
+            y_path = NPZ_FALLBACK_DIR / "y_train.npy"
+            meta_path = NPZ_FALLBACK_DIR / "meta.json"
+            self.log(f"[NPZ] dataset too big for RAM -> memmap fallback ({_human_bytes(est_bytes)})", "WARN")
+        else:
+            X_arr = np.zeros((n, d), dtype=np.float32)
+            y_arr = np.zeros((n,), dtype=np.int64)
+
+        # Pass 2: transform and write
+        row_cursor = 0
+        try:
+            if use_memmap:
+                X_mm = np.memmap(X_path, mode="w+", dtype=np.float32, shape=(n, d))
+                y_mm = np.memmap(y_path, mode="w+", dtype=np.int64, shape=(n,))
+            for i, chunk in enumerate(pd.read_csv(FINAL_TRAIN, chunksize=chunk_size, low_memory=False), 1):
+                if self.stop_event.is_set():
+                    return
+                y = le.transform(chunk["Label"].astype(str))
+                X = chunk[numeric_cols].astype(np.float32, copy=False)
+                X = X.fillna(X.mean(numeric_only=True))
+                Xs = scaler.transform(X).astype(np.float32, copy=False)
+
+                r = len(chunk)
+                if use_memmap:
+                    X_mm[row_cursor: row_cursor + r, :] = Xs
+                    y_mm[row_cursor: row_cursor + r] = y
+                else:
+                    X_arr[row_cursor: row_cursor + r, :] = Xs
+                    y_arr[row_cursor: row_cursor + r] = y
+                row_cursor += r
+
+                self.progress_npz.set(45.0 + 55.0 * (row_cursor / max(n, 1)))
+                self.progress_overall.set(
+                    0.15 * float(self.progress_ton.get())
+                    + 0.65 * float(self.progress_cic.get())
+                    + 0.15 * float(self.progress_finalize.get())
+                    + 0.05 * float(self.progress_npz.get())
+                )
+                self.log(f"[NPZ] pass2 chunk#{i} rows={r:,} cursor={row_cursor:,}/{n:,}", "DEBUG")
+
+            if use_memmap:
+                X_mm.flush()
+                y_mm.flush()
+                meta = {"classes": le.classes_.tolist(), "numeric_cols": numeric_cols}
+                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                self.add_alert("NPZ fallback done: memmap folder created.", "WARN")
+            else:
+                # NPZ creation (in-RAM)
+                np.savez_compressed(
+                    NPZ_OUT,
+                    X=X_arr,
+                    y=y_arr,
+                    classes=le.classes_,
+                    numeric_cols=np.array(numeric_cols, dtype=object),
+                )
+                self.add_alert("NPZ created.", "OK")
+        except Exception:
+            self.log(f"[NPZ] pass2 failed:\n{traceback.format_exc()}", "ERROR")
+            self.add_alert("NPZ build failed (see logs).", "ERROR")
+        finally:
+            self.progress_npz.set(100.0)
 
 # ============================================================
 # main
@@ -1224,19 +1697,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
