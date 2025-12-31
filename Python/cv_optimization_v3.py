@@ -26,6 +26,18 @@ from itertools import product
 import numpy as np
 import pandas as pd
 
+def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure label column is named exactly 'Label' (case-insensitive match)."""
+    if df is None or df.empty:
+        return df
+    if 'Label' in df.columns:
+        return df
+    for c in df.columns:
+        if str(c).lower() == 'label':
+            return df.rename(columns={c: 'Label'})
+    return df
+
+
 try:
     from sklearn.model_selection import train_test_split, StratifiedKFold
     from sklearn.linear_model import LogisticRegression
@@ -337,6 +349,7 @@ class CVOptimizationGUI:
                     time.sleep(2)
             
             self.df = pd.concat(chunks, ignore_index=True)
+            self.df = _normalize_label_column(self.df)
             self.log_live(f'OK: {len(self.df):,} lignes\n\n', 'info')
             return True
         except Exception as e:

@@ -16,6 +16,18 @@ import time
 import gc
 import numpy as np
 import pandas as pd
+
+def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure label column is named exactly 'Label' (case-insensitive match)."""
+    if df is None or df.empty:
+        return df
+    if 'Label' in df.columns:
+        return df
+    for c in df.columns:
+        if str(c).lower() == 'label':
+            return df.rename(columns={c: 'Label'})
+    return df
+
 import multiprocessing
 import threading
 import psutil
@@ -129,6 +141,7 @@ class MLEvaluationRunner:
             
             # Charger test en chunks si grand
             df_test = pd.read_csv("fusion_test_smart4.csv", low_memory=False, encoding='utf-8')
+            df_test = _normalize_label_column(df_test)
             self.log(f"Test chargé: {len(df_test):,} lignes", level="OK")
             
             # Vérifier RAM

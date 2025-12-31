@@ -135,6 +135,8 @@ class LauncherDDoS:
         try:
             result = subprocess.run(
                 [sys.executable, 'consolidateddata_CORRECTED.py'],
+                env=_build_consolidation_env(),
+
                 capture_output=False,
                 text=True,
                 timeout=7200

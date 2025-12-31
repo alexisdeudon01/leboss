@@ -13,6 +13,14 @@ DDoS DETECTION PROJECT - LAUNCHER (AMÉLIORÉ)
 import os
 import sys
 import subprocess
+
+def _build_consolidation_env() -> dict:
+    env = os.environ.copy()
+    # defaults (user can override before launching)
+    env.setdefault('FULL_RUN', '0')
+    env.setdefault('SAMPLE_ROWS', '1000')
+    return env
+
 import time
 
 def print_header():
@@ -134,7 +142,7 @@ def mode_consolidation():
     
     input("Appuyez sur ENTREE pour lancer...")
     
-    result = subprocess.run([sys.executable, "consolidateddata_CORRECTED.py"])
+    result = subprocess.run([sys.executable, "consolidateddata_CORRECTED.py"], env=_build_consolidation_env())
     
     if result.returncode != 0:
         print("\n[WARNING] Consolidation interrompue")
