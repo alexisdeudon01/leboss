@@ -138,7 +138,7 @@ class OptimizedDataProcessor:
         budget = max(headroom * 0.6, 64 * 1024 * 1024)  # keep plenty of headroom
 
         try:
-            sample = pd.read_csv(filepath, nrows=2000, low_memory=True, memory_map=True)
+            sample = pd.read_csv(filepath, nrows=2000, low_memory=False, memory_map=True)
             sample = self._optimize_dtypes(sample)
             per_row = sample.memory_usage(deep=True).sum() / max(len(sample), 1)
             est = int(budget / max(per_row, 1))
@@ -158,10 +158,18 @@ class OptimizedDataProcessor:
             df[float_cols] = df[float_cols].apply(pd.to_numeric, downcast="float")
 
         for col in obj_cols:
-            converted = pd.to_numeric(df[col], errors="ignore")
-            if np.issubdtype(converted.dtype, np.number):
-                df[col] = converted
-            elif df[col].nunique(dropna=False) / max(len(df[col]), 1) < 0.5:
+            try:
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                numeric_ratio = numeric.notna().mean()
+            except Exception:
+                numeric = None
+                numeric_ratio = 0
+
+            if numeric is not None and numeric_ratio > 0.5:
+                df[col] = numeric
+                continue
+
+            if df[col].nunique(dropna=False) / max(len(df[col]), 1) < 0.5:
                 df[col] = df[col].astype("category")
 
         return df
@@ -183,7 +191,7 @@ class OptimizedDataProcessor:
     def _load_single_file(self, filepath: str) -> tuple[pd.DataFrame | None, str]:
         self._wait_for_ram(self.max_ram_percent - 2)
         try:
-            df = pd.read_csv(filepath, low_memory=True, memory_map=True)
+            df = pd.read_csv(filepath, low_memory=False, memory_map=True)
             df = self._optimize_dtypes(df)
             self.monitor.record_metric()
             return df, filepath
@@ -193,7 +201,7 @@ class OptimizedDataProcessor:
     # --- public API ------------------------------------------------------
     def load_toniot_optimized(self, filepath: str, callback=None) -> pd.DataFrame:
         chunk_size = self._estimate_chunk_size(filepath)
-        reader = pd.read_csv(filepath, chunksize=chunk_size, low_memory=True, memory_map=True)
+        reader = pd.read_csv(filepath, chunksize=chunk_size, low_memory=False, memory_map=True)
         chunks: list[pd.DataFrame] = []
         processed = 0
 
@@ -219,13 +227,15 @@ class OptimizedDataProcessor:
         gc.collect()
         return result
 
-    def load_cic_optimized(self, folder: str, callback=None) -> tuple[list[pd.DataFrame], int]:
+    def load_cic_optimized(self, folder: str, callback=None, threads_hook=None) -> tuple[list[pd.DataFrame], int, int]:
         cic_files = []
         for root, _, files in os.walk(folder):
             cic_files.extend(os.path.join(root, f) for f in files if f.endswith(".csv"))
         cic_files.sort()
 
         threads = self._choose_threads(len(cic_files))
+        if threads_hook:
+            threads_hook(threads)
         dfs_cic: list[pd.DataFrame] = []
 
         with ThreadPoolExecutor(max_workers=threads) as executor:
@@ -246,7 +256,7 @@ class OptimizedDataProcessor:
                     gc.collect()
 
         gc.collect()
-        return dfs_cic, len(cic_files)
+        return dfs_cic, len(cic_files), threads
 
     def merge_optimized(self, dfs_list: list[pd.DataFrame]) -> pd.DataFrame:
         result = pd.concat(dfs_list, ignore_index=True, copy=False)
@@ -298,6 +308,7 @@ class ConsolidationGUIEnhanced:
         self.cpu_var = tk.StringVar(value="-- %")
         self.rows_var = tk.StringVar(value="Rows: 0")
         self.files_var = tk.StringVar(value="Files: 0")
+        self.thread_bars: dict[int, dict[str, tk.Variable | ttk.Label]] = {}
 
         self.setup_ui()
         self.start_monitoring_loop()
@@ -325,6 +336,19 @@ class ConsolidationGUIEnhanced:
         self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_consolidation, state=tk.DISABLED)
         self.stop_button.pack(side="left", padx=5)
 
+        alerts_frame = ttk.LabelFrame(self.root, text="Alerts")
+        alerts_frame.pack(fill="both", padx=10, pady=5)
+        self.alert_canvas = tk.Canvas(alerts_frame, height=120)
+        alerts_scroll = ttk.Scrollbar(alerts_frame, orient="vertical", command=self.alert_canvas.yview)
+        self.alert_canvas.configure(yscrollcommand=alerts_scroll.set)
+        self.alert_canvas.pack(side="left", fill="both", expand=True)
+        alerts_scroll.pack(side="right", fill="y")
+        self.alert_inner = ttk.Frame(self.alert_canvas)
+        self.alert_canvas.create_window((0, 0), window=self.alert_inner, anchor="nw")
+        self.alert_inner.bind(
+            "<Configure>", lambda e: self.alert_canvas.configure(scrollregion=self.alert_canvas.bbox("all"))
+        )
+
         monitor_frame = ttk.LabelFrame(self.root, text="Monitoring")
         monitor_frame.pack(fill="x", padx=10, pady=10)
 
@@ -343,6 +367,11 @@ class ConsolidationGUIEnhanced:
         self.progress_bar.grid(row=3, column=0, columnspan=4, sticky="ew", padx=5, pady=6)
         monitor_frame.columnconfigure(1, weight=1)
         monitor_frame.columnconfigure(3, weight=1)
+
+        threads_frame = ttk.LabelFrame(self.root, text="Thread progress")
+        threads_frame.pack(fill="x", padx=10, pady=5)
+        self.thread_container = ttk.Frame(threads_frame)
+        self.thread_container.pack(fill="x", padx=5, pady=5)
 
         log_frame = ttk.LabelFrame(self.root, text="Logs")
         log_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -372,6 +401,54 @@ class ConsolidationGUIEnhanced:
 
         self.root.after(0, _append)
 
+    def add_alert(self, message: str, level: str = "INFO") -> None:
+        colors = {"ERROR": "#c0392b", "WARN": "#d35400", "INFO": "#2980b9", "OK": "#27ae60"}
+        color = colors.get(level.upper(), "#2c3e50")
+
+        def _append():
+            row = ttk.Frame(self.alert_inner)
+            tk.Label(row, text=level.upper(), fg=color, width=8).pack(side="left", padx=4)
+            tk.Label(row, text=message, fg=color, wraplength=800, anchor="w", justify="left").pack(
+                side="left", fill="x", expand=True
+            )
+            row.pack(fill="x", padx=4, pady=1)
+            self.alert_canvas.yview_moveto(1.0)
+            if len(self.alert_inner.winfo_children()) > 100:
+                self.alert_inner.winfo_children()[0].destroy()
+
+        self.root.after(0, _append)
+
+    def ensure_thread_bars(self, count: int) -> None:
+        for tid in range(count):
+            if tid in self.thread_bars:
+                continue
+            var = tk.DoubleVar(value=0)
+            row = ttk.Frame(self.thread_container)
+            ttk.Label(row, text=f"T{tid}").pack(side="left", padx=4)
+            bar = ttk.Progressbar(row, maximum=100, variable=var)
+            bar.pack(side="left", fill="x", expand=True, padx=4, pady=2)
+            label = ttk.Label(row, text="Idle", width=40)
+            label.pack(side="left", padx=4)
+            row.pack(fill="x", padx=2, pady=1)
+            self.thread_bars[tid] = {"var": var, "label": label}
+
+    def reset_thread_bars(self) -> None:
+        for entry in self.thread_bars.values():
+            entry["var"].set(0)
+            entry["label"].config(text="Idle")
+
+    def update_thread_progress(self, thread_id: int, progress: float, text: str | None = None) -> None:
+        entry = self.thread_bars.get(thread_id)
+        if not entry:
+            return
+
+        def _update():
+            entry["var"].set(progress)
+            if text:
+                entry["label"].config(text=text)
+
+        self.root.after(0, _update)
+
     def start_monitoring_loop(self) -> None:
         ram, cpu = self.monitor.record_metric()
         stats = self.monitor.get_stats()
@@ -386,6 +463,7 @@ class ConsolidationGUIEnhanced:
     def start_consolidation(self) -> None:
         if not self.toniot_file or not self.cic_dir:
             messagebox.showerror("Missing input", "Select both TON_IoT CSV and CIC folder first.")
+            self.add_alert("Select both TON_IoT CSV and CIC folder first.", "ERROR")
             return
 
         self.is_running = True
@@ -395,6 +473,8 @@ class ConsolidationGUIEnhanced:
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.log("Consolidation started", "INFO")
+        self.add_alert("Consolidation started", "INFO")
+        self.reset_thread_bars()
 
         threading.Thread(target=self.consolidate_worker, daemon=True).start()
 
@@ -422,6 +502,7 @@ class ConsolidationGUIEnhanced:
 
         # Load TON_IoT
         self.status_var.set("Loading TON_IoT")
+        self.ensure_thread_bars(2)
         df_toniot = self.processor.load_toniot_optimized(self.toniot_file, callback=self._progress_callback("TON_IoT"))
         step += 1
         self.progress_var.set(step / steps * 100)
@@ -431,7 +512,10 @@ class ConsolidationGUIEnhanced:
 
         # Load CIC
         self.status_var.set("Loading CIC")
-        dfs_cic, total_files = self.processor.load_cic_optimized(self.cic_dir, callback=self._progress_callback("CIC"))
+        dfs_cic, total_files, cic_threads = self.processor.load_cic_optimized(
+            self.cic_dir, callback=self._progress_callback("CIC"), threads_hook=self.ensure_thread_bars
+        )
+        self.log(f"CIC loader using {cic_threads} thread(s)", "INFO")
         step += 1
         self.progress_var.set(step / steps * 100)
         self.log(f"CIC loaded: {len(dfs_cic)} file(s) (expected {total_files})", "OK")
@@ -497,6 +581,7 @@ class ConsolidationGUIEnhanced:
 
         elapsed = time.time() - (self.start_time or time.time())
         self.log(f"Consolidation finished in {self._format_duration(elapsed)}", "INFO")
+        self.add_alert(f"Consolidation completed in {self._format_duration(elapsed)}", "OK")
 
     def _format_duration(self, seconds: float) -> str:
         mins, secs = divmod(int(seconds), 60)
@@ -509,6 +594,7 @@ class ConsolidationGUIEnhanced:
                 return
             msg = action or f"{name} chunk {idx} ({size:,} rows)"
             self.log(f"{name}: {msg} [{progress:.1f}% - thread {thread_id}]", "INFO")
+            self.update_thread_progress(thread_id, progress, msg)
 
         return _cb
 
