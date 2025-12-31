@@ -405,20 +405,23 @@ class OptimizedDataProcessor:
         cap = base_threads
 
         # grow when we have room; CPU encourages growth
-        if ram_headroom >= 10 and score >= 70:
-            cap = min(self.max_threads, base_threads + 4)
-            return cap, f"headroom {ram_headroom:.1f}% & score {score:.1f} => +4"
-        if ram_headroom >= 6:
+        if ram_headroom >= 12:
+            cap = min(self.max_threads, base_threads + 5)
+            return cap, f"headroom {ram_headroom:.1f}% => +5"
+        if ram_headroom >= 8:
+            cap = min(self.max_threads, base_threads + 3)
+            return cap, f"headroom {ram_headroom:.1f}% => +3"
+        if ram_headroom >= 4 and cpu < 95:
             cap = min(self.max_threads, base_threads + 2)
-            return cap, f"headroom {ram_headroom:.1f}% => +2"
-        if ram_headroom >= 3 and cpu < 90:
+            return cap, f"CPU {cpu:.1f}% & headroom {ram_headroom:.1f}% => +2"
+        if ram_headroom >= 2 and cpu < 85:
             cap = min(self.max_threads, base_threads + 1)
             return cap, f"CPU {cpu:.1f}% low & headroom {ram_headroom:.1f}% => +1"
 
-        # if score poor, back off slightly
-        if score < 50:
+        # back off only if score is low AND almost no headroom
+        if score < 50 and ram_headroom < 2:
             cap = max(1, min(base_threads, 2))
-            return cap, f"score {score:.1f} low => reduce cap={cap}"
+            return cap, f"score {score:.1f} low & headroom {ram_headroom:.1f}% => reduce cap={cap}"
 
         cap = min(self.max_threads, max(1, base_threads))
         return cap, f"stable: cap={cap}"
@@ -453,7 +456,9 @@ class OptimizedDataProcessor:
 
             # callback/progress
             if callback:
-                prog = min(100.0, (processed / est_total_rows) * 100.0)
+                # keep progress moving even if estimate is off
+                prog_est = (processed / est_total_rows) * 100.0
+                prog = min(100.0, max(prog_est, idx * 0.3))
                 callback(idx, len(chunk), prog, thread_id, f"{os.path.basename(filepath)} chunk {idx}")
 
             # occasionally concat to reduce fragmentation
@@ -523,8 +528,7 @@ class OptimizedDataProcessor:
         avg_mb = (sum(sizes_mb) / len(sizes_mb)) if sizes_mb else 0.0
         self._log(f"[CIC] found {len(cic_files)} file(s) | avgâ‰ˆ{avg_mb:.1f}MB | sample_rows={sample_rows}", "INFO")
 
-        base_threads = min(max(1, psutil.cpu_count(logical=True) or 4), self.max_threads, len(cic_files) or self.max_threads)
-        base_threads = max(1, min(base_threads, 4))  # baseline; dynamic can go higher
+        base_threads = min(self.max_threads, max(1, (psutil.cpu_count(logical=True) or 4), len(cic_files)))
         chosen = base_threads
 
         if threads_hook:
@@ -685,7 +689,7 @@ class ConsolidationGUIEnhanced:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Data Consolidation - Dynamic v4")
-        self.root.geometry("1250x900")
+        self.root.geometry("1400x1050")
 
         self.toniot_file: str | None = None
         self.cic_dir: str | None = None
@@ -804,7 +808,7 @@ class ConsolidationGUIEnhanced:
         # Logs (canvas)
         logs_frame = ttk.LabelFrame(self.root, text="Logs (canvas)", padding=6)
         logs_frame.pack(fill="both", padx=10, pady=8, expand=True)
-        self.log_feed = CanvasFeed(logs_frame, height=260, max_items=800, bg="#0f172a", fg="#e2e8f0")
+        self.log_feed = CanvasFeed(logs_frame, height=320, max_items=800, bg="#0f172a", fg="#e2e8f0")
         self.log_feed.pack(fill="both", expand=True)
         # ensure log area starts visible
         self.log("Log canvas ready", "INFO")
@@ -1194,6 +1198,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
 
 
 
