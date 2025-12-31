@@ -212,12 +212,125 @@ class AdvancedMonitor:
 
 
 # ===== OPTIMIZED DATA PROCESSOR =====
+class RecoverySystem:
+    """Handles recovery from errors and checkpointing - AUTO RESUME"""
+    
+    def __init__(self, checkpoint_dir=".checkpoints"):
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoints = {}
+        self.recovery_history = []
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        self._load_existing_checkpoints()
+    
+    def _load_existing_checkpoints(self):
+        """Auto-load existing checkpoints at startup"""
+        try:
+            for file in os.listdir(self.checkpoint_dir):
+                if file.endswith('.pkl'):
+                    task_id = file.replace('task_', '').replace('_checkpoint.pkl', '')
+                    filepath = os.path.join(self.checkpoint_dir, file)
+                    self.checkpoints[task_id] = {
+                        'file': filepath,
+                        'timestamp': datetime.fromtimestamp(os.path.getmtime(filepath)),
+                        'size': os.path.getsize(filepath)
+                    }
+        except:
+            pass
+    
+    def get_available_checkpoints(self):
+        """Get list of available checkpoints for recovery"""
+        return self.checkpoints
+    
+    def has_checkpoint(self, task_id):
+        """Check if checkpoint exists"""
+        return task_id in self.checkpoints
+    
+    def create_checkpoint(self, task_id, data):
+        """Create checkpoint for task - ATOMIC WRITE"""
+        try:
+            checkpoint_file = os.path.join(self.checkpoint_dir, f"task_{task_id}_checkpoint.pkl")
+            
+            # Write to temp file first (atomic)
+            temp_file = checkpoint_file + ".tmp"
+            with open(temp_file, 'wb') as f:
+                pickle.dump(data, f)
+            
+            # Atomic rename
+            os.replace(temp_file, checkpoint_file)
+            
+            self.checkpoints[task_id] = {
+                'file': checkpoint_file,
+                'timestamp': datetime.now(),
+                'size': os.path.getsize(checkpoint_file)
+            }
+            return True
+        except Exception as e:
+            print(f"Checkpoint error: {e}")
+            return False
+    
+    def restore_checkpoint(self, task_id):
+        """Restore checkpoint for task - AUTO DETECT & LOAD"""
+        try:
+            if task_id in self.checkpoints:
+                checkpoint_file = self.checkpoints[task_id]['file']
+                with open(checkpoint_file, 'rb') as f:
+                    data = pickle.load(f)
+                
+                self.recovery_history.append({
+                    'task_id': task_id,
+                    'timestamp': datetime.now(),
+                    'status': 'recovered'
+                })
+                return data
+        except Exception as e:
+            self.recovery_history.append({
+                'task_id': task_id,
+                'timestamp': datetime.now(),
+                'status': 'failed',
+                'error': str(e)
+            })
+        return None
+    
+    def cleanup_checkpoints(self):
+        """Clean up checkpoint files - SAFE CLEANUP"""
+        for task_id, info in list(self.checkpoints.items()):
+            try:
+                os.remove(info['file'])
+            except:
+                pass
+        self.checkpoints.clear()
+    
+    def delete_checkpoint(self, task_id):
+        """Delete specific checkpoint"""
+        if task_id in self.checkpoints:
+            try:
+                os.remove(self.checkpoints[task_id]['file'])
+                del self.checkpoints[task_id]
+            except:
+                pass
+    
+    def get_checkpoint_info(self, task_id):
+        """Get checkpoint info"""
+        if task_id in self.checkpoints:
+            info = self.checkpoints[task_id]
+            return {
+                'task_id': task_id,
+                'size_mb': info['size'] / (1024**2),
+                'timestamp': info['timestamp'].isoformat(),
+                'status': 'available'
+            }
+        return None
+
+
+# ===== ADVANCED LOGGING =====
+
 class OptimizedDataProcessor:
     """Ultra-optimized data processing"""
     
     def __init__(self, monitor, cache):
         self.monitor = monitor
         self.cache = cache
+        self.recovery = RecoverySystem()  # ← ADDED: Recovery system for checkpoints
         self.processed_rows = 0
         self.total_rows_estimate = 0
         self.start_time = time.time()
@@ -563,6 +676,7 @@ class ConsolidationGUIEnhanced:
                 self.log("🗑️  Cleaned up old checkpoints", "INFO")
     
     
+    def setup_ui(self):
         """Setup UI with complete scrollbars"""
         try:
             self.root.columnconfigure(0, weight=1)
@@ -1209,117 +1323,6 @@ class PerformanceTracker:
 
 
 # ===== RECOVERY SYSTEM =====
-class RecoverySystem:
-    """Handles recovery from errors and checkpointing - AUTO RESUME"""
-    
-    def __init__(self, checkpoint_dir=".checkpoints"):
-        self.checkpoint_dir = checkpoint_dir
-        self.checkpoints = {}
-        self.recovery_history = []
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        self._load_existing_checkpoints()
-    
-    def _load_existing_checkpoints(self):
-        """Auto-load existing checkpoints at startup"""
-        try:
-            for file in os.listdir(self.checkpoint_dir):
-                if file.endswith('.pkl'):
-                    task_id = file.replace('task_', '').replace('_checkpoint.pkl', '')
-                    filepath = os.path.join(self.checkpoint_dir, file)
-                    self.checkpoints[task_id] = {
-                        'file': filepath,
-                        'timestamp': datetime.fromtimestamp(os.path.getmtime(filepath)),
-                        'size': os.path.getsize(filepath)
-                    }
-        except:
-            pass
-    
-    def get_available_checkpoints(self):
-        """Get list of available checkpoints for recovery"""
-        return self.checkpoints
-    
-    def has_checkpoint(self, task_id):
-        """Check if checkpoint exists"""
-        return task_id in self.checkpoints
-    
-    def create_checkpoint(self, task_id, data):
-        """Create checkpoint for task - ATOMIC WRITE"""
-        try:
-            checkpoint_file = os.path.join(self.checkpoint_dir, f"task_{task_id}_checkpoint.pkl")
-            
-            # Write to temp file first (atomic)
-            temp_file = checkpoint_file + ".tmp"
-            with open(temp_file, 'wb') as f:
-                pickle.dump(data, f)
-            
-            # Atomic rename
-            os.replace(temp_file, checkpoint_file)
-            
-            self.checkpoints[task_id] = {
-                'file': checkpoint_file,
-                'timestamp': datetime.now(),
-                'size': os.path.getsize(checkpoint_file)
-            }
-            return True
-        except Exception as e:
-            print(f"Checkpoint error: {e}")
-            return False
-    
-    def restore_checkpoint(self, task_id):
-        """Restore checkpoint for task - AUTO DETECT & LOAD"""
-        try:
-            if task_id in self.checkpoints:
-                checkpoint_file = self.checkpoints[task_id]['file']
-                with open(checkpoint_file, 'rb') as f:
-                    data = pickle.load(f)
-                
-                self.recovery_history.append({
-                    'task_id': task_id,
-                    'timestamp': datetime.now(),
-                    'status': 'recovered'
-                })
-                return data
-        except Exception as e:
-            self.recovery_history.append({
-                'task_id': task_id,
-                'timestamp': datetime.now(),
-                'status': 'failed',
-                'error': str(e)
-            })
-        return None
-    
-    def cleanup_checkpoints(self):
-        """Clean up checkpoint files - SAFE CLEANUP"""
-        for task_id, info in list(self.checkpoints.items()):
-            try:
-                os.remove(info['file'])
-            except:
-                pass
-        self.checkpoints.clear()
-    
-    def delete_checkpoint(self, task_id):
-        """Delete specific checkpoint"""
-        if task_id in self.checkpoints:
-            try:
-                os.remove(self.checkpoints[task_id]['file'])
-                del self.checkpoints[task_id]
-            except:
-                pass
-    
-    def get_checkpoint_info(self, task_id):
-        """Get checkpoint info"""
-        if task_id in self.checkpoints:
-            info = self.checkpoints[task_id]
-            return {
-                'task_id': task_id,
-                'size_mb': info['size'] / (1024**2),
-                'timestamp': info['timestamp'].isoformat(),
-                'status': 'available'
-            }
-        return None
-
-
-# ===== ADVANCED LOGGING =====
 class AdvancedLogger:
     """Comprehensive logging system"""
     
@@ -2473,8 +2476,7 @@ class DebugUtils:
     @staticmethod
     def print_dataframe_info(df, name="DataFrame"):
         """Print detailed dataframe information"""
-        print(f"
-{name} Information:")
+        print(f"\n{name} Information:")
         print(f"Shape: {df.shape}")
         print(f"Memory: {df.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
         print(f"Columns: {list(df.columns)}")
