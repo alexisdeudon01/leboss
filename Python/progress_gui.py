@@ -32,6 +32,7 @@ class GenericProgressGUI:
         self.stages = {}
         self.file_progress = {}
         self.global_progress = {'current': 0, 'total': 0, 'status': ''}
+        self.thread_bars = {}
         self.start_time = None
         
         self.setup_ui()
@@ -133,6 +134,28 @@ class GenericProgressGUI:
         self.file_text = scrolledtext.ScrolledText(file_frame, height=5, font=('Courier', 8),
                                                    bg='#f8f8f8', fg='#333')
         self.file_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+
+        # Thread progress (scrollable)
+        threads_frame = tk.LabelFrame(right_frame, text='THREADS', font=('Arial', 9, 'bold'),
+                                      bg='white', relief=tk.SUNKEN, bd=2)
+        threads_frame.grid(row=5, column=0, sticky='nsew', padx=0, pady=(0, 5))
+        threads_frame.columnconfigure(0, weight=1)
+        threads_frame.rowconfigure(0, weight=1)
+
+        thread_holder = tk.Frame(threads_frame, bg='white')
+        thread_holder.grid(row=0, column=0, sticky='nsew')
+        thread_holder.columnconfigure(0, weight=1)
+
+        self.thread_canvas = tk.Canvas(thread_holder, bg='white', highlightthickness=0)
+        self.thread_scroll = ttk.Scrollbar(thread_holder, orient='vertical', command=self.thread_canvas.yview)
+        self.thread_canvas.configure(yscrollcommand=self.thread_scroll.set)
+        self.thread_inner = tk.Frame(self.thread_canvas, bg='white')
+        self.thread_inner.bind("<Configure>", lambda e: self.thread_canvas.configure(scrollregion=self.thread_canvas.bbox("all")))
+        self.thread_window = self.thread_canvas.create_window((0, 0), window=self.thread_inner, anchor='nw')
+        self.thread_canvas.bind("<Configure>", lambda e: self.thread_canvas.itemconfigure(self.thread_window, width=e.width))
+
+        self.thread_canvas.pack(side='left', fill='both', expand=True)
+        self.thread_scroll.pack(side='right', fill='y')
         
         # Status bar
         footer = tk.Frame(self.root, bg='#ecf0f1', height=40)
@@ -160,6 +183,45 @@ class GenericProgressGUI:
             self.stages[stage_id]['total'] = total
             self.stages[stage_id]['status'] = status
             self.update_stages_display()
+
+    def add_thread_bar(self, thread_id, label_text=None):
+        """Ajoute une barre de progression pour un thread (avec scroll)."""
+        tid = int(thread_id)
+        if tid in self.thread_bars:
+            return
+
+        row = tk.Frame(self.thread_inner, bg='white')
+        tk.Label(row, text=f"T{tid}", font=('Arial', 9, 'bold'), bg='white', width=4, anchor='w').pack(side='left', padx=4)
+        var = tk.DoubleVar(value=0.0)
+        bar = ttk.Progressbar(row, maximum=100, variable=var, length=180)
+        bar.pack(side='left', fill='x', expand=True, padx=4, pady=2)
+        lbl = tk.Label(row, text=label_text or 'Idle', font=('Arial', 8), bg='white', anchor='w')
+        lbl.pack(side='left', padx=4)
+        row.pack(fill='x', padx=4, pady=2)
+
+        self.thread_bars[tid] = {'var': var, 'label': lbl, 'row': row}
+        try:
+            self.thread_inner.update_idletasks()
+            self.thread_canvas.configure(scrollregion=self.thread_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def update_thread_progress(self, thread_id, progress, text=None):
+        """Met à jour la barre de thread (auto-ajout si absente)."""
+        tid = int(thread_id)
+        if tid not in self.thread_bars:
+            self.add_thread_bar(tid)
+        entry = self.thread_bars.get(tid)
+        if not entry:
+            return
+        try:
+            entry['var'].set(float(progress))
+            if text:
+                entry['label'].config(text=str(text)[:120])
+            self.thread_inner.update_idletasks()
+            self.thread_canvas.configure(scrollregion=self.thread_canvas.bbox("all"))
+        except Exception:
+            pass
     
     def update_stages_display(self):
         """Affiche toutes les étapes"""

@@ -1,5 +1,5 @@
 {
-  "run_id": "b08e14d31d",
+  "run_id": "2f480a406d",
   "toniot_file": "C:/Users/Shadow/Desktop/master/TONIOT/train_test_network.csv",
   "cic_dir": "C:/Users/Shadow/Desktop/master/CIC",
   "full_run": true,
@@ -8,24 +8,13 @@
   "union_cols_hash": "d1b64b1054",
   "completed_files": [
     "C:\\Users\\Shadow\\Desktop\\master\\TONIOT\\train_test_network.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\LDAP.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\UDPLag.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_DNS.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NTP.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\Syn.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_SNMP.csv",
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_LDAP.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_UDP.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NetBIOS.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\TFTP.csv",
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_MSSQL.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_SSDP.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\UDPLag.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\Portmap.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\NetBIOS.csv"
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_DNS.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NTP.csv"
   ],
   "stage": "cic",
   "rows_written_train": 0,
   "rows_written_test": 0,
-  "last_update_ts": "2025-12-31 11:59:34"
+  "last_update_ts": "2025-12-31 13:11:12"
 }

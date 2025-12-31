@@ -92,6 +92,7 @@ SMALL_FONT = ("Arial", 9)
 SMALL_FONT_BOLD = ("Arial", 9, "bold")
 
 TARGET_FLOAT_DTYPE = np.float32
+NPZ_FLOAT_DTYPE = np.float64  # safer for very large magnitudes during NPZ build
 
 # ============================================================
 # Helpers
@@ -517,6 +518,40 @@ class OptimizedDataProcessor:
         except Exception:
             return df
 
+    def _sanitize_chunk(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Replace inf by NaN and clip numeric values to avoid float32 overflows downstream."""
+        try:
+            num_cols = df.select_dtypes(include=[np.number]).columns
+            if len(num_cols) == 0:
+                return df
+            df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
+            df[num_cols] = df[num_cols].clip(-1e6, 1e6)
+            return df
+        except Exception:
+            self._log(f"sanitize_chunk failed:\n{traceback.format_exc()}", "WARN")
+            return df
+
+    @staticmethod
+    def _sanitize_numeric_block(
+        df: pd.DataFrame,
+        numeric_cols: list[str],
+        *,
+        clip_val: float | None = 1e6,
+        dtype: Any = np.float32,
+    ) -> pd.DataFrame:
+        """Sanitize numeric columns: replace inf, optional clip, fill NaN with column mean."""
+        try:
+            if not numeric_cols:
+                return df
+            df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+            if clip_val is not None:
+                df[numeric_cols] = df[numeric_cols].clip(-clip_val, clip_val)
+            means = df[numeric_cols].mean(numeric_only=True)
+            df[numeric_cols] = df[numeric_cols].fillna(means).astype(dtype, copy=False)
+            return df
+        except Exception:
+            return df
+
     # --------------------------
     # union columns (schema)
     # --------------------------
@@ -744,6 +779,7 @@ class OptimizedDataProcessor:
         if sample_rows is not None:
             df = pd.read_csv(filepath, nrows=sample_rows, low_memory=False, memory_map=True)
             df = self._optimize_dtypes(self.ensure_label_is_standard(df))
+            df = self._sanitize_chunk(df)
             df = df.reindex(columns=union_cols)
             if "Label" in df.columns:
                 df = df.dropna(subset=["Label"])
@@ -771,6 +807,7 @@ class OptimizedDataProcessor:
 
                 chunk_i += 1
                 chunk = self._optimize_dtypes(self.ensure_label_is_standard(chunk))
+                chunk = self._sanitize_chunk(chunk)
                 chunk = chunk.reindex(columns=union_cols)
                 if "Label" in chunk.columns:
                     chunk = chunk.dropna(subset=["Label"])
@@ -1845,8 +1882,10 @@ class ConsolidationGUIEnhanced:
                     return
                 y = chunk["Label"].astype(str)
                 label_set.update(y.unique().tolist())
-                X = chunk[numeric_cols].astype(np.float32, copy=False)
-                X = X.fillna(X.mean(numeric_only=True))
+                chunk = OptimizedDataProcessor._sanitize_numeric_block(
+                    chunk, numeric_cols, clip_val=None, dtype=NPZ_FLOAT_DTYPE
+                )
+                X = chunk[numeric_cols].astype(NPZ_FLOAT_DTYPE, copy=False)
                 scaler.partial_fit(X)
                 total_rows += len(chunk)
                 if i % 1 == 0:
@@ -1878,22 +1917,24 @@ class ConsolidationGUIEnhanced:
             meta_path = NPZ_FALLBACK_DIR / "meta.json"
             self.log(f"[NPZ] dataset too big for RAM -> memmap fallback ({_human_bytes(est_bytes)})", "WARN")
         else:
-            X_arr = np.zeros((n, d), dtype=np.float32)
+            X_arr = np.zeros((n, d), dtype=NPZ_FLOAT_DTYPE)
             y_arr = np.zeros((n,), dtype=np.int64)
 
         # Pass 2: transform and write
         row_cursor = 0
         try:
             if use_memmap:
-                X_mm = np.memmap(X_path, mode="w+", dtype=np.float32, shape=(n, d))
+                X_mm = np.memmap(X_path, mode="w+", dtype=NPZ_FLOAT_DTYPE, shape=(n, d))
                 y_mm = np.memmap(y_path, mode="w+", dtype=np.int64, shape=(n,))
             for i, chunk in enumerate(pd.read_csv(FINAL_TRAIN, chunksize=chunk_size, low_memory=False), 1):
                 if self.stop_event.is_set():
                     return
                 y = le.transform(chunk["Label"].astype(str))
-                X = chunk[numeric_cols].astype(np.float32, copy=False)
-                X = X.fillna(X.mean(numeric_only=True))
-                Xs = scaler.transform(X).astype(np.float32, copy=False)
+                chunk = OptimizedDataProcessor._sanitize_numeric_block(
+                    chunk, numeric_cols, clip_val=None, dtype=NPZ_FLOAT_DTYPE
+                )
+                X = chunk[numeric_cols].astype(NPZ_FLOAT_DTYPE, copy=False)
+                Xs = scaler.transform(X).astype(NPZ_FLOAT_DTYPE, copy=False)
 
                 r = len(chunk)
                 if use_memmap:
