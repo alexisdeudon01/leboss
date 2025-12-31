@@ -224,10 +224,19 @@ class OptimizedDataProcessor:
         self.dtype_cache = {}
     
     def load_toniot_optimized(self, filepath, callback=None):
-        """Load TON_IoT with optimization"""
+        """Load TON_IoT with optimization + CHECKPOINT RECOVERY"""
         chunks = []
         chunk_size = self._get_optimal_chunk_size()
         chunk_idx = 0
+        
+        # Check if checkpoint exists - RESUME from here!
+        checkpoint_key = "toniot_checkpoint"
+        checkpoint_data = self.recovery.restore_checkpoint(checkpoint_key)
+        
+        if checkpoint_data is not None:
+            chunks = checkpoint_data.get('chunks', [])
+            chunk_idx = checkpoint_data.get('chunk_idx', 0)
+            print(f"✅ RESUMED from checkpoint: chunk {chunk_idx}")
         
         try:
             for chunk in pd.read_csv(filepath, chunksize=chunk_size, low_memory=False):
@@ -251,61 +260,119 @@ class OptimizedDataProcessor:
                     thread_id = (chunk_idx - 1) % 2
                     callback(chunk_idx, len(chunk), min(100, progress), thread_id)
                 
-                # Aggressive garbage collection
-                if chunk_idx % 3 == 0:
+                # REDUCED GC - only every 10 chunks instead of 3
+                if chunk_idx % 10 == 0:
                     gc.collect()
                 
-                if psutil.virtual_memory().percent > 90:
+                # Only GC if RAM > 95% (was 90%) - less aggressive!
+                if psutil.virtual_memory().percent > 95:
                     gc.collect()
+                
+                # CHECKPOINT every 5 chunks for recovery
+                if chunk_idx % 5 == 0:
+                    self.recovery.create_checkpoint(checkpoint_key, {
+                        'chunks': chunks,
+                        'chunk_idx': chunk_idx,
+                        'timestamp': datetime.now().isoformat()
+                    })
             
             # Concatenate efficiently
             result = pd.concat(chunks, ignore_index=True, copy=False)
-            gc.collect()
+            
+            # CLEANUP checkpoint when done
+            if checkpoint_key in self.recovery.checkpoints:
+                del self.recovery.checkpoints[checkpoint_key]
+            
             return result
         
         except Exception as e:
+            # ON ERROR - SAVE CHECKPOINT for recovery!
+            self.recovery.create_checkpoint(checkpoint_key, {
+                'chunks': chunks,
+                'chunk_idx': chunk_idx,
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e)
+            })
             self.monitor.add_error(f"Error loading TON_IoT: {str(e)}")
             raise
     
     def load_cic_optimized(self, folder, callback=None):
-        """Load CIC files with optimization (threading) - NO PICKLE ERRORS"""
+        """Load CIC files with optimization + CHECKPOINT RECOVERY - NO PICKLE ERRORS"""
         # Scan files
         cic_files = []
         for root, dirs, files in os.walk(folder):
             cic_files.extend([os.path.join(root, f) for f in files if f.endswith('.csv')])
         cic_files.sort()
         
-        num_threads = self._get_optimal_threads()
+        # Check if checkpoint exists - RESUME!
+        checkpoint_key = "cic_checkpoint"
+        checkpoint_data = self.recovery.restore_checkpoint(checkpoint_key)
+        
         dfs_cic = []
+        start_idx = 1
         
-        # Thread pool for loading - NO CALLBACK PASSED (prevents pickle error)
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = {}
-            
-            for idx, csv_file in enumerate(cic_files, 1):
-                thread_id = (idx - 1) % num_threads
-                # FIXED: Don't pass callback to executor - no pickle!
-                future = executor.submit(self._load_single_file_safe, csv_file, idx, len(cic_files), thread_id)
-                futures[future] = (csv_file, idx, thread_id)
-            
-            # Collect results
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result is not None:
-                        df, file_idx, t_id, filename = result
-                        if df is not None:
-                            dfs_cic.append(df)
-                            self.monitor.track_file()
-                        
-                        # Call callback AFTER getting result (not in thread)
-                        if callback:
-                            progress = (file_idx / len(cic_files)) * 100
-                            callback(file_idx, len(cic_files), progress, t_id, f"Loaded {os.path.basename(filename)[:20]}")
-                except Exception as e:
-                    self.monitor.add_warning(f"Error loading file: {str(e)}")
+        if checkpoint_data is not None:
+            dfs_cic = checkpoint_data.get('dfs_cic', [])
+            start_idx = checkpoint_data.get('start_idx', 1)
+            print(f"✅ RESUMED CIC loading from file {start_idx}")
         
-        return dfs_cic, len(cic_files)
+        num_threads = self._get_optimal_threads()
+        
+        try:
+            # Thread pool for loading - NO CALLBACK PASSED (prevents pickle error)
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = {}
+                
+                for idx, csv_file in enumerate(cic_files, 1):
+                    # Skip already processed files
+                    if idx < start_idx:
+                        continue
+                    
+                    thread_id = (idx - 1) % num_threads
+                    # FIXED: Don't pass callback to executor - no pickle!
+                    future = executor.submit(self._load_single_file_safe, csv_file, idx, len(cic_files), thread_id)
+                    futures[future] = (csv_file, idx, thread_id)
+                
+                # Collect results
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            df, file_idx, t_id, filename = result
+                            if df is not None:
+                                dfs_cic.append(df)
+                                self.monitor.track_file()
+                            
+                            # Call callback AFTER getting result (not in thread)
+                            if callback:
+                                progress = (file_idx / len(cic_files)) * 100
+                                callback(file_idx, len(cic_files), progress, t_id, f"Loaded {os.path.basename(filename)[:20]}")
+                            
+                            # CHECKPOINT every 10 files for recovery
+                            if file_idx % 10 == 0:
+                                self.recovery.create_checkpoint(checkpoint_key, {
+                                    'dfs_cic': dfs_cic,
+                                    'start_idx': file_idx + 1,
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                    except Exception as e:
+                        self.monitor.add_warning(f"Error loading file: {str(e)}")
+            
+            # CLEANUP checkpoint when done
+            if checkpoint_key in self.recovery.checkpoints:
+                del self.recovery.checkpoints[checkpoint_key]
+            
+            return dfs_cic, len(cic_files)
+        
+        except Exception as e:
+            # ON ERROR - SAVE CHECKPOINT for recovery!
+            self.recovery.create_checkpoint(checkpoint_key, {
+                'dfs_cic': dfs_cic,
+                'start_idx': len(dfs_cic) + 1,
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e)
+            })
+            raise
     
     def _load_single_file_safe(self, filepath, idx, total, thread_id):
         """Load single file (thread-safe) - NO CALLBACK PARAMETER"""
@@ -316,7 +383,8 @@ class OptimizedDataProcessor:
             self.monitor.record_metric()
             self.monitor.track_data(len(df), 1)
             
-            if psutil.virtual_memory().percent > 90:
+            # REDUCED GC - only if RAM > 95% (was 90%)
+            if psutil.virtual_memory().percent > 95:
                 gc.collect()
             
             return df, idx, thread_id, filepath
@@ -353,8 +421,11 @@ class OptimizedDataProcessor:
                 
                 if col_type == 'object':
                     try:
-                        df[col] = pd.to_numeric(df[col], errors='ignore')
-                    except:
+                        # Use try-catch instead of errors='ignore' (deprecated)
+                        numeric_col = pd.to_numeric(df[col])
+                        df[col] = numeric_col
+                    except (ValueError, TypeError):
+                        # Keep as object if conversion fails
                         pass
                 
                 elif col_type == 'int64':
@@ -469,9 +540,29 @@ class ConsolidationGUIEnhanced:
         
         self.task_displays = {}
         self.setup_ui()
+        
+        # AUTO-DETECT CHECKPOINTS AT STARTUP
+        self._check_for_recovery()
+        
         self.start_monitoring_loop()
     
-    def setup_ui(self):
+    def _check_for_recovery(self):
+        """Check for existing checkpoints and offer recovery"""
+        checkpoints = self.processor.recovery.get_available_checkpoints()
+        
+        if checkpoints:
+            msg = f"🔄 Found {len(checkpoints)} checkpoint(s) from previous run:\n\n"
+            for task_id, info in checkpoints.items():
+                msg += f"• {task_id}: {info['size']/1024**2:.1f}MB (saved {info['timestamp'].strftime('%H:%M:%S')})\n"
+            msg += "\n[YES] Resume from checkpoint\n[NO] Start fresh (delete checkpoints)"
+            
+            if messagebox.askyesno("Recovery Available", msg):
+                self.log("🔄 RESUMING FROM CHECKPOINT...", "PROGRESS")
+            else:
+                self.processor.recovery.cleanup_checkpoints()
+                self.log("🗑️  Cleaned up old checkpoints", "INFO")
+    
+    
         """Setup UI with complete scrollbars"""
         try:
             self.root.columnconfigure(0, weight=1)
@@ -1119,20 +1210,51 @@ class PerformanceTracker:
 
 # ===== RECOVERY SYSTEM =====
 class RecoverySystem:
-    """Handles recovery from errors and checkpointing"""
+    """Handles recovery from errors and checkpointing - AUTO RESUME"""
     
     def __init__(self, checkpoint_dir=".checkpoints"):
         self.checkpoint_dir = checkpoint_dir
         self.checkpoints = {}
         self.recovery_history = []
         os.makedirs(checkpoint_dir, exist_ok=True)
+        self._load_existing_checkpoints()
+    
+    def _load_existing_checkpoints(self):
+        """Auto-load existing checkpoints at startup"""
+        try:
+            for file in os.listdir(self.checkpoint_dir):
+                if file.endswith('.pkl'):
+                    task_id = file.replace('task_', '').replace('_checkpoint.pkl', '')
+                    filepath = os.path.join(self.checkpoint_dir, file)
+                    self.checkpoints[task_id] = {
+                        'file': filepath,
+                        'timestamp': datetime.fromtimestamp(os.path.getmtime(filepath)),
+                        'size': os.path.getsize(filepath)
+                    }
+        except:
+            pass
+    
+    def get_available_checkpoints(self):
+        """Get list of available checkpoints for recovery"""
+        return self.checkpoints
+    
+    def has_checkpoint(self, task_id):
+        """Check if checkpoint exists"""
+        return task_id in self.checkpoints
     
     def create_checkpoint(self, task_id, data):
-        """Create checkpoint for task"""
+        """Create checkpoint for task - ATOMIC WRITE"""
         try:
             checkpoint_file = os.path.join(self.checkpoint_dir, f"task_{task_id}_checkpoint.pkl")
-            with open(checkpoint_file, 'wb') as f:
+            
+            # Write to temp file first (atomic)
+            temp_file = checkpoint_file + ".tmp"
+            with open(temp_file, 'wb') as f:
                 pickle.dump(data, f)
+            
+            # Atomic rename
+            os.replace(temp_file, checkpoint_file)
+            
             self.checkpoints[task_id] = {
                 'file': checkpoint_file,
                 'timestamp': datetime.now(),
@@ -1140,10 +1262,11 @@ class RecoverySystem:
             }
             return True
         except Exception as e:
+            print(f"Checkpoint error: {e}")
             return False
     
     def restore_checkpoint(self, task_id):
-        """Restore checkpoint for task"""
+        """Restore checkpoint for task - AUTO DETECT & LOAD"""
         try:
             if task_id in self.checkpoints:
                 checkpoint_file = self.checkpoints[task_id]['file']
@@ -1166,12 +1289,34 @@ class RecoverySystem:
         return None
     
     def cleanup_checkpoints(self):
-        """Clean up checkpoint files"""
-        for task_id, info in self.checkpoints.items():
+        """Clean up checkpoint files - SAFE CLEANUP"""
+        for task_id, info in list(self.checkpoints.items()):
             try:
                 os.remove(info['file'])
             except:
                 pass
+        self.checkpoints.clear()
+    
+    def delete_checkpoint(self, task_id):
+        """Delete specific checkpoint"""
+        if task_id in self.checkpoints:
+            try:
+                os.remove(self.checkpoints[task_id]['file'])
+                del self.checkpoints[task_id]
+            except:
+                pass
+    
+    def get_checkpoint_info(self, task_id):
+        """Get checkpoint info"""
+        if task_id in self.checkpoints:
+            info = self.checkpoints[task_id]
+            return {
+                'task_id': task_id,
+                'size_mb': info['size'] / (1024**2),
+                'timestamp': info['timestamp'].isoformat(),
+                'status': 'available'
+            }
+        return None
 
 
 # ===== ADVANCED LOGGING =====
@@ -2328,7 +2473,8 @@ class DebugUtils:
     @staticmethod
     def print_dataframe_info(df, name="DataFrame"):
         """Print detailed dataframe information"""
-        print(f"{name} Information:")
+        print(f"
+{name} Information:")
         print(f"Shape: {df.shape}")
         print(f"Memory: {df.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
         print(f"Columns: {list(df.columns)}")
@@ -2395,4 +2541,3 @@ def export_all_reports(self, output_dir="./reports"):
     cache_stats = self.cache.get_stats()
     with open(os.path.join(output_dir, "cache.json"), 'w') as f:
         json.dump(cache_stats, f, indent=2, default=str)
-
