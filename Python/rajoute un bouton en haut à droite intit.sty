@@ -1,0 +1,15 @@
+rajoute un bouton en haut à droite intitule session, je veux voir la liste avec temps et action qui été en cours par decroissant en temps avec liste deroulante, des que je chosit un message de confirmation et apres ca charge. Pour le score, nouvelle formule le score est égale à combien de ligne lues /ou ecrites a été effectués en 10 secondes, l'objectif étant de le maximaniser. Sur le graphique quand tu decide de prendre action par exemple ajout d'un thread, je veux point apparaitre avec label sur graph score ou il est marqué à cette instant un process a été enlevé , retiré, changement de chunk. Le score depend de plusieurs variables la première étant le nombre de thread en parrallelle et qui ont une action, la deuxième étant la taille d'un chunk et le troisième étant l'utilisation de la ram entre 0 et 1 (float) et quatrième CPU (entre 0 et 1 float).1 etant la RAM totalement occupé et 1 pour cpu totalement occupé
+Sachant que si tu augmente le chunk la memoire ram diminue(float entre 0 et 1) et inversement
+a: nombre de process
+b: Taille d'un chunk propre au process dans lequel il est 
+type Process[utilisation memoire en mega juste pour le process, utilisation du processeur juste pour le process)
+c: Array of Process
+d:en 5 seconde capture: Recolter valeur suivant : pour chaque process le travail realisé c'est à dire le nombre de lignes lues ou ecrite en 5 seconde->Unité numberl/s (on l'appele score)
+d: utilisation du cpu uniquement pour son process
+Durant c'est 5 secondes et pour chaque process, dire l'evolution qu'il a eu sur b et sur d.
+Objectif de l'optimisation: Trouver algo ia qui permettent toutes les 5 secondes de trouver les meilleurs valeur de b et d pour que le score soit maximiser. On peut augmenter b en augmentant la taille d'un chunk  et cela fera aussi augmenter a, si on diminue b, a diminue avec.  
+
+Il y a toujours un process dans c à savoir le thread principale main
+carray[
+Sachant que un process contient sa propre zone memoire, directement il n'influt pas sur la ram totale, mais indrectememnt oui car si plusieurs process en parallele plus zones memoire occupé. 
+EN gros si nombre de threads augmente alors RAM augmente
