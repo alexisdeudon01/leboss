@@ -109,15 +109,15 @@ class DDoSDetector:
             # Nettoyer avant charge
             gc.collect()
             
-            data = np.load('preprocessed_dataset.npz', allow_pickle=True)
-            X_train = data['X']
+            data = np.load('preprocessed_dataset.npz', allow_pickle=True, mmap_mode="r")
+            X_train = np.asarray(data['X'], dtype=np.float64)
             
             # Paramètres normalisation
             self.scaler_mean = X_train.mean(axis=0)
             self.scaler_std = X_train.std(axis=0) + 1e-8
             
             # Classes du training
-            self.classes = data['classes']
+            self.classes = np.asarray(data['classes'])
             
             # Label encoder
             self.label_encoder = LabelEncoder()
@@ -146,7 +146,7 @@ class DDoSDetector:
             return None
         
         try:
-            X_normalized = ((X_raw - self.scaler_mean) / self.scaler_std).astype(np.float32)
+            X_normalized = ((X_raw - self.scaler_mean) / self.scaler_std).astype(np.float64)
             return X_normalized
         except Exception as e:
             self.log_alert(f"Erreur normalisation: {e}", level="error")

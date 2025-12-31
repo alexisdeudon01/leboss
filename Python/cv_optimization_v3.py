@@ -26,6 +26,8 @@ from itertools import product
 import numpy as np
 import pandas as pd
 
+NPZ_FLOAT_DTYPE = np.float64
+
 def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure label column is named exactly 'Label' (case-insensitive match)."""
     if df is None or df.empty:
@@ -374,14 +376,14 @@ class CVOptimizationGUI:
             
             self.log_live(f'Dataset: {len(self.df):,} lignes\n', 'info')
             
-            X = self.df[numeric_cols].astype(np.float32).copy()
+            X = self.df[numeric_cols].astype(NPZ_FLOAT_DTYPE).copy()
             X = X.fillna(X.mean())
             
             self.label_encoder = LabelEncoder()
             self.y = self.label_encoder.fit_transform(self.df['Label'])
             
             scaler = StandardScaler()
-            self.X_scaled = scaler.fit_transform(X).astype(np.float32)
+            self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
             
             self.log_live(f'Data normalisee: X={self.X_scaled.shape}\n', 'info')
             

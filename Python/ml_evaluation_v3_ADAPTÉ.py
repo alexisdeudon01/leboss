@@ -125,10 +125,12 @@ class MLEvaluationRunner:
             # Nettoyer avant charge
             gc.collect()
             
-            data = np.load(npz_file, allow_pickle=True)
-            self.X_train = data["X"]
-            self.y_train = data["y"]
-            self.classes = data["classes"]
+            # Charger en mmap pour limiter la RAM, puis caster en float32 si besoin
+            data = np.load(npz_file, allow_pickle=True, mmap_mode="r")
+            # Conserver le float64 pour éviter toute perte de dynamique
+            self.X_train = np.asarray(data["X"], dtype=np.float64)
+            self.y_train = np.asarray(data["y"])
+            self.classes = np.asarray(data["classes"])
             
             self.log(f"Train NPZ chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
             self.log(f"Classes: {list(self.classes)}", level="OK")
@@ -149,9 +151,9 @@ class MLEvaluationRunner:
                 self.log("RAM critique, nettoyage", level="WARN")
             
             numeric_cols = df_test.select_dtypes(include=[np.number]).columns.tolist()
-            X_test_raw = df_test[numeric_cols].astype(np.float32)
+            X_test_raw = df_test[numeric_cols].astype(np.float64)
             X_test_raw = X_test_raw.fillna(X_test_raw.mean())
-            
+
             if X_test_raw.shape[1] != self.X_train.shape[1]:
                 self.log_alert(f"Mismatch features", level="error")
                 return False
@@ -159,7 +161,7 @@ class MLEvaluationRunner:
             # Normaliser avec stats training
             mean = self.X_train.mean(axis=0)
             std = self.X_train.std(axis=0) + 1e-8
-            self.X_test = ((X_test_raw - mean) / std).astype(np.float32)
+            self.X_test = ((X_test_raw - mean) / std).astype(np.float64)
             
             # Encoder labels
             lbl = LabelEncoder()
