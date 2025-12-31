@@ -997,7 +997,7 @@ class ConsolidationGUIEnhanced:
 
         upper = ttk.Frame(paned)
         lower = ttk.Frame(paned)
-        paned.add(upper, weight=4)
+        paned.add(upper, weight=5)
         paned.add(lower, weight=1)
 
         # Monitoring + progress bars
@@ -1072,9 +1072,22 @@ class ConsolidationGUIEnhanced:
         self.thread_canvas.pack(side="left", fill="both", expand=True)
         self.thread_scroll.pack(side="right", fill="y")
 
-        decision_frame = ttk.LabelFrame(mid, text="Dynamic decisions (verbose)", padding=6)
-        decision_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        # scrollable container for decision canvases
+        # Logs
+        lower_paned = ttk.PanedWindow(lower, orient="horizontal")
+        lower_paned.pack(fill="both", expand=True)
+
+        logs_frame = ttk.LabelFrame(lower_paned, text="Logs (VERY verbose)", padding=6)
+        log_container = tk.Frame(logs_frame, bg="#0f172a")
+        log_container.pack(fill="both", expand=True)
+        self.log_feed = CanvasFeed(log_container, height=220, max_items=1600, bg="#0f172a", fg="#e2e8f0")
+        self.log_feed.pack(fill="both", expand=True)
+        lower_paned.add(logs_frame, weight=1)
+
+        right_lower = ttk.Frame(lower_paned)
+        lower_paned.add(right_lower, weight=2)
+
+        decision_frame = ttk.LabelFrame(right_lower, text="Dynamic decisions (verbose)", padding=6)
+        decision_frame.pack(fill="both", expand=True, padx=(0, 6), pady=(0, 4))
         decision_holder = tk.Canvas(decision_frame, highlightthickness=0)
         decision_scroll = ttk.Scrollbar(decision_frame, orient="vertical", command=decision_holder.yview)
         decision_holder.configure(yscrollcommand=decision_scroll.set)
@@ -1092,8 +1105,8 @@ class ConsolidationGUIEnhanced:
         self.worker_canvas = tk.Canvas(decision_inner, width=480, height=120, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
         self.worker_canvas.pack(fill="x", padx=4, pady=(0, 4))
 
-        ai_frame = ttk.LabelFrame(mid, text="AI evolution (time series)", padding=6)
-        ai_frame.pack(side="left", fill="both", expand=True)
+        ai_frame = ttk.LabelFrame(right_lower, text="AI evolution (time series)", padding=6)
+        ai_frame.pack(fill="both", expand=True, padx=(0, 6), pady=(0, 4))
 
         toggle_bar = ttk.Frame(ai_frame)
         toggle_bar.pack(fill="x", padx=4, pady=(2, 0))
@@ -1111,15 +1124,6 @@ class ConsolidationGUIEnhanced:
         self.metric_canvas.pack(side="left", fill="both", expand=True)
         self.metric_scroll.pack(side="right", fill="y")
         self.metric_canvas.bind("<Configure>", lambda e: self.metric_canvas.configure(scrollregion=self.metric_canvas.bbox("all")))
-
-        # Logs
-        logs_frame = ttk.LabelFrame(lower, text="Logs (VERY verbose)", padding=6)
-        logs_frame.pack(fill="both", expand=True)
-
-        log_container = tk.Frame(logs_frame, bg="#0f172a")
-        log_container.pack(fill="both", expand=True)
-        self.log_feed = CanvasFeed(log_container, height=300, max_items=1600, bg="#0f172a", fg="#e2e8f0")
-        self.log_feed.pack(fill="both", expand=True)
 
         self.log("Log canvas ready", "INFO")
 
@@ -1418,7 +1422,7 @@ class ConsolidationGUIEnhanced:
             x = x0 + (tm / max_t) * (x1 - x0)
             y = y1 - ((v - lo) / (hi - lo)) * (y1 - y0)
             pts.extend([x, y])
-        if len(pts) >= 2:
+        if len(pts) >= 4:
             c.create_line(*pts, fill=color, width=2)
         elif len(pts) == 2:
             c.create_oval(pts[0] - 2, pts[1] - 2, pts[0] + 2, pts[1] + 2, fill=color, outline="")
