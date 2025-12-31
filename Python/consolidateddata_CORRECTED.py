@@ -53,7 +53,7 @@ MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "750000"))
 MAX_THREADS = int(os.getenv("MAX_THREADS", "12"))
 
 # keep sample runs heavier to stress CPU/RAM
-DEFAULT_SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", "50000"))
+DEFAULT_SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", "10"))
 FULL_RUN = os.getenv("FULL_RUN", "1").strip() == "1"              # full processing if 1
 WARM_START_SECONDS = float(os.getenv("WARM_START_SECONDS", "12")) # aggressive period at beginning
 
@@ -461,8 +461,15 @@ class OptimizedDataProcessor:
                 prog = min(100.0, max(prog_est, idx * 0.3))
                 callback(idx, len(chunk), prog, thread_id, f"{os.path.basename(filepath)} chunk {idx}")
 
-            # occasionally concat to reduce fragmentation
-            if len(chunks) >= 4 and psutil.virtual_memory().percent > (self.max_ram_percent - 6):
+            # aggressively concat buffered chunks to free memory
+            if len(chunks) >= 2 or psutil.virtual_memory().percent > (self.max_ram_percent - 6):
+                try:
+                    self._log(
+                        f"[CHUNK] concat buffered ({len(chunks)} parts) at idx {idx} | RAM {psutil.virtual_memory().percent:.1f}%",
+                        "DEBUG",
+                    )
+                except Exception:
+                    pass
                 chunks = [pd.concat(chunks, ignore_index=True, copy=False)]
                 gc.collect()
 
@@ -690,6 +697,7 @@ class ConsolidationGUIEnhanced:
         self.root = root
         self.root.title("Data Consolidation - Dynamic v4")
         self.root.geometry("1400x1050")
+        self.root.minsize(1300, 950)
 
         self.toniot_file: str | None = None
         self.cic_dir: str | None = None
@@ -699,6 +707,7 @@ class ConsolidationGUIEnhanced:
 
         self.monitor = AdvancedMonitor()
         self.processor = OptimizedDataProcessor(self.monitor, logger=self.log)
+        self.processor.gui_hook_merge_progress = None
 
         # live ui vars
         self.progress_var = tk.DoubleVar(value=0)
@@ -713,6 +722,7 @@ class ConsolidationGUIEnhanced:
         self.score_state: dict[str, float | None] = {"ram": None, "cpu": None, "overall": None}
 
         self.setup_ui()
+        self.processor.gui_hook_merge_progress = self._merge_progress
         self.start_monitoring_loop()
 
     # ---------------- UI ----------------
@@ -808,7 +818,13 @@ class ConsolidationGUIEnhanced:
         # Logs (canvas)
         logs_frame = ttk.LabelFrame(self.root, text="Logs (canvas)", padding=6)
         logs_frame.pack(fill="both", padx=10, pady=8, expand=True)
-        self.log_feed = CanvasFeed(logs_frame, height=320, max_items=800, bg="#0f172a", fg="#e2e8f0")
+        logs_frame.update_idletasks()
+
+        log_container = tk.Frame(logs_frame, height=420, bg="#0f172a")
+        log_container.pack(fill="both", expand=True)
+        log_container.pack_propagate(False)
+
+        self.log_feed = CanvasFeed(log_container, height=420, max_items=1200, bg="#0f172a", fg="#e2e8f0")
         self.log_feed.pack(fill="both", expand=True)
         # ensure log area starts visible
         self.log("Log canvas ready", "INFO")
@@ -902,6 +918,16 @@ class ConsolidationGUIEnhanced:
 
         try:
             self.root.after(0, _update)
+        except Exception:
+            pass
+
+    def _merge_progress(self, idx: int, total: int, rows: int, pct: int) -> None:
+        """Hook from processor.merge to show progress on thread bar 0."""
+        try:
+            self.ensure_thread_bars(1)
+            msg = f"MERGE {idx}/{total} ({rows:,} rows)"
+            self.update_thread_progress(0, pct, msg)
+            self.progress_detail.config(text=msg)
         except Exception:
             pass
 
