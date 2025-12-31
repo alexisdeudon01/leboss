@@ -116,7 +116,13 @@ class AdvancedMonitor:
 class OptimizedDataProcessor:
     """Loader/processor tuned for low RAM pressure."""
 
-    def __init__(self, monitor: AdvancedMonitor, cache: SmartCache, max_ram_percent: int = MAX_RAM_PERCENT) -> None:
+    def __init__(
+        self,
+        monitor: AdvancedMonitor,
+        cache: SmartCache,
+        max_ram_percent: int = MAX_RAM_PERCENT,
+        logger=None,
+    ) -> None:
         self.monitor = monitor
         self.cache = cache
         self.max_ram_percent = max_ram_percent
@@ -124,6 +130,15 @@ class OptimizedDataProcessor:
         self.max_chunk_size = MAX_CHUNK_SIZE
         self.processed_rows = 0
         self.start_time = time.time()
+        self.logger = logger
+
+    # --- logging helper -------------------------------------------------
+    def _log(self, msg: str) -> None:
+        if self.logger:
+            try:
+                self.logger(msg, "DEBUG")
+            except Exception:
+                pass
 
     # --- helpers ---------------------------------------------------------
     def _wait_for_ram(self, target: float | None = None) -> None:
@@ -145,7 +160,9 @@ class OptimizedDataProcessor:
         except Exception:
             est = self.max_chunk_size // 2
 
-        return max(self.min_chunk_size, min(self.max_chunk_size, est))
+        chunk = max(self.min_chunk_size, min(self.max_chunk_size, est))
+        self._log(f"Chunk size estimate for {os.path.basename(filepath)} -> {chunk:,} rows (budget {budget/1e6:.1f} MB)")
+        return chunk
 
     def _optimize_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
         int_cols = df.select_dtypes(include=["int64", "int32"]).columns
@@ -186,7 +203,9 @@ class OptimizedDataProcessor:
         elif vm.percent > 60:
             max_threads = min(max_threads, 4)
 
-        return max(1, max_threads)
+        threads = max(1, max_threads)
+        self._log(f"Thread choice -> {threads} workers for {file_count} file(s) (RAM {vm.percent:.1f}%, CPU threads {cpu_threads})")
+        return threads
 
     def _load_single_file(self, filepath: str) -> tuple[pd.DataFrame | None, str]:
         self._wait_for_ram(self.max_ram_percent - 2)
@@ -194,6 +213,7 @@ class OptimizedDataProcessor:
             df = pd.read_csv(filepath, low_memory=False, memory_map=True)
             df = self._optimize_dtypes(df)
             self.monitor.record_metric()
+            self._log(f"Loaded file on thread: {os.path.basename(filepath)} ({len(df):,} rows)")
             return df, filepath
         except Exception:
             return None, filepath
@@ -204,6 +224,7 @@ class OptimizedDataProcessor:
         reader = pd.read_csv(filepath, chunksize=chunk_size, low_memory=False, memory_map=True)
         chunks: list[pd.DataFrame] = []
         processed = 0
+        self._log(f"Starting TON_IoT load with chunk_size={chunk_size:,}")
 
         for idx, chunk in enumerate(reader, 1):
             self._wait_for_ram(self.max_ram_percent - 2)
@@ -220,11 +241,13 @@ class OptimizedDataProcessor:
                 callback(idx, len(chunk), progress, (idx - 1) % 2)
 
             if len(chunks) >= 4 and psutil.virtual_memory().percent > self.max_ram_percent - 5:
+                self._log(f"Concatenating buffered TON_IoT chunks at idx {idx} to free memory")
                 chunks = [pd.concat(chunks, ignore_index=True, copy=False)]
                 gc.collect()
 
         result = pd.concat(chunks, ignore_index=True, copy=False) if chunks else pd.DataFrame()
         gc.collect()
+        self._log(f"TON_IoT loaded -> {len(result):,} rows")
         return result
 
     def load_cic_optimized(self, folder: str, callback=None, threads_hook=None) -> tuple[list[pd.DataFrame], int, int]:
@@ -232,6 +255,7 @@ class OptimizedDataProcessor:
         for root, _, files in os.walk(folder):
             cic_files.extend(os.path.join(root, f) for f in files if f.endswith(".csv"))
         cic_files.sort()
+        self._log(f"Discovered {len(cic_files)} CIC file(s) in {folder}")
 
         threads = self._choose_threads(len(cic_files))
         if threads_hook:
@@ -247,6 +271,7 @@ class OptimizedDataProcessor:
                     dfs_cic.append(df)
                     self.monitor.track_file()
                     self.monitor.track_data(len(df))
+                    self._log(f"[CIC] done {done_idx}/{len(cic_files)} -> {os.path.basename(path)} ({len(df):,} rows)")
 
                 if callback:
                     progress = (done_idx / max(len(cic_files), 1)) * 100
@@ -300,7 +325,7 @@ class ConsolidationGUIEnhanced:
 
         self.monitor = AdvancedMonitor()
         self.cache = SmartCache(max_items=0)
-        self.processor = OptimizedDataProcessor(self.monitor, self.cache)
+        self.processor = OptimizedDataProcessor(self.monitor, self.cache, logger=self.log)
 
         self.progress_var = tk.DoubleVar(value=0)
         self.status_var = tk.StringVar(value="Idle")
