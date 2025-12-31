@@ -997,8 +997,8 @@ class ConsolidationGUIEnhanced:
 
         upper = ttk.Frame(paned)
         lower = ttk.Frame(paned)
-        paned.add(upper, weight=1)
-        paned.add(lower, weight=4)
+        paned.add(upper, weight=4)
+        paned.add(lower, weight=1)
 
         # Monitoring + progress bars
         monitor_frame = ttk.LabelFrame(upper, text="Monitoring + Progress", padding=8)
@@ -1118,7 +1118,7 @@ class ConsolidationGUIEnhanced:
 
         log_container = tk.Frame(logs_frame, bg="#0f172a")
         log_container.pack(fill="both", expand=True)
-        self.log_feed = CanvasFeed(log_container, height=640, max_items=1600, bg="#0f172a", fg="#e2e8f0")
+        self.log_feed = CanvasFeed(log_container, height=300, max_items=1600, bg="#0f172a", fg="#e2e8f0")
         self.log_feed.pack(fill="both", expand=True)
 
         self.log("Log canvas ready", "INFO")
@@ -1391,7 +1391,7 @@ class ConsolidationGUIEnhanced:
 
         t = self._ai_history["t"][-240:]
         vals_raw = self._ai_history.get(series_key, [])[-240:]
-        if len(t) < 2 or len(vals_raw) < 2:
+        if len(t) < 1 or len(vals_raw) < 1:
             c.create_text(w / 2, h / 2, text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
             return
 
@@ -1401,7 +1401,7 @@ class ConsolidationGUIEnhanced:
 
         t0 = t[0]
         times = [ti - t0 for ti in t]
-        max_t = max(times)
+        max_t = max(times) if times else 0.0
         if max_t <= 0:
             max_t = 1.0
 
@@ -1418,7 +1418,10 @@ class ConsolidationGUIEnhanced:
             x = x0 + (tm / max_t) * (x1 - x0)
             y = y1 - ((v - lo) / (hi - lo)) * (y1 - y0)
             pts.extend([x, y])
-        c.create_line(*pts, fill=color, width=2)
+        if len(pts) >= 2:
+            c.create_line(*pts, fill=color, width=2)
+        elif len(pts) == 2:
+            c.create_oval(pts[0] - 2, pts[1] - 2, pts[0] + 2, pts[1] + 2, fill=color, outline="")
 
         # axes + grid
         c.create_line(x0, y1, x1, y1, fill="#475569", dash=(2, 3))
@@ -1432,16 +1435,16 @@ class ConsolidationGUIEnhanced:
         last_y = pts[-1] if len(pts) >= 2 else y1
         c.create_oval(now_x - 4, last_y - 4, now_x + 4, last_y + 4, fill="#ef4444", outline="")
 
-        # Additional marker at Now - 30s (best-effort)
-        marker_sec = min(30.0, max_t * 0.5)
-        if marker_sec > 0:
-            target_t = max(t) - marker_sec
-            if target_t > t0:
-                # find closest point
-                closest_idx = min(range(len(t)), key=lambda i: abs(t[i] - target_t))
-                x_mark = x0 + (times[closest_idx] / max_t) * (x1 - x0)
+        # Additional markers every 5s back from Now
+        if max_t > 0:
+            step = 5
+            k = 1
+            while k * step <= max_t:
+                back = k * step
+                x_mark = x1 - (back / max_t) * (x1 - x0)
                 c.create_line(x_mark, y1, x_mark, y1 + 10, fill="#22c55e", width=1)
-                c.create_text(x_mark, y1 + 24, anchor="n", text=f"Now-{int(marker_sec)}s", fill="#22c55e", font=SMALL_FONT)
+                c.create_text(x_mark, y1 + 24, anchor="n", text=f"Now-{back:.0f}s", fill="#22c55e", font=SMALL_FONT)
+                k += 1
 
         # y ticks
         for frac in (0.25, 0.5, 0.75):
