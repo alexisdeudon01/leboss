@@ -17,10 +17,18 @@
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_LDAP.csv",
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_MSSQL.csv",
     "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_NetBIOS.csv",
-    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_DNS.csv"
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\DrDoS_DNS.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-01-12\\01-12\\Syn.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\Portmap.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\UDPLag.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\LDAP.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\NetBIOS.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\UDP.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\Syn.csv",
+    "C:\\Users\\Shadow\\Desktop\\master\\CIC\\CSV-03-11\\03-11\\MSSQL.csv"
   ],
-  "stage": "cic",
+  "stage": "done",
   "rows_written_train": 0,
   "rows_written_test": 0,
-  "last_update_ts": "2025-12-31 17:34:46"
+  "last_update_ts": "2026-01-01 00:16:20"
 }

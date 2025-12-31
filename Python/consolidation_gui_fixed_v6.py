@@ -53,9 +53,9 @@ from tkinter import ttk, filedialog, messagebox
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 try:
-    from ai_optimization_server_with_sessions_v3 import AIOptimizationServer, Metrics as AIMetrics
+    from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 except ImportError:
-    from ai_optimization_server_with_sessions_v3 import AIOptimizationServer, Metrics as AIMetrics
+    from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 # ============================================================
 # CONFIG
@@ -655,11 +655,14 @@ class OptimizedDataProcessor:
         try:
             if not numeric_cols:
                 return df
-            df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+            num_block = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+            num_block = num_block.replace([np.inf, -np.inf], np.nan)
             if clip_val is not None:
-                df[numeric_cols] = df[numeric_cols].clip(-clip_val, clip_val)
-            means = df[numeric_cols].mean(numeric_only=True)
-            df[numeric_cols] = df[numeric_cols].fillna(means).astype(dtype, copy=False)
+                num_block = num_block.clip(-clip_val, clip_val)
+            means = num_block.mean(numeric_only=True)
+            num_block = num_block.fillna(means)
+            num_block = num_block.fillna(0.0)
+            df[numeric_cols] = num_block.astype(dtype, copy=False)
             return df
         except Exception:
             return df
@@ -1000,7 +1003,7 @@ class ConsolidationGUIEnhanced:
             max_chunk_size=MAX_CHUNK_SIZE,
             min_chunk_size=MIN_CHUNK_SIZE,
             max_ram_percent=MAX_RAM_PERCENT,
-            with_gui=True,  # ✅ NOW WORKS!
+            with_gui=False,
         )
 
         self.ai_server_thread = threading.Thread(
@@ -1973,3 +1976,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

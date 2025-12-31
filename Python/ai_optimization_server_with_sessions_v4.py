@@ -14,15 +14,10 @@ from typing import Optional, Any, List, Dict, Tuple
 
 import numpy as np
 
-# Tkinter optionnel
-try:
-    import tkinter as tk
-    from tkinter import ttk
-    HAS_TKINTER = True
-except Exception:
-    HAS_TKINTER = False
-    tk = None
-    ttk = None
+# Tkinter désactivé (serveur headless)
+HAS_TKINTER = False
+tk = None
+ttk = None
 
 
 # ============================================================
@@ -250,7 +245,7 @@ class AIOptimizationServer:
         max_chunk_size: int = 750_000,
         min_chunk_size: int = 50_000,
         max_ram_percent: float = 90.0,
-        with_gui: bool = True,
+        with_gui: bool = False,
     ):
         self.max_workers = int(max_workers)
         self.max_chunk_size = int(max_chunk_size)
@@ -266,7 +261,7 @@ class AIOptimizationServer:
         self._rows_window = deque()  # (t, rows_delta)
         self._prev_score10 = 0.0
 
-        self.gui: Optional[AIServerGUI] = AIServerGUI() if (with_gui and HAS_TKINTER) else None
+        self.gui: Optional[AIServerGUI] = None  # headless only
 
     def stop(self):
         self._stop_event = True
