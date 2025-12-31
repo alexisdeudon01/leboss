@@ -27,6 +27,8 @@ MAX_RAM_PERCENT = 90
 MIN_CHUNK_SIZE = 50_000
 MAX_CHUNK_SIZE = 750_000
 MAX_THREADS = 12
+TARGET_FLOAT_DTYPE = np.float32
+PROGRESS_TITLE = "Overall progress"
 
 
 class SmartCache:
@@ -160,8 +162,17 @@ class OptimizedDataProcessor:
         except Exception:
             est = self.max_chunk_size // 2
 
+        # Dynamic safety based on current RAM
+        if vm.percent > 60:
+            est = int(est * 0.6)
+        if vm.percent > 70:
+            est = int(est * 0.5)
+
         chunk = max(self.min_chunk_size, min(self.max_chunk_size, est))
-        self._log(f"Chunk size estimate for {os.path.basename(filepath)} -> {chunk:,} rows (budget {budget/1e6:.1f} MB)")
+        self._log(
+            f"Chunk size estimate for {os.path.basename(filepath)} -> {chunk:,} rows "
+            f"(budget {budget/1e6:.1f} MB, RAM {vm.percent:.1f}%)"
+        )
         return chunk
 
     def _optimize_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -172,7 +183,7 @@ class OptimizedDataProcessor:
         if len(int_cols) > 0:
             df[int_cols] = df[int_cols].apply(pd.to_numeric, downcast="integer")
         if len(float_cols) > 0:
-            df[float_cols] = df[float_cols].apply(pd.to_numeric, downcast="float")
+            df[float_cols] = df[float_cols].apply(pd.to_numeric, downcast="float").astype(TARGET_FLOAT_DTYPE)
 
         for col in obj_cols:
             try:
@@ -183,15 +194,17 @@ class OptimizedDataProcessor:
                 numeric_ratio = 0
 
             if numeric is not None and numeric_ratio > 0.5:
-                df[col] = numeric
+                df[col] = pd.to_numeric(numeric, downcast="float").astype(TARGET_FLOAT_DTYPE)
                 continue
 
             if df[col].nunique(dropna=False) / max(len(df[col]), 1) < 0.5:
                 df[col] = df[col].astype("category")
+            elif df[col].nunique(dropna=False) < 50:
+                df[col] = df[col].astype("category")
 
         return df
 
-    def _choose_threads(self, file_count: int) -> int:
+    def _choose_threads(self, file_count: int, avg_mb: float = 0.0) -> int:
         cpu_threads = psutil.cpu_count(logical=True) or 4
         max_threads = min(cpu_threads, MAX_THREADS, file_count if file_count else cpu_threads)
         vm = psutil.virtual_memory()
@@ -203,8 +216,16 @@ class OptimizedDataProcessor:
         elif vm.percent > 60:
             max_threads = min(max_threads, 4)
 
+        if avg_mb and avg_mb > 500:
+            max_threads = min(max_threads, 4)
+        if avg_mb and avg_mb > 1000:
+            max_threads = min(max_threads, 2)
+
         threads = max(1, max_threads)
-        self._log(f"Thread choice -> {threads} workers for {file_count} file(s) (RAM {vm.percent:.1f}%, CPU threads {cpu_threads})")
+        self._log(
+            f"Thread choice -> {threads} workers for {file_count} file(s) "
+            f"(RAM {vm.percent:.1f}%, CPU threads {cpu_threads}, avg size ~{avg_mb:.1f} MB)"
+        )
         return threads
 
     def _load_single_file(self, filepath: str) -> tuple[pd.DataFrame | None, str]:
@@ -213,7 +234,8 @@ class OptimizedDataProcessor:
             df = pd.read_csv(filepath, low_memory=False, memory_map=True)
             df = self._optimize_dtypes(df)
             self.monitor.record_metric()
-            self._log(f"Loaded file on thread: {os.path.basename(filepath)} ({len(df):,} rows)")
+            mem_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+            self._log(f"Loaded file on thread: {os.path.basename(filepath)} ({len(df):,} rows, ~{mem_mb:.1f} MB)")
             return df, filepath
         except Exception:
             return None, filepath
@@ -235,6 +257,8 @@ class OptimizedDataProcessor:
             self.processed_rows += len(chunk)
             self.monitor.record_metric()
             self.monitor.track_data(len(chunk))
+            chunk_mem = chunk.memory_usage(deep=True).sum() / (1024 * 1024)
+            self._log(f"TON_IoT chunk {idx}: {len(chunk):,} rows (~{chunk_mem:.1f} MB)")
 
             if callback:
                 progress = min(100.0, (idx * chunk_size) / max(processed, chunk_size) * 100)
@@ -247,20 +271,32 @@ class OptimizedDataProcessor:
 
         result = pd.concat(chunks, ignore_index=True, copy=False) if chunks else pd.DataFrame()
         gc.collect()
-        self._log(f"TON_IoT loaded -> {len(result):,} rows")
+        res_mem = result.memory_usage(deep=True).sum() / (1024 * 1024) if not result.empty else 0
+        self._log(f"TON_IoT loaded -> {len(result):,} rows (~{res_mem:.1f} MB)")
         return result
 
     def load_cic_optimized(self, folder: str, callback=None, threads_hook=None) -> tuple[list[pd.DataFrame], int, int]:
         cic_files = []
+        sizes_mb = []
         for root, _, files in os.walk(folder):
-            cic_files.extend(os.path.join(root, f) for f in files if f.endswith(".csv"))
+            for f in files:
+                if f.endswith(".csv"):
+                    path = os.path.join(root, f)
+                    cic_files.append(path)
+                    try:
+                        sizes_mb.append(os.path.getsize(path) / (1024 * 1024))
+                    except OSError:
+                        sizes_mb.append(0)
         cic_files.sort()
         self._log(f"Discovered {len(cic_files)} CIC file(s) in {folder}")
 
-        threads = self._choose_threads(len(cic_files))
+        avg_mb = sum(sizes_mb) / len(sizes_mb) if sizes_mb else 0.0
+        self._log(f"Avg CIC file size ~{avg_mb:.1f} MB (max ~{max(sizes_mb) if sizes_mb else 0:.1f} MB)")
+        threads = self._choose_threads(len(cic_files), avg_mb=avg_mb)
         if threads_hook:
             threads_hook(threads)
         dfs_cic: list[pd.DataFrame] = []
+        failures: list[str] = []
 
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = {executor.submit(self._load_single_file, path): path for path in cic_files}
@@ -272,6 +308,12 @@ class OptimizedDataProcessor:
                     self.monitor.track_file()
                     self.monitor.track_data(len(df))
                     self._log(f"[CIC] done {done_idx}/{len(cic_files)} -> {os.path.basename(path)} ({len(df):,} rows)")
+                    if done_idx % 3 == 0:
+                        mem_mb = sum(x.memory_usage(deep=True).sum() for x in dfs_cic) / (1024 * 1024)
+                        self._log(f"[CIC] accumulated {done_idx} files, ~{mem_mb:.1f} MB in memory")
+                else:
+                    failures.append(path)
+                    self._log(f"[CIC] failed to load {os.path.basename(path)} (returned None)")
 
                 if callback:
                     progress = (done_idx / max(len(cic_files), 1)) * 100
@@ -281,10 +323,26 @@ class OptimizedDataProcessor:
                     gc.collect()
 
         gc.collect()
+        if failures:
+            self._log(f"[CIC] missing/failed files: {len(failures)} -> {[os.path.basename(f) for f in failures]}")
         return dfs_cic, len(cic_files), threads
 
     def merge_optimized(self, dfs_list: list[pd.DataFrame]) -> pd.DataFrame:
+        if not dfs_list:
+            return pd.DataFrame()
+
+        mem_before = sum(df.memory_usage(deep=True).sum() for df in dfs_list) / (1024 * 1024)
+        rows_before = sum(len(df) for df in dfs_list)
+        cols_before = max(len(df.columns) for df in dfs_list)
+        self._log(
+            f"Merging {len(dfs_list)} dataframe(s) "
+            f"(rows {rows_before:,}, cols ~{cols_before}, ~{mem_before:.1f} MB pre-merge)"
+        )
         result = pd.concat(dfs_list, ignore_index=True, copy=False)
+        result = self._optimize_dtypes(result)
+        mem_after = result.memory_usage(deep=True).sum() / (1024 * 1024)
+        dtypes_summary = result.dtypes.value_counts().to_dict()
+        self._log(f"Merged dataframe -> {len(result):,} rows, {len(result.columns)} cols (~{mem_after:.1f} MB, dtypes {dtypes_summary})")
         gc.collect()
         return result
 
@@ -388,8 +446,9 @@ class ConsolidationGUIEnhanced:
         ttk.Label(monitor_frame, text="Status:").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         ttk.Label(monitor_frame, textvariable=self.status_var).grid(row=2, column=1, columnspan=3, sticky="w", padx=5, pady=3)
 
+        ttk.Label(monitor_frame, text=PROGRESS_TITLE + ":").grid(row=3, column=0, sticky="w", padx=5, pady=3)
         self.progress_bar = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_var)
-        self.progress_bar.grid(row=3, column=0, columnspan=4, sticky="ew", padx=5, pady=6)
+        self.progress_bar.grid(row=3, column=1, columnspan=3, sticky="ew", padx=5, pady=6)
         monitor_frame.columnconfigure(1, weight=1)
         monitor_frame.columnconfigure(3, weight=1)
 
@@ -541,6 +600,10 @@ class ConsolidationGUIEnhanced:
             self.cic_dir, callback=self._progress_callback("CIC"), threads_hook=self.ensure_thread_bars
         )
         self.log(f"CIC loader using {cic_threads} thread(s)", "INFO")
+        if len(dfs_cic) != total_files:
+            missing = total_files - len(dfs_cic)
+            self.add_alert(f"CIC missing/failed files: {missing} (loaded {len(dfs_cic)}/{total_files})", "WARN")
+            self.log(f"CIC missing/failed files: {missing} (loaded {len(dfs_cic)}/{total_files})", "WARN")
         step += 1
         self.progress_var.set(step / steps * 100)
         self.log(f"CIC loaded: {len(dfs_cic)} file(s) (expected {total_files})", "OK")
