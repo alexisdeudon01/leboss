@@ -168,6 +168,103 @@ class CanvasFeed:
         except Exception:
             pass
 
+
+class DualColorProgressBar:
+    """Canvas-based progress bar: existing progress stays base_color, new delta is red."""
+
+    def __init__(
+        self,
+        parent,
+        variable: tk.DoubleVar,
+        *,
+        height: int = 18,
+        base_color: str = "#22c55e",
+        delta_color: str = "#ef4444",
+        trough_color: str = "#e5e7eb",
+        border_color: str = "#cbd5e1",
+    ) -> None:
+        self.variable = variable
+        self.base_color = base_color
+        self.delta_color = delta_color
+        self.trough_color = trough_color
+        self.border_color = border_color
+        self.height = int(height)
+
+        self.prev_value = float(self.variable.get() or 0.0)
+        self.curr_value = float(self.variable.get() or 0.0)
+
+        bg = "#ffffff"
+        try:
+            if hasattr(parent, "cget"):
+                for key in ("background", "bg"):
+                    try:
+                        candidate = parent.cget(key)
+                        if candidate:
+                            bg = candidate
+                            break
+                    except tk.TclError:
+                        continue
+        except Exception:
+            pass
+        self.canvas = tk.Canvas(parent, height=self.height + 4, highlightthickness=0, bg=bg)
+        self._trace = self.variable.trace_add("write", self._on_change)
+        self.canvas.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def _on_change(self, *_args) -> None:
+        try:
+            new_val = float(self.variable.get())
+        except Exception:
+            new_val = 0.0
+        new_val = max(0.0, min(100.0, new_val))
+
+        if new_val >= self.curr_value:
+            self.prev_value = self.curr_value
+        else:
+            # reset/backward: no red highlight
+            self.prev_value = new_val
+        self.curr_value = new_val
+        self._draw()
+
+    def _draw(self) -> None:
+        try:
+            c = self.canvas
+            c.delete("all")
+            w = max(int(c.winfo_width()), 1)
+            h = self.height
+            pad = 2
+            x0, y0, x1, y1 = pad, pad, w - pad, h + pad
+            c.create_rectangle(x0, y0, x1, y1, fill=self.trough_color, outline=self.border_color)
+
+            total_w = max((x1 - x0), 1)
+            green_w = int(total_w * max(min(self.prev_value, self.curr_value), 0.0) / 100.0)
+            red_w = int(total_w * max(self.curr_value - self.prev_value, 0.0) / 100.0)
+
+            if green_w > 0:
+                c.create_rectangle(x0, y0, x0 + green_w, y1, fill=self.base_color, outline="")
+            if red_w > 0:
+                c.create_rectangle(x0 + green_w, y0, x0 + green_w + red_w, y1, fill=self.delta_color, outline="")
+        except Exception:
+            pass
+
+    # geometry passthroughs
+    def grid(self, *args, **kwargs):
+        return self.canvas.grid(*args, **kwargs)
+
+    def pack(self, *args, **kwargs):
+        return self.canvas.pack(*args, **kwargs)
+
+    def destroy(self) -> None:
+        try:
+            if self._trace:
+                self.variable.trace_remove("write", self._trace)
+        except Exception:
+            pass
+        try:
+            self.canvas.destroy()
+        except Exception:
+            pass
+
 # ============================================================
 # Checkpointing
 # ============================================================
@@ -518,6 +615,26 @@ class OptimizedDataProcessor:
         self.last_chunk_reason = f"{current_size:,}->{tuned:,} | RAM {ram:.1f}% score {score:.1f} | mult {mult:.2f} | " + "; ".join(reason)
         return tuned
 
+    def _rebalance_chunk_size(self, current_size: int, *, workers_cap: int, per_row: float) -> int:
+        """Fair-share headroom across active workers to let chunks regrow when RAM is available."""
+        try:
+            vm = psutil.virtual_memory()
+            target_ram = float(self.max_ram_percent) - 1.0
+            if vm.percent >= target_ram - 5:
+                return current_size
+
+            headroom = max((self.max_ram_percent / 100.0 * vm.total) - vm.used, vm.available * 0.5)
+            fair_budget = max(headroom * 0.9 / max(workers_cap, 1), 0.0)
+            est_rows = int(fair_budget / max(per_row, 1.0))
+            est_rows = max(self.min_chunk_size, min(self.max_chunk_size, est_rows))
+
+            if est_rows > current_size:
+                grown = int(min(self.max_chunk_size, current_size * 0.6 + est_rows * 0.4))
+                return grown
+            return current_size
+        except Exception:
+            return current_size
+
     # --------------------------
     # splitting (streaming stratified-ish)
     # --------------------------
@@ -672,6 +789,10 @@ class OptimizedDataProcessor:
                 score = float(getattr(self, "current_score", 100.0))
                 workers_cap = max(1, int(getattr(self, "current_worker_cap", workers_hint)))
                 chunk_size = self._tune_chunk_size(chunk_size, ram=ram, score=score, workers_cap=workers_cap)
+                rebalance = self._rebalance_chunk_size(chunk_size, workers_cap=workers_cap, per_row=per_row)
+                if rebalance != chunk_size:
+                    self.last_chunk_reason += f" | rebalance->{rebalance:,}"
+                chunk_size = rebalance
                 try:
                     reader.chunksize = chunk_size
                 except Exception:
@@ -747,6 +868,7 @@ class ConsolidationGUIEnhanced:
             "chunk_mult": [],
             "reward": [],
         }
+        self.metrics_content_height = 360
 
         # UI vars
         self.status_var = tk.StringVar(value="Idle")
@@ -761,6 +883,14 @@ class ConsolidationGUIEnhanced:
         self.progress_cic = tk.DoubleVar(value=0.0)
         self.progress_finalize = tk.DoubleVar(value=0.0)
         self.progress_npz = tk.DoubleVar(value=0.0)
+        self._progress_cache = {"overall": 0.0, "ton": 0.0, "cic": 0.0, "finalize": 0.0, "npz": 0.0}
+        self._progress_var_to_key = {
+            id(self.progress_overall): "overall",
+            id(self.progress_ton): "ton",
+            id(self.progress_cic): "cic",
+            id(self.progress_finalize): "finalize",
+            id(self.progress_npz): "npz",
+        }
 
         self.thread_bars: dict[int, dict[str, Any]] = {}
         self.current_score = 100.0
@@ -851,23 +981,33 @@ class ConsolidationGUIEnhanced:
 
         # Overall + stage bars (color-coded)
         ttk.Label(monitor_frame, text=PROGRESS_TITLE + ":", font=UI_FONT_BOLD).grid(row=3, column=0, sticky="w")
-        self.pb_overall = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_overall, style="StageALL.Horizontal.TProgressbar")
+        self.pb_overall = DualColorProgressBar(
+            monitor_frame, self.progress_overall, base_color="#16a34a", delta_color="#ef4444"
+        )
         self.pb_overall.grid(row=3, column=1, columnspan=4, sticky="ew", padx=5, pady=3)
 
         ttk.Label(monitor_frame, text="TON:", font=SMALL_FONT_BOLD).grid(row=4, column=0, sticky="w")
-        self.pb_ton = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_ton, style="StageTON.Horizontal.TProgressbar")
+        self.pb_ton = DualColorProgressBar(
+            monitor_frame, self.progress_ton, base_color="#2563eb", delta_color="#ef4444"
+        )
         self.pb_ton.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
 
         ttk.Label(monitor_frame, text="CIC:", font=SMALL_FONT_BOLD).grid(row=4, column=2, sticky="w")
-        self.pb_cic = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_cic, style="StageCIC.Horizontal.TProgressbar")
+        self.pb_cic = DualColorProgressBar(
+            monitor_frame, self.progress_cic, base_color="#16a34a", delta_color="#ef4444"
+        )
         self.pb_cic.grid(row=4, column=3, sticky="ew", padx=5, pady=2)
 
         ttk.Label(monitor_frame, text="Finalize:", font=SMALL_FONT_BOLD).grid(row=5, column=0, sticky="w")
-        self.pb_fin = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_finalize, style="StageFIN.Horizontal.TProgressbar")
+        self.pb_fin = DualColorProgressBar(
+            monitor_frame, self.progress_finalize, base_color="#f59e0b", delta_color="#ef4444"
+        )
         self.pb_fin.grid(row=5, column=1, sticky="ew", padx=5, pady=2)
 
         ttk.Label(monitor_frame, text="NPZ:", font=SMALL_FONT_BOLD).grid(row=5, column=2, sticky="w")
-        self.pb_npz = ttk.Progressbar(monitor_frame, maximum=100, variable=self.progress_npz, style="StageNPZ.Horizontal.TProgressbar")
+        self.pb_npz = DualColorProgressBar(
+            monitor_frame, self.progress_npz, base_color="#7c3aed", delta_color="#ef4444"
+        )
         self.pb_npz.grid(row=5, column=3, sticky="ew", padx=5, pady=2)
 
         monitor_frame.columnconfigure(1, weight=1)
@@ -879,8 +1019,21 @@ class ConsolidationGUIEnhanced:
 
         threads_frame = ttk.LabelFrame(mid, text="Thread progress (never empty)", padding=6)
         threads_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self.thread_container = ttk.Frame(threads_frame)
-        self.thread_container.pack(fill="both", expand=True)
+        thread_canvas_holder = ttk.Frame(threads_frame)
+        thread_canvas_holder.pack(fill="both", expand=True)
+        self.thread_canvas = tk.Canvas(thread_canvas_holder, highlightthickness=0)
+        self.thread_scroll = ttk.Scrollbar(thread_canvas_holder, orient="vertical", command=self.thread_canvas.yview)
+        self.thread_canvas.configure(yscrollcommand=self.thread_scroll.set)
+        self.thread_inner = ttk.Frame(self.thread_canvas)
+        self.thread_inner.bind(
+            "<Configure>", lambda e: self.thread_canvas.configure(scrollregion=self.thread_canvas.bbox("all"))
+        )
+        self.thread_inner_window = self.thread_canvas.create_window((0, 0), window=self.thread_inner, anchor="nw")
+        self.thread_canvas.bind(
+            "<Configure>", lambda e: self.thread_canvas.itemconfigure(self.thread_inner_window, width=e.width)
+        )
+        self.thread_canvas.pack(side="left", fill="both", expand=True)
+        self.thread_scroll.pack(side="right", fill="y")
 
         decision_frame = ttk.LabelFrame(mid, text="Dynamic decisions (verbose)", padding=6)
         decision_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
@@ -892,11 +1045,29 @@ class ConsolidationGUIEnhanced:
         self.worker_canvas = tk.Canvas(decision_frame, width=480, height=90, bg="#f5f5f5", highlightthickness=1, highlightbackground="#ccc")
         self.worker_canvas.pack(fill="x", padx=4, pady=(0, 4))
 
-        ai_frame = ttk.LabelFrame(mid, text="AI evolution (score/cap/chunk_mult)", padding=6)
+        ai_frame = ttk.LabelFrame(mid, text="AI evolution (time series)", padding=6)
         ai_frame.pack(side="left", fill="both", expand=True)
 
-        self.ai_canvas = tk.Canvas(ai_frame, width=520, height=260, bg="#0b1220", highlightthickness=1, highlightbackground="#334155")
-        self.ai_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        self.score_history_canvas = tk.Canvas(
+            ai_frame, width=520, height=150, bg="#0b1220", highlightthickness=1, highlightbackground="#334155"
+        )
+        self.score_history_canvas.pack(fill="both", expand=True, padx=4, pady=(4, 3))
+
+        metrics_holder = ttk.Frame(ai_frame)
+        metrics_holder.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.metrics_history_canvas = tk.Canvas(
+            metrics_holder,
+            width=520,
+            height=140,
+            bg="#0b1220",
+            highlightthickness=1,
+            highlightbackground="#334155",
+            yscrollcommand=lambda *args: self.metrics_scroll.set(*args),
+            scrollregion=(0, 0, 520, self.metrics_content_height),
+        )
+        self.metrics_scroll = ttk.Scrollbar(metrics_holder, orient="vertical", command=self.metrics_history_canvas.yview)
+        self.metrics_history_canvas.pack(side="left", fill="both", expand=True)
+        self.metrics_scroll.pack(side="right", fill="y")
 
         # Logs
         logs_frame = ttk.LabelFrame(lower, text="Logs (VERY verbose)", padding=6)
@@ -956,11 +1127,11 @@ class ConsolidationGUIEnhanced:
 
         self.ckpt = Checkpoint.fresh()
         self.ckpt_mgr.save(self.ckpt)
-        self.progress_overall.set(0)
-        self.progress_ton.set(0)
-        self.progress_cic.set(0)
-        self.progress_finalize.set(0)
-        self.progress_npz.set(0)
+        self._set_progress_async(self.progress_overall, 0)
+        self._set_progress_async(self.progress_ton, 0)
+        self._set_progress_async(self.progress_cic, 0)
+        self._set_progress_async(self.progress_finalize, 0)
+        self._set_progress_async(self.progress_npz, 0)
         self.add_alert("State reset. Ready.", "OK")
         self.log("State reset. Ready.", "OK")
 
@@ -994,6 +1165,11 @@ class ConsolidationGUIEnhanced:
             entry = self.thread_bars.pop(tid, None)
             if entry:
                 try:
+                    if entry.get("bar"):
+                        entry["bar"].destroy()
+                except Exception:
+                    pass
+                try:
                     entry["row"].destroy()
                 except Exception:
                     pass
@@ -1004,15 +1180,21 @@ class ConsolidationGUIEnhanced:
             if tid in self.thread_bars:
                 continue
             var = tk.DoubleVar(value=0)
-            row = ttk.Frame(self.thread_container)
+            row = ttk.Frame(self.thread_inner)
             ttk.Label(row, text=f"T{tid}", font=UI_FONT_BOLD, width=4).pack(side="left", padx=4)
-            bar = ttk.Progressbar(row, maximum=100, variable=var, style="StageALL.Horizontal.TProgressbar")
+            bar = DualColorProgressBar(row, var, base_color="#16a34a", delta_color="#ef4444")
             bar.pack(side="left", fill="x", expand=True, padx=4, pady=2)
             label = ttk.Label(row, text="Idle", width=62, font=SMALL_FONT)
             label.pack(side="left", padx=4)
             row.pack(fill="x", padx=2, pady=2)
-            self.thread_bars[tid] = {"var": var, "label": label, "row": row}
+            self.thread_bars[tid] = {"var": var, "label": label, "row": row, "bar": bar}
             self.log(f"[UI] Added thread bar T{tid}", "DEBUG")
+
+        try:
+            self.thread_inner.update_idletasks()
+            self.thread_canvas.configure(scrollregion=self.thread_canvas.bbox("all"))
+        except Exception:
+            pass
 
     def update_thread_progress(self, thread_id: int, progress: float, text: str | None = None) -> None:
         entry = self.thread_bars.get(int(thread_id))
@@ -1028,6 +1210,18 @@ class ConsolidationGUIEnhanced:
                 pass
 
         self.root.after(0, _update)
+
+    def _set_progress_async(self, var: tk.DoubleVar, value: float) -> None:
+        try:
+            key = self._progress_var_to_key.get(id(var))
+            if key:
+                self._progress_cache[key] = float(value)
+        except Exception:
+            pass
+        try:
+            self.root.after(0, lambda v=var, x=float(value): v.set(x))
+        except Exception:
+            pass
 
     # ---------------- Score + panels ----------------
 
@@ -1081,55 +1275,107 @@ class ConsolidationGUIEnhanced:
         c.create_text(10, 10, anchor="nw", text="CHUNK (tuning log)", font=SMALL_FONT_BOLD)
         c.create_text(10, 30, anchor="nw", text=self.processor.last_chunk_reason, font=SMALL_FONT, width=int(c["width"]) - 20)
 
-    def _draw_ai_graph(self) -> None:
-        c = self.ai_canvas
+    def _draw_score_timeseries(self) -> None:
+        c = self.score_history_canvas
         c.delete("all")
-        w = int(c["width"])
-        h = int(c["height"])
+        w = max(int(c.winfo_width()), int(c["width"]))
+        h = max(int(c.winfo_height()), int(c["height"]))
 
-        # frame
-        c.create_rectangle(10, 10, w - 10, h - 10, outline="#334155")
-        c.create_text(14, 12, anchor="nw", text="Evolution (last ~120 points)", fill="#e2e8f0", font=SMALL_FONT_BOLD)
+        x0, x1 = 46, w - 14
+        y0, y1 = 24, h - 28
+        c.create_rectangle(x0 - 30, y0 - 12, x1 + 6, y1 + 12, outline="#334155")
+        c.create_text(x0 - 28, y0 - 20, anchor="w", text="Score (y) / Temps (x)", fill="#e2e8f0", font=SMALL_FONT_BOLD)
 
-        t = self._ai_history["t"][-120:]
+        t = self._ai_history["t"][-240:]
+        scores = self._ai_history["score"][-240:]
         if len(t) < 2:
-            c.create_text(14, 40, anchor="nw", text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
             return
 
-        score = self._ai_history["score"][-120:]
-        cap = self._ai_history["cap"][-120:]
-        mult = self._ai_history["chunk_mult"][-120:]
-        reward = self._ai_history["reward"][-120:]
+        t0 = t[0]
+        times = [ti - t0 for ti in t]
+        max_t = max(times)
+        if max_t <= 0:
+            max_t = 1.0
 
-        # normalize helpers
-        def _norm(vals: list[float], lo: float, hi: float) -> list[float]:
-            span = max(hi - lo, 1e-6)
-            return [(v - lo) / span for v in vals]
+        pts = []
+        for tm, sc in zip(times, scores):
+            x = x0 + (tm / max_t) * (x1 - x0)
+            y = y1 - (max(0.0, min(100.0, sc)) / 100.0) * (y1 - y0)
+            pts.extend([x, y])
 
-        # y bands
-        pad = 25
-        x0, y0 = 15, 30
-        x1, y1 = w - 15, h - 15
-        xs = np.linspace(x0, x1, len(t)).tolist()
+        c.create_line(*pts, fill="#22c55e", width=2)
+        c.create_line(x0, y1, x1, y1, fill="#475569", dash=(2, 3))
+        c.create_line(x0, y0, x0, y1, fill="#475569", dash=(2, 3))
+        c.create_text(x1, y0 - 20, anchor="e", text=f"{scores[-1]:.1f}", fill="#22c55e", font=SMALL_FONT_BOLD)
+        c.create_text((x0 + x1) / 2, h - 12, text=f"Temps (s) | span ~{max_t:.0f}s", fill="#94a3b8", font=SMALL_FONT)
 
-        sc = _norm(score, 0.0, 100.0)
-        capn = _norm([float(x) for x in cap], 1.0, float(max(2, self.processor.max_threads)))
-        multn = _norm([float(x) for x in mult], 0.6, 1.4)
-        rwdn = _norm([float(x) for x in reward], min(reward), max(reward) + 1e-6)
+        for pct in (25, 50, 75):
+            y_line = y1 - (pct / 100.0) * (y1 - y0)
+            c.create_line(x0, y_line, x1, y_line, fill="#1f2937", dash=(2, 4))
+            c.create_text(x0 - 4, y_line, anchor="e", text=f"{pct}", fill="#94a3b8", font=SMALL_FONT)
 
-        def _plot_line(norm_y: list[float], color: str, label: str, y_shift: float) -> None:
+    def _draw_metrics_timeseries(self) -> None:
+        c = self.metrics_history_canvas
+        c.delete("all")
+        w = max(int(c.winfo_width()), int(c["width"]))
+        h = max(self.metrics_content_height, int(c.winfo_height()), int(c["height"]))
+        try:
+            c.configure(scrollregion=(0, 0, max(w, 1), max(h, 1)))
+        except Exception:
+            pass
+
+        t = self._ai_history["t"][-240:]
+        if len(t) < 2:
+            c.create_text(w / 2, h / 2, text="(waiting for data...)", fill="#94a3b8", font=SMALL_FONT)
+            return
+
+        times = [ti - t[0] for ti in t]
+        max_t = max(times)
+        if max_t <= 0:
+            max_t = 1.0
+
+        x0, x1 = 46, w - 14
+        area_h = (h - 26) / 3
+        series = [
+            ("cap", self._ai_history["cap"][-240:], (1.0, float(self.processor.max_threads)), "#38bdf8"),
+            ("chunkx", self._ai_history["chunk_mult"][-240:], (0.60, 1.40), "#a78bfa"),
+            ("reward", self._ai_history["reward"][-240:], None, "#f59e0b"),
+        ]
+
+        for idx, (label, vals, bounds, color) in enumerate(series):
+            y_top = 14 + idx * area_h
+            y_bottom = y_top + area_h - 12
+            c.create_rectangle(x0 - 30, y_top - 8, x1 + 6, y_bottom + 8, outline="#334155")
+            c.create_text(x0 - 28, y_top - 8, anchor="w", text=f"{label} (y)", fill=color, font=SMALL_FONT_BOLD)
+
+            if not vals:
+                continue
+
+            if bounds is None:
+                lo = min(vals + [-1.0])
+                hi = max(vals + [1.0])
+            else:
+                lo, hi = bounds
+                lo = min(lo, min(vals))
+                hi = max(hi, max(vals))
+            if hi - lo < 1e-6:
+                hi = lo + 1.0
+
             pts = []
-            for xi, ny in zip(xs, norm_y):
-                yi = y1 - (ny * (y1 - y0 - pad)) - y_shift
-                pts.extend([xi, yi])
+            for tm, v in zip(times, vals):
+                x = x0 + (tm / max_t) * (x1 - x0)
+                y = y_bottom - ((v - lo) / (hi - lo)) * (y_bottom - y_top)
+                pts.extend([x, y])
             c.create_line(*pts, fill=color, width=2)
-            c.create_text(w - 16, y0 + y_shift, anchor="ne", text=label, fill=color, font=SMALL_FONT)
+            c.create_line(x0, y_bottom, x1, y_bottom, fill="#475569", dash=(2, 3))
+            c.create_text(x1 + 4, y_top - 8, anchor="e", text=f"{vals[-1]:.2f}", fill=color, font=SMALL_FONT)
 
-        # 4 lines
-        _plot_line(sc, "#22c55e", "score", 18)
-        _plot_line(capn, "#38bdf8", "cap", 36)
-        _plot_line(multn, "#a78bfa", "chunk×", 54)
-        _plot_line(rwdn, "#f59e0b", "reward", 72)
+        c.create_text((x0 + x1) / 2, h - 6, text="Temps (s)", fill="#94a3b8", font=SMALL_FONT)
+
+    def _draw_ai_graph(self) -> None:
+        self._draw_score_timeseries()
+        self._draw_metrics_timeseries()
 
     # ---------------- Monitoring loop (1 second) ----------------
 
@@ -1319,7 +1565,7 @@ class ConsolidationGUIEnhanced:
                 self.ckpt_mgr.save(self.ckpt)
         else:
             self.log("[RESUME] TON already completed (checkpoint).", "INFO")
-            self.progress_ton.set(100.0)
+            self._set_progress_async(self.progress_ton, 100.0)
 
         if self.stop_event.is_set():
             self.status_var.set("Stopped")
@@ -1409,7 +1655,7 @@ class ConsolidationGUIEnhanced:
                 self.update_thread_progress(tid, 100.0, f"{Path(file_path).name} done (train={tr_rows:,} test={te_rows:,})")
                 self.log(f"[CIC] done {completed}/{total}: {Path(file_path).name} train={tr_rows:,} test={te_rows:,}", "OK")
 
-                self.progress_cic.set(100.0 * (completed / max(total, 1)))
+                self._set_progress_async(self.progress_cic, 100.0 * (completed / max(total, 1)))
 
                 # periodic checkpoint ping
                 if (time.time() - start) > 4.0:
@@ -1421,7 +1667,7 @@ class ConsolidationGUIEnhanced:
             self.add_alert("Stopped by user.", "WARN")
             return
 
-        self.progress_cic.set(100.0)
+        self._set_progress_async(self.progress_cic, 100.0)
 
         # stage 4: finalize - concat parts into final train/test
         self.status_var.set("Finalize: assembling final CSVs")
@@ -1436,7 +1682,7 @@ class ConsolidationGUIEnhanced:
         self._build_npz_best_effort(union_cols)
 
         # done
-        self.progress_overall.set(100.0)
+        self._set_progress_async(self.progress_overall, 100.0)
         self.status_var.set("Completed")
         self.ckpt.stage = "done"
         self.ckpt_mgr.save(self.ckpt)
@@ -1458,7 +1704,7 @@ class ConsolidationGUIEnhanced:
         stage_var: tk.DoubleVar,
         stage_name: str,
     ) -> None:
-        stage_var.set(0.0)
+        self._set_progress_async(stage_var, 0.0)
         cb = self._progress_callback(stage=stage_name, stage_var=stage_var, total_files=1)
         fp, tr, te = self.processor.process_file_to_parts(
             filepath=filepath,
@@ -1470,7 +1716,7 @@ class ConsolidationGUIEnhanced:
             stop_flag=self.stop_event,
         )
         self.monitor.track_file_done()
-        stage_var.set(100.0)
+        self._set_progress_async(stage_var, 100.0)
         self.log(f"[{stage_name}] done {Path(fp).name} -> train={tr:,} test={te:,}", "OK")
 
     def _progress_callback(self, *, stage: str, stage_var: tk.DoubleVar, total_files: int):
@@ -1479,15 +1725,15 @@ class ConsolidationGUIEnhanced:
                 return
             msg = action or f"{stage} chunk {chunk_idx} ({rows:,} rows)"
             self.update_thread_progress(int(thread_id), float(progress), msg)
-            stage_var.set(float(progress))
+            self._set_progress_async(stage_var, float(progress))
             # overall weighted
             overall = (
-                0.15 * float(self.progress_ton.get())
-                + 0.65 * float(self.progress_cic.get())
-                + 0.15 * float(self.progress_finalize.get())
-                + 0.05 * float(self.progress_npz.get())
+                0.15 * self._progress_cache["ton"]
+                + 0.65 * self._progress_cache["cic"]
+                + 0.15 * self._progress_cache["finalize"]
+                + 0.05 * self._progress_cache["npz"]
             )
-            self.progress_overall.set(overall)
+            self._set_progress_async(self.progress_overall, overall)
 
             # intentionally verbose
             if int(progress) % 5 == 0:
@@ -1495,7 +1741,7 @@ class ConsolidationGUIEnhanced:
         return _cb
 
     def _finalize_from_parts(self, union_cols: list[str]) -> None:
-        self.progress_finalize.set(0.0)
+        self._set_progress_async(self.progress_finalize, 0.0)
 
         train_parts = sorted(PARTS_DIR.glob("train__*.csv"))
         test_parts = sorted(PARTS_DIR.glob("test__*.csv"))
@@ -1529,12 +1775,13 @@ class ConsolidationGUIEnhanced:
                         for row in reader:
                             writer.writerow(row)
                             written += 1
-                    self.progress_finalize.set(100.0 * (i / max(total, 1)))
-                    self.progress_overall.set(
-                        0.15 * float(self.progress_ton.get())
-                        + 0.65 * float(self.progress_cic.get())
-                        + 0.15 * float(self.progress_finalize.get())
-                        + 0.05 * float(self.progress_npz.get())
+                    self._set_progress_async(self.progress_finalize, 100.0 * (i / max(total, 1)))
+                    self._set_progress_async(
+                        self.progress_overall,
+                        0.15 * self._progress_cache["ton"]
+                        + 0.65 * self._progress_cache["cic"]
+                        + 0.15 * self._progress_cache["finalize"]
+                        + 0.05 * self._progress_cache["npz"],
                     )
                     self.log(f"[FINALIZE] {label} {i}/{total} part={part.name} (rows~{written:,})", "DEBUG")
 
@@ -1542,7 +1789,7 @@ class ConsolidationGUIEnhanced:
 
         _concat(train_parts, FINAL_TRAIN, "train")
         _concat(test_parts, FINAL_TEST, "test")
-        self.progress_finalize.set(100.0)
+        self._set_progress_async(self.progress_finalize, 100.0)
 
         if FINAL_TRAIN.exists():
             self.log(f"[FINALIZE] train size={_human_bytes(FINAL_TRAIN.stat().st_size)}", "INFO")
@@ -1550,12 +1797,13 @@ class ConsolidationGUIEnhanced:
             self.log(f"[FINALIZE] test size={_human_bytes(FINAL_TEST.stat().st_size)}", "INFO")
 
     def _build_npz_best_effort(self, union_cols: list[str]) -> None:
-        self.progress_npz.set(0.0)
-        self.progress_overall.set(
-            0.15 * float(self.progress_ton.get())
-            + 0.65 * float(self.progress_cic.get())
-            + 0.15 * float(self.progress_finalize.get())
-            + 0.05 * float(self.progress_npz.get())
+        self._set_progress_async(self.progress_npz, 0.0)
+        self._set_progress_async(
+            self.progress_overall,
+            0.15 * self._progress_cache["ton"]
+            + 0.65 * self._progress_cache["cic"]
+            + 0.15 * self._progress_cache["finalize"]
+            + 0.05 * self._progress_cache["npz"],
         )
 
         if not FINAL_TRAIN.exists():
@@ -1602,12 +1850,13 @@ class ConsolidationGUIEnhanced:
                 scaler.partial_fit(X)
                 total_rows += len(chunk)
                 if i % 1 == 0:
-                    self.progress_npz.set(min(45.0, 45.0 * (i / max(i + 1, 2))))
-                    self.progress_overall.set(
-                        0.15 * float(self.progress_ton.get())
-                        + 0.65 * float(self.progress_cic.get())
-                        + 0.15 * float(self.progress_finalize.get())
-                        + 0.05 * float(self.progress_npz.get())
+                    self._set_progress_async(self.progress_npz, min(45.0, 45.0 * (i / max(i + 1, 2))))
+                    self._set_progress_async(
+                        self.progress_overall,
+                        0.15 * self._progress_cache["ton"]
+                        + 0.65 * self._progress_cache["cic"]
+                        + 0.15 * self._progress_cache["finalize"]
+                        + 0.05 * self._progress_cache["npz"],
                     )
                     self.log(f"[NPZ] pass1 chunk#{i} rows={len(chunk):,} total={total_rows:,}", "DEBUG")
         except Exception:
@@ -1655,12 +1904,13 @@ class ConsolidationGUIEnhanced:
                     y_arr[row_cursor: row_cursor + r] = y
                 row_cursor += r
 
-                self.progress_npz.set(45.0 + 55.0 * (row_cursor / max(n, 1)))
-                self.progress_overall.set(
-                    0.15 * float(self.progress_ton.get())
-                    + 0.65 * float(self.progress_cic.get())
-                    + 0.15 * float(self.progress_finalize.get())
-                    + 0.05 * float(self.progress_npz.get())
+                self._set_progress_async(self.progress_npz, 45.0 + 55.0 * (row_cursor / max(n, 1)))
+                self._set_progress_async(
+                    self.progress_overall,
+                    0.15 * self._progress_cache["ton"]
+                    + 0.65 * self._progress_cache["cic"]
+                    + 0.15 * self._progress_cache["finalize"]
+                    + 0.05 * self._progress_cache["npz"],
                 )
                 self.log(f"[NPZ] pass2 chunk#{i} rows={r:,} cursor={row_cursor:,}/{n:,}", "DEBUG")
 
@@ -1684,7 +1934,7 @@ class ConsolidationGUIEnhanced:
             self.log(f"[NPZ] pass2 failed:\n{traceback.format_exc()}", "ERROR")
             self.add_alert("NPZ build failed (see logs).", "ERROR")
         finally:
-            self.progress_npz.set(100.0)
+            self._set_progress_async(self.progress_npz, 100.0)
 
 # ============================================================
 # main
