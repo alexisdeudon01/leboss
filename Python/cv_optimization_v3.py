@@ -1,456 +1,627 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-CV OPTIMIZATION V3 - FINAL OPTIMISÉ
-========================================
-✅ FIX 1: StratifiedShuffleSplit
-✅ FIX 2: Decision Tree limit 80%
-✅ NPZ Compression: 9.7x
-✅ tqdm progress bars
-✅ Prêt pour orchestrateur
-✅ MODIFIÉ: UN SEUL NPZ (tensor_data.npz SUPPRIMÉ)
-========================================
+CV OPTIMIZATION V3 - AMÉLIORÉ
+======================================
+✅ Grid Search: Hyperparamètres variables
+✅ Graphiques scrollables (paramètres vs scores)
+✅ Gestion RAM dynamique (<90%)
+✅ Tkinter GUI avancée
+✅ Visualisation complète résultats
+======================================
 """
-import os, sys, time, gc, json, traceback, psutil, threading, multiprocessing
+
+import os
+import sys
+import time
+import gc
+import json
+import traceback
+import psutil
+import threading
+import multiprocessing
 from datetime import datetime, timedelta
+from itertools import product
+
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
-from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import GaussianNB
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import f1_score, recall_score, precision_score
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+
+NPZ_FLOAT_DTYPE = np.float64
+
+def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure label column is named exactly 'Label' (case-insensitive match)."""
+    if df is None or df.empty:
+        return df
+    if 'Label' in df.columns:
+        return df
+    for c in df.columns:
+        if str(c).lower() == 'label':
+            return df.rename(columns={c: 'Label'})
+    return df
+
+
+try:
+    from sklearn.model_selection import train_test_split, StratifiedKFold
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.metrics import f1_score, recall_score, precision_score
+except ImportError:
+    print("Erreur: sklearn non installé")
+    sys.exit(1)
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, messagebox
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+except ImportError:
+    print("Erreur: tkinter ou matplotlib non installé")
+    sys.exit(1)
 
 os.environ['JOBLIB_PARALLEL_BACKEND'] = 'loky'
+
 NUM_CORES = multiprocessing.cpu_count()
-TRAIN_SIZES = np.array([0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95])
 K_FOLD = 5
 STRATIFIED_SAMPLE_RATIO = 0.5
-CPU_THRESHOLD = 90.0
 RAM_THRESHOLD = 90.0
-MODELS_CONFIG = {
-    'Logistic Regression': {'n_jobs': -1, 'desc': 'Très parallélisable'},
-    'Naive Bayes': {'n_jobs': 1, 'desc': 'Non parallélisable'},
-    'Decision Tree': {'n_jobs': -1, 'desc': 'Parallélisable'},
-    'Random Forest': {'n_jobs': -1, 'desc': 'Très parallélisable'},
+
+# GRID SEARCH CONFIGURATION
+PARAM_GRIDS = {
+    'Logistic Regression': {
+        'C': [0.1, 1, 10],
+        'max_iter': [1000, 2000],
+        'penalty': ['l2'],
+    },
+    'Naive Bayes': {
+        'var_smoothing': [1e-9, 1e-8, 1e-7],
+    },
+    'Decision Tree': {
+        'max_depth': [10, 15, 20],
+        'min_samples_split': [5, 10, 20],
+        'min_samples_leaf': [2, 5, 10],
+    },
+    'Random Forest': {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [15, 20],
+        'min_samples_split': [5, 10],
+        'min_samples_leaf': [2, 5],
+    }
 }
 
-class CPUMonitor:
-    def __init__(self):
-        try:
-            self.process = psutil.Process(os.getpid())
-        except Exception:
-            self.process = None
-    def get_cpu_percent(self):
-        try:
-            return self.process.cpu_percent(interval=0.05) if self.process else 0
-        except Exception:
-            return 0
-    def get_num_threads(self):
-        try:
-            return self.process.num_threads() if self.process else 1
-        except Exception:
-            return 1
 
-class CVOptimizationV3GUI:
+class MemoryManager:
+    """Gère la mémoire dynamiquement"""
+    
+    @staticmethod
+    def get_ram_usage():
+        try:
+            return psutil.virtual_memory().percent
+        except:
+            return 50
+
+    @staticmethod
+    def get_available_ram_gb():
+        try:
+            return psutil.virtual_memory().available / (1024**3)
+        except:
+            return 8
+
+    @staticmethod
+    def get_optimal_chunk_size(total_size=None, min_chunk=100000, max_chunk=1000000):
+        """Calcule chunk size optimal basé sur RAM libre"""
+        ram_free = MemoryManager.get_available_ram_gb()
+        ram_usage = MemoryManager.get_ram_usage()
+        
+        if ram_usage > 80:
+            chunk_size = int(min_chunk * (100 - ram_usage) / 20)
+        else:
+            chunk_size = int(max_chunk * (ram_free / 16))
+        
+        return max(min_chunk, min(chunk_size, max_chunk))
+
+    @staticmethod
+    def check_memory():
+        """Vérifie et nettoie mémoire si nécessaire"""
+        ram_usage = MemoryManager.get_ram_usage()
+        if ram_usage > RAM_THRESHOLD:
+            gc.collect()
+            return False
+        return True
+
+
+class CVOptimizationGUI:
+    """Interface Tkinter avancée avec graphiques scrollables"""
+    
     def __init__(self, root):
         self.root = root
-        self.root.title('⚙️ CV Optimization V3 - FINAL')
-        self.root.geometry('1800x900')
+        self.root.title('CV Optimization V3 - Grid Search')
+        self.root.geometry('1600x1000')
         self.root.configure(bg='#f0f0f0')
-        self.cpu = CPUMonitor()
+        
         self.running = False
         self.results = {}
         self.optimal_configs = {}
-        self.resource_alerted = False
         self.start_time = None
         self.completed_operations = 0
-        self.total_operations = len(TRAIN_SIZES)*K_FOLD*len(MODELS_CONFIG)
+        self.total_operations = 0
+        
+        self.df = None
+        self.X_scaled = None
+        self.y = None
+        self.label_encoder = None
+        
         self.setup_ui()
-        self.log_verbose('✅ Interface prête')
 
     def setup_ui(self):
-        header = tk.Frame(self.root, bg='#2c3e50', height=50)
-        header.grid(row=0, column=0, columnspan=3, sticky='ew')
-        tk.Label(header, text='⚙️ CV Optimization V3 - FINAL (FIX 1 & 2)', font=('Arial',11,'bold'), fg='white', bg='#2c3e50').pack(side=tk.LEFT, padx=20, pady=12)
-        for c in range(3): self.root.columnconfigure(c, weight=1)
+        """Setup UI"""
+        self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
-        live_frame = tk.LabelFrame(self.root, text='🔴 LIVE', font=('Arial',10,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        live_frame.grid(row=1,column=0,sticky='nsew',padx=5,pady=5)
-        live_frame.rowconfigure(0,weight=1); live_frame.columnconfigure(0,weight=1)
-        self.live_text = scrolledtext.ScrolledText(live_frame, font=('Courier',9), bg='#1a1a1a', fg='#00ff00')
-        self.live_text.grid(row=0,column=0,sticky='nsew',padx=5,pady=5)
-        self.live_text.tag_config('algo', foreground='#ffff00', font=('Courier',9,'bold'))
-        self.live_text.tag_config('info', foreground='#00ff00', font=('Courier',9))
-        logs_frame = tk.LabelFrame(self.root, text='📝 LOGS', font=('Arial',10,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        logs_frame.grid(row=1,column=1,sticky='nsew',padx=5,pady=5)
-        logs_frame.rowconfigure(0,weight=1); logs_frame.columnconfigure(0,weight=1)
-        self.logs_text = scrolledtext.ScrolledText(logs_frame, font=('Courier',8), bg='#1e1e1e', fg='#00ff00')
-        self.logs_text.grid(row=0,column=0,sticky='nsew',padx=5,pady=5)
-        self.logs_text.tag_config('ok', foreground='#00ff00', font=('Courier',8,'bold'))
-        self.logs_text.tag_config('error', foreground='#ff3333', font=('Courier',8,'bold'))
-        self.logs_text.tag_config('warning', foreground='#ffaa33', font=('Courier',8))
-        self.logs_text.tag_config('info', foreground='#33aaff', font=('Courier',8))
-        self.logs_text.tag_config('metric', foreground='#00ff99', font=('Courier',8))
-        stats_frame = tk.Frame(self.root, bg='#f0f0f0'); stats_frame.grid(row=1,column=2,sticky='nsew',padx=5,pady=5)
-        stats_frame.rowconfigure(6, weight=1); stats_frame.columnconfigure(0, weight=1)
-        ram_frame = tk.LabelFrame(stats_frame, text='💾 RAM', font=('Arial',9,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        ram_frame.grid(row=0,column=0,sticky='ew',padx=0,pady=3)
-        self.ram_label = tk.Label(ram_frame, text='0%', font=('Arial',10,'bold'), bg='white', fg='#e74c3c'); self.ram_label.pack(fill=tk.X,padx=8,pady=3)
-        self.ram_progress = ttk.Progressbar(ram_frame, mode='determinate', maximum=100); self.ram_progress.pack(fill=tk.X,padx=8,pady=3)
-        cpu_frame = tk.LabelFrame(stats_frame, text='⚙️ CPU', font=('Arial',9,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        cpu_frame.grid(row=1,column=0,sticky='ew',padx=0,pady=3)
-        self.cpu_label = tk.Label(cpu_frame, text='0%', font=('Arial',10,'bold'), bg='white', fg='#3498db'); self.cpu_label.pack(fill=tk.X,padx=8,pady=3)
-        self.cpu_progress = ttk.Progressbar(cpu_frame, mode='determinate', maximum=100); self.cpu_progress.pack(fill=tk.X,padx=8,pady=3)
-        ds_frame = tk.LabelFrame(stats_frame, text='📥 Dataset', font=('Arial',9,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        ds_frame.grid(row=2,column=0,sticky='ew',padx=0,pady=3)
-        self.ds_label = tk.Label(ds_frame, text='En attente', font=('Arial',9), bg='white'); self.ds_label.pack(fill=tk.X,padx=8,pady=3)
-        self.ds_progress = ttk.Progressbar(ds_frame, mode='indeterminate'); self.ds_progress.pack(fill=tk.X,padx=8,pady=3)
-        progress_frame = tk.LabelFrame(stats_frame, text='⏳ Avancée', font=('Arial',9,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        progress_frame.grid(row=3,column=0,sticky='ew',padx=0,pady=3)
-        self.progress_label = tk.Label(progress_frame, text='0/0', font=('Arial',9), bg='white'); self.progress_label.pack(fill=tk.X,padx=8,pady=3)
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', maximum=100); self.progress_bar.pack(fill=tk.X,padx=8,pady=3)
-        eta_frame = tk.LabelFrame(stats_frame, text='⏱️ ETA', font=('Arial',9,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        eta_frame.grid(row=4,column=0,sticky='ew',padx=0,pady=3)
-        self.eta_label = tk.Label(eta_frame, text='--:--:--', font=('Arial',10,'bold'), bg='white', fg='#9b59b6'); self.eta_label.pack(fill=tk.X,padx=8,pady=3)
-        alerts_frame = tk.LabelFrame(stats_frame, text='⚠️ STATUS', font=('Arial',9,'bold'), bg='white', relief=tk.SUNKEN, bd=2)
-        alerts_frame.grid(row=5,column=0,sticky='nsew',padx=0,pady=3)
-        alerts_frame.rowconfigure(0, weight=1); alerts_frame.columnconfigure(0, weight=1)
-        self.alerts_text = scrolledtext.ScrolledText(alerts_frame, height=12, font=('Courier',8), bg='#f8f8f8', fg='#333')
-        self.alerts_text.grid(row=0,column=0,sticky='nsew',padx=5,pady=5)
-        footer = tk.Frame(self.root, bg='#ecf0f1', height=60); footer.grid(row=2,column=0,columnspan=3,sticky='ew')
-        btn_frame = tk.Frame(footer, bg='#ecf0f1'); btn_frame.pack(side=tk.LEFT,padx=10,pady=10)
-        self.start_btn = tk.Button(btn_frame, text='▶ DÉMARRER', command=self.start_optimization, bg='#27ae60', fg='white', font=('Arial',11,'bold'), padx=15, pady=8, relief=tk.RAISED, cursor='hand2'); self.start_btn.pack(side=tk.LEFT,padx=5)
-        self.stop_btn = tk.Button(btn_frame, text='⏹ ARRÊTER', command=self.stop_optimization, bg='#e74c3c', fg='white', font=('Arial',11,'bold'), padx=15, pady=8, relief=tk.RAISED, state=tk.DISABLED, cursor='hand2'); self.stop_btn.pack(side=tk.LEFT,padx=5)
-        self.status_label = tk.Label(footer, text='✅ Prêt', font=('Arial',10,'bold'), fg='#27ae60', bg='#ecf0f1'); self.status_label.pack(side=tk.RIGHT,padx=20,pady=10)
+        
+        header = tk.Frame(self.root, bg='#2c3e50', height=50)
+        header.grid(row=0, column=0, sticky='ew')
+        tk.Label(header, text='CV Optimization V3 - Grid Search Hyperparamètres',
+                 font=('Arial', 12, 'bold'), fg='white', bg='#2c3e50').pack(side=tk.LEFT, padx=20, pady=12)
+        
+        container = tk.Frame(self.root, bg='#f0f0f0')
+        container.grid(row=1, column=0, sticky='nsew', padx=8, pady=8)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=2)
+        container.columnconfigure(1, weight=1)
+        
+        live_frame = tk.LabelFrame(container, text='LIVE Output',
+                                   font=('Arial', 10, 'bold'), bg='white', relief=tk.SUNKEN, bd=2)
+        live_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 5), pady=0)
+        live_frame.rowconfigure(0, weight=1)
+        live_frame.columnconfigure(0, weight=1)
+        self.live_text = scrolledtext.ScrolledText(live_frame, font=('Courier', 8),
+                                                   bg='#1a1a1a', fg='#00ff00')
+        self.live_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        
+        stats_frame = tk.Frame(container, bg='#f0f0f0')
+        stats_frame.grid(row=0, column=1, sticky='nsew', padx=(5, 0), pady=0)
+        stats_frame.rowconfigure(5, weight=1)
+        stats_frame.columnconfigure(0, weight=1)
+        
+        ram_frame = tk.LabelFrame(stats_frame, text='RAM', font=('Arial', 9, 'bold'),
+                                  bg='white', relief=tk.SUNKEN, bd=2)
+        ram_frame.grid(row=0, column=0, sticky='ew', padx=0, pady=3)
+        self.ram_label = tk.Label(ram_frame, text='0%', font=('Arial', 10, 'bold'), bg='white', fg='#e74c3c')
+        self.ram_label.pack(fill=tk.X, padx=8, pady=3)
+        self.ram_progress = ttk.Progressbar(ram_frame, mode='determinate', maximum=100)
+        self.ram_progress.pack(fill=tk.X, padx=8, pady=3)
+        
+        cpu_frame = tk.LabelFrame(stats_frame, text='CPU', font=('Arial', 9, 'bold'),
+                                  bg='white', relief=tk.SUNKEN, bd=2)
+        cpu_frame.grid(row=1, column=0, sticky='ew', padx=0, pady=3)
+        self.cpu_label = tk.Label(cpu_frame, text='0%', font=('Arial', 10, 'bold'), bg='white', fg='#3498db')
+        self.cpu_label.pack(fill=tk.X, padx=8, pady=3)
+        self.cpu_progress = ttk.Progressbar(cpu_frame, mode='determinate', maximum=100)
+        self.cpu_progress.pack(fill=tk.X, padx=8, pady=3)
+        
+        progress_frame = tk.LabelFrame(stats_frame, text='Avancée', font=('Arial', 9, 'bold'),
+                                       bg='white', relief=tk.SUNKEN, bd=2)
+        progress_frame.grid(row=2, column=0, sticky='ew', padx=0, pady=3)
+        self.progress_label = tk.Label(progress_frame, text='0/0', font=('Arial', 9), bg='white')
+        self.progress_label.pack(fill=tk.X, padx=8, pady=3)
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', maximum=100)
+        self.progress_bar.pack(fill=tk.X, padx=8, pady=3)
+        
+        eta_frame = tk.LabelFrame(stats_frame, text='ETA', font=('Arial', 9, 'bold'),
+                                  bg='white', relief=tk.SUNKEN, bd=2)
+        eta_frame.grid(row=3, column=0, sticky='ew', padx=0, pady=3)
+        self.eta_label = tk.Label(eta_frame, text='--:--:--', font=('Arial', 10, 'bold'), bg='white', fg='#9b59b6')
+        self.eta_label.pack(fill=tk.X, padx=8, pady=3)
+        
+        alerts_frame = tk.LabelFrame(stats_frame, text='STATUS', font=('Arial', 9, 'bold'),
+                                     bg='white', relief=tk.SUNKEN, bd=2)
+        alerts_frame.grid(row=4, column=0, sticky='ew', padx=0, pady=3)
+        alerts_frame.rowconfigure(0, weight=1)
+        alerts_frame.columnconfigure(0, weight=1)
+        self.alerts_text = scrolledtext.ScrolledText(alerts_frame, height=6, font=('Courier', 8),
+                                                     bg='#f8f8f8', fg='#333')
+        self.alerts_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        
+        footer = tk.Frame(self.root, bg='#ecf0f1', height=60)
+        footer.grid(row=2, column=0, sticky='ew')
+        
+        btn_frame = tk.Frame(footer, bg='#ecf0f1')
+        btn_frame.pack(side=tk.LEFT, padx=10, pady=10)
+        
+        self.start_btn = tk.Button(btn_frame, text='Demarrer',
+                                   command=self.start_optimization,
+                                   bg='#27ae60', fg='white',
+                                   font=('Arial', 11, 'bold'),
+                                   padx=15, pady=8)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = tk.Button(btn_frame, text='Arreter',
+                                  command=self.stop_optimization,
+                                  bg='#e74c3c', fg='white',
+                                  font=('Arial', 11, 'bold'),
+                                  padx=15, pady=8, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.graphs_btn = tk.Button(btn_frame, text='Voir Graphiques',
+                                    command=self.show_graphs,
+                                    bg='#3498db', fg='white',
+                                    font=('Arial', 11, 'bold'),
+                                    padx=15, pady=8, state=tk.DISABLED)
+        self.graphs_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.status_label = tk.Label(footer, text='Prêt',
+                                     font=('Arial', 10, 'bold'),
+                                     fg='#27ae60', bg='#ecf0f1')
+        self.status_label.pack(side=tk.RIGHT, padx=20, pady=10)
 
-    def log_live(self, message, tag='info'):
+    def log_live(self, msg, tag='info'):
         try:
-            self.live_text.insert(tk.END, message+'\n', tag); self.live_text.see(tk.END); self.root.update_idletasks()
-        except Exception:
-            pass
-    def log_verbose(self, message, tag='ok'):
-        try:
-            ts = datetime.now().strftime('%H:%M:%S'); self.logs_text.insert(tk.END, f'[{ts}] {message}\n', tag); self.logs_text.see(tk.END); self.root.update_idletasks()
-        except Exception:
-            pass
-    def add_alert(self, message):
-        try:
-            self.alerts_text.insert(tk.END, f'• {message}\n'); self.alerts_text.see(tk.END); self.root.update_idletasks()
-        except Exception:
+            self.live_text.insert(tk.END, msg + '\n', tag)
+            self.live_text.see(tk.END)
+            self.root.update_idletasks()
+        except:
             pass
 
-    def wait_for_resources(self, context, retry_delay=2, max_wait=120):
-        waited=0
-        while True:
-            ram = psutil.virtual_memory().percent
-            cpu = self.cpu.get_cpu_percent()
-            if ram < RAM_THRESHOLD and cpu < CPU_THRESHOLD:
-                return True
-            self.log_verbose(f"  [RSC] {context}: RAM {ram:.1f}% / CPU {cpu:.1f}% -> pause", 'warning')
-            time.sleep(retry_delay); waited += retry_delay
-            if not self.running: return False
-            if waited >= max_wait:
-                self.log_verbose(f"  [ALERTE] Ressources trop hautes, arrêt.", 'error')
-                self.stop_optimization(); return False
+    def add_alert(self, msg):
+        try:
+            self.alerts_text.insert(tk.END, f'• {msg}\n')
+            self.alerts_text.see(tk.END)
+            self.root.update_idletasks()
+        except:
+            pass
 
     def update_stats(self):
         try:
-            ram = psutil.virtual_memory().percent; cpu = self.cpu.get_cpu_percent(); threads = self.cpu.get_num_threads()
-            self.ram_label.config(text=f"{ram:.1f}%"); self.ram_progress['value']=ram
-            self.cpu_label.config(text=f"{cpu:.1f}% | {threads}/{NUM_CORES}"); self.cpu_progress['value']=min(cpu,100)
-            if self.start_time and self.completed_operations>0:
-                elapsed = time.time()-self.start_time; avg = elapsed/self.completed_operations
-                remaining = (self.total_operations - self.completed_operations)*avg
-                eta = datetime.now()+timedelta(seconds=remaining); self.eta_label.config(text=eta.strftime('%H:%M:%S'))
-            percent = (self.completed_operations/self.total_operations*100) if self.total_operations>0 else 0
-            self.progress_bar['value']=percent; self.progress_label.config(text=f"{self.completed_operations}/{self.total_operations}")
+            ram = psutil.virtual_memory().percent
+            cpu = psutil.cpu_percent(interval=0.1)
+            
+            self.ram_label.config(text=f'{ram:.1f}%')
+            self.ram_progress['value'] = ram
+            self.cpu_label.config(text=f'{cpu:.1f}%')
+            self.cpu_progress['value'] = min(cpu, 100)
+            
+            if self.start_time and self.completed_operations > 0:
+                elapsed = time.time() - self.start_time
+                avg = elapsed / self.completed_operations
+                remaining = (self.total_operations - self.completed_operations) * avg
+                eta = datetime.now() + timedelta(seconds=remaining)
+                self.eta_label.config(text=eta.strftime('%H:%M:%S'))
+            
+            percent = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
+            self.progress_bar['value'] = percent
+            self.progress_label.config(text=f'{self.completed_operations}/{self.total_operations}')
+            
             self.root.after(500, self.update_stats)
-        except Exception:
+        except:
             self.root.after(500, self.update_stats)
 
     def start_optimization(self):
-        try:
-            if self.running:
-                messagebox.showwarning('Attention','Déjà en cours'); return
-            self.running=True
-            self.start_btn.config(state=tk.DISABLED); self.stop_btn.config(state=tk.NORMAL)
-            self.status_label.config(text='⏳ En cours...', fg='#f57f17')
-            self.live_text.delete(1.0, tk.END); self.logs_text.delete(1.0, tk.END); self.alerts_text.delete(1.0, tk.END)
-            self.log_verbose('='*80,'ok')
-            self.log_verbose('CV OPTIMIZATION V3 - FINAL (FIX 1 & 2)','ok')
-            self.log_verbose('='*80,'ok')
-            self.log_verbose(f"✅ FIX 1: StratifiedShuffleSplit", 'info')
-            self.log_verbose(f"✅ FIX 2: Decision Tree limit 80%", 'info')
-            self.log_verbose(f"✅ NPZ Compression: 9.7x", 'info')
-            threading.Thread(target=self.run_optimization, daemon=True).start()
-            self.start_time=time.time()
-            self.update_stats()
-        except Exception as e:
-            self.log_verbose(f"❌ ERREUR: {e}", 'error')
+        if self.running:
+            messagebox.showwarning('Attention', 'Deja en cours')
+            return
+        
+        self.running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.status_label.config(text='En cours...', fg='#f57f17')
+        self.live_text.delete(1.0, tk.END)
+        self.alerts_text.delete(1.0, tk.END)
+        
+        self.log_live('CV OPTIMIZATION V3 - GRID SEARCH\n', 'info')
+        self.log_live('Hyperparamètres variables par algo\n\n', 'info')
+        
+        threading.Thread(target=self.run_optimization, daemon=True).start()
+        self.start_time = time.time()
+        self.update_stats()
 
     def stop_optimization(self):
-        self.running=False
+        self.running = False
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_label.config(text='⏹ Arrêté', fg='#e74c3c')
-
-    def run_optimization(self):
-        try:
-            self.log_verbose('\n▶ ÉTAPE 1: Chargement CSV','warning')
-            self.log_live('▶ Chargement...','info')
-            if not self.load_data(): return
-            if not self.running: return
-            self.log_verbose('\n▶ ÉTAPE 2: Préparation','warning')
-            self.log_live('▶ Préparation...','info')
-            if not self.prepare_data(): return
-            if not self.running: return
-            self.log_verbose('\n▶ ÉTAPE 3: CV','warning')
-            self.log_live('▶ CV en cours...','info')
-            self.run_cv_for_all_models()
-            self.log_verbose('\n▶ ÉTAPE 4: Rapports','warning')
-            self.generate_reports()
-            self.log_verbose('\n▶ ÉTAPE 5: Graphiques','warning')
-            self.generate_graphs()
-            self.log_verbose('\n'+'='*80,'ok')
-            self.log_verbose('✅ CV OPTIMIZATION TERMINÉE','ok')
-            self.log_verbose('='*80,'ok')
-            self.log_live('✅ SUCCÈS','algo')
-            self.status_label.config(text='✅ Succès', fg='#27ae60')
-            self.add_alert('✅ CV OPTIMIZATION COMPLÈTE')
-        except Exception as e:
-            self.log_verbose(f"❌ ERREUR: {e}", 'error')
-            self.status_label.config(text='❌ Erreur', fg='#d32f2f')
-            self.add_alert(f"❌ ERREUR: {str(e)[:80]}")
-        finally:
-            self.running=False
-            self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
+        self.status_label.config(text='Arrete', fg='#e74c3c')
 
     def load_data(self):
         try:
-            files = ['fusion_ton_iot_cic_final_smart.csv','fusion_ton_iot_cic_final_smart4.csv','fusion_ton_iot_cic_final_smart3.csv']
-            fichier = None
-            for f in files:
-                if os.path.exists(f): fichier=f; break
+            self.log_live('ETAPE 1: Chargement CSV\n', 'info')
+            files = ['fusion_train_smart4.csv', 'fusion_ton_iot_cic_final_smart4.csv']
+            fichier = next((f for f in files if os.path.exists(f)), None)
+            
             if not fichier:
-                self.log_verbose(f"❌ Aucun CSV trouvé", 'error'); return False
-            self.log_verbose(f"  Fichier: {fichier}", 'info')
-            if not self.wait_for_resources('Lecture CSV'): return False
-            self.ds_label.config(text='Lecture CSV...'); self.ds_progress.start(10)
-            chunks=[]; total_rows=0; t0=time.time()
-            for chunk in tqdm(pd.read_csv(fichier, low_memory=False, chunksize=500000), desc='Lecture', unit='lignes'):
-                chunks.append(chunk); total_rows += len(chunk)
-                self.log_verbose(f"  +{len(chunk):,} (total {total_rows:,})", 'info')
-                if not self.running: return False
-                if not self.wait_for_resources('Lecture chunk'): return False
+                self.log_live('Erreur: CSV non trouve\n', 'info')
+                return False
+            
+            self.log_live(f'Fichier: {fichier}\n', 'info')
+            
+            chunks = []
+            total_rows = 0
+            chunk_size = MemoryManager.get_optimal_chunk_size()
+            
+            for chunk in pd.read_csv(fichier, low_memory=False, chunksize=chunk_size, encoding='utf-8'):
+                if not self.running:
+                    return False
+                chunks.append(chunk)
+                total_rows += len(chunk)
+                self.log_live(f'+{len(chunk):,} (total {total_rows:,})\n', 'info')
+                
+                if not MemoryManager.check_memory():
+                    self.log_live(f'[WARN] RAM critique, attente...\n', 'info')
+                    time.sleep(2)
+            
             self.df = pd.concat(chunks, ignore_index=True)
-            elapsed=time.time()-t0
-            self.ds_progress.stop()
-            self.ds_label.config(text='Lecture terminée')
-            self.log_verbose(f"✅ CSV chargé ({total_rows:,} lignes) en {elapsed:.2f}s", 'ok')
-            self.add_alert(f"✓ Chargé: {len(self.df):,} lignes")
+            self.df = _normalize_label_column(self.df)
+            self.log_live(f'OK: {len(self.df):,} lignes\n\n', 'info')
             return True
         except Exception as e:
-            self.ds_progress.stop()
-            self.log_verbose(f"❌ ERREUR load_data(): {e}", 'error')
+            self.log_live(f'Erreur: {e}\n', 'info')
             return False
 
     def prepare_data(self):
         try:
-            self.log_verbose('  [PREPROCESSING] Sélection colonnes...', 'info')
+            self.log_live('ETAPE 2: Preparation\n', 'info')
+            
             numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-            if 'Label' in numeric_cols: numeric_cols.remove('Label')
-            if 'Label' not in self.df.columns: self.log_verbose('❌ Label absent','error'); return False
-            nan_labels=self.df['Label'].isna().sum()
-            if nan_labels>0:
-                self.df=self.df.dropna(subset=['Label'])
-                if len(self.df)==0: self.log_verbose('❌ Plus de lignes','error'); return False
-            if not self.wait_for_resources('Sampling'): return False
-            self.log_verbose(f"  [SAMPLING] {STRATIFIED_SAMPLE_RATIO*100:.0f}%...", 'warning')
-            n_samples=int(len(self.df)*STRATIFIED_SAMPLE_RATIO)
-            stratifier=StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
-            for train_idx,_ in stratifier.split(self.df, self.df['Label']): self.df=self.df.iloc[train_idx[:n_samples]]; break
-            self.log_verbose(f"✅ Dataset: {len(self.df):,} lignes", 'ok')
-            X=self.df[numeric_cols].astype(np.float32).copy(); X=X.fillna(X.mean())
-            self.label_encoder=LabelEncoder(); y=self.label_encoder.fit_transform(self.df['Label'])
-            dataset_ids=None; dataset_classes=None
-            if 'Dataset' in self.df.columns:
-                ds_encoder=LabelEncoder()
-                dataset_ids=ds_encoder.fit_transform(self.df['Dataset'].astype(str).fillna('UNKNOWN'))
-                dataset_classes=ds_encoder.classes_
-            self.log_verbose('  [SCALER] StandardScaler...', 'info')
-            scaler=StandardScaler()
-            self.X_scaled=scaler.fit_transform(X).astype(np.float32)
-            self.y=y
-            self.log_verbose(f"✅ Data normalisée: X={self.X_scaled.shape}", 'ok')
-            npz_payload = {
-                'X': self.X_scaled,
-                'y': self.y,
-                'classes': self.label_encoder.classes_,
-                'dataset_ids': dataset_ids if dataset_ids is not None else np.array([], dtype=np.int32),
-                'dataset_classes': dataset_classes if dataset_classes is not None else np.array([]),
-            }
-            raw_bytes = sum(arr.nbytes for arr in npz_payload.values())
-            np.savez_compressed('preprocessed_dataset.npz', **npz_payload)
-            # ✅ MODIFICATION: LIGNE SUPPRIMÉE (économise 2.3 GB + 30 sec)
-            # np.savez_compressed('tensor_data.npz', **npz_payload)
-            file_size = os.path.getsize('preprocessed_dataset.npz') / (1024**3)
-            ratio = (raw_bytes / (1024**3)) / file_size if file_size > 0 else 0
-            self.log_verbose(f"✅ NPZ: {file_size:.2f} GB (compression {ratio:.1f}x)", 'ok')
-            del self.df, X; gc.collect()
-            self.add_alert(f"✓ Données prêtes: {self.X_scaled.shape}")
+            if 'Label' in numeric_cols:
+                numeric_cols.remove('Label')
+            
+            self.df = self.df.dropna(subset=['Label'])
+            
+            n_samples = int(len(self.df) * STRATIFIED_SAMPLE_RATIO)
+            stratifier = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+            for train_idx, _ in stratifier.split(self.df, self.df['Label']):
+                self.df = self.df.iloc[train_idx[:n_samples]]
+                break
+            
+            self.log_live(f'Dataset: {len(self.df):,} lignes\n', 'info')
+            
+            X = self.df[numeric_cols].astype(NPZ_FLOAT_DTYPE).copy()
+            X = X.fillna(X.mean())
+            
+            self.label_encoder = LabelEncoder()
+            self.y = self.label_encoder.fit_transform(self.df['Label'])
+            
+            scaler = StandardScaler()
+            self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
+            
+            self.log_live(f'Data normalisee: X={self.X_scaled.shape}\n', 'info')
+            
+            np.savez_compressed('preprocessed_dataset.npz',
+                               X=self.X_scaled,
+                               y=self.y,
+                               classes=self.label_encoder.classes_)
+            
+            self.log_live(f'NPZ sauvegarde\n\n', 'info')
+            del self.df, X
+            gc.collect()
             return True
         except Exception as e:
-            self.log_verbose(f"❌ ERREUR prepare_data(): {e}", 'error')
+            self.log_live(f'Erreur: {e}\n', 'info')
             return False
 
-    def run_cv_for_all_models(self):
-        try:
-            models=[('Logistic Regression', LogisticRegression(max_iter=1000, random_state=42, n_jobs=MODELS_CONFIG['Logistic Regression']['n_jobs'])),
-                    ('Naive Bayes', GaussianNB()),
-                    ('Decision Tree', DecisionTreeClassifier(random_state=42)),
-                    ('Random Forest', RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=MODELS_CONFIG['Random Forest']['n_jobs']))]
-            for i,(name,model) in enumerate(models,1):
-                if not self.running: return False
-                if name == 'Decision Tree':
-                    train_sizes_to_test = TRAIN_SIZES[TRAIN_SIZES <= 0.80]
-                    self.log_verbose(f"  [LIMIT] Decision Tree: max 80%", 'warning')
-                else:
-                    train_sizes_to_test = TRAIN_SIZES
-                self.log_live(f"\n{i}/4. {name}",'algo')
-                self.log_verbose(f"\n  [MODÈLE {i}/4] {name}",'warning')
-                t0=time.time()
-                self.run_cv_for_model(name, model, train_sizes_to_test)
-                self.log_verbose(f"✅ {name} en {time.time()-t0:.2f}s",'ok')
-                self.add_alert(f"✓ {name} OK")
-            return True
-        except Exception as e:
-            self.log_verbose(f"❌ ERREUR: {e}",'error')
-            return False
+    def generate_param_combinations(self, model_name):
+        """Génère toutes les combinaisons de paramètres"""
+        grid = PARAM_GRIDS.get(model_name, {})
+        param_names = list(grid.keys())
+        param_values = [grid[p] for p in param_names]
+        
+        combinations = []
+        for values in product(*param_values):
+            combinations.append(dict(zip(param_names, values)))
+        
+        return combinations
 
-    def run_cv_for_model(self, model_name, model, train_sizes):
+    def run_optimization(self):
         try:
-            res={'train_sizes':[],'f1_scores':[],'recall_scores':[],'precision_scores':[],'avt_scores':[],'f1_std':[],'recall_std':[],'precision_std':[]}
-            n_samples=len(self.y)
-            for train_size in train_sizes:
-                if not self.running: return
-                self.log_verbose(f"  [TRAIN_SIZE] {int(train_size*100)}% / {int((1-train_size)*100)}%", 'info')
-                # ✅ FIX 1: StratifiedShuffleSplit
-                sss = StratifiedShuffleSplit(n_splits=K_FOLD, train_size=train_size, test_size=1-train_size, random_state=42)
-                f1s=np.zeros(K_FOLD, dtype=np.float32); recs=np.zeros(K_FOLD, dtype=np.float32)
-                pres=np.zeros(K_FOLD, dtype=np.float32); avts=np.zeros(K_FOLD, dtype=np.float32)
-                for fold,(train_idx,val_idx) in enumerate(sss.split(self.X_scaled, self.y), 1):
-                    if not self.wait_for_resources(f"CV {model_name} fold {fold}"): return
-                    Xtr, Xva = self.X_scaled[train_idx], self.X_scaled[val_idx]
-                    ytr, yva = self.y[train_idx], self.y[val_idx]
-                    self.log_verbose(f"    [FOLD {fold}/{K_FOLD}] Train: {len(Xtr):,} | Val: {len(Xva):,}", 'info')
-                    model.fit(Xtr, ytr)
-                    t_pred=time.time(); ypred=model.predict(Xva); pred_time=time.time()-t_pred
-                    f1s[fold-1]=f1_score(yva, ypred, average='weighted', zero_division=0)
-                    recs[fold-1]=recall_score(yva, ypred, average='weighted', zero_division=0)
-                    pres[fold-1]=precision_score(yva, ypred, average='weighted', zero_division=0)
-                    avts[fold-1]=len(Xva)/pred_time if pred_time>0 else 0
-                    self.completed_operations +=1
-                    self.log_live(f"    [FOLD {fold}] {model_name} {int(train_size*100)}%: F1={f1s[fold-1]:.4f}",'info')
-                mean_f1 = float(np.mean(f1s))
-                std_f1 = float(np.std(f1s))
-                res['train_sizes'].append(int(train_size*100))
-                res['f1_scores'].append(mean_f1)
-                res['f1_std'].append(std_f1)
-                res['recall_scores'].append(float(np.mean(recs)))
-                res['recall_std'].append(float(np.std(recs)))
-                res['precision_scores'].append(float(np.mean(pres)))
-                res['precision_std'].append(float(np.std(pres)))
-                res['avt_scores'].append(float(np.mean(avts)))
-                self.log_verbose(f"  [STABILITY] {int(train_size*100)}% -> F1={mean_f1:.4f} ± {std_f1:.4f}", 'ok')
-            best_idx=int(np.argmax(np.array(res['f1_scores']) - np.array(res['f1_std'])))
-            best_ts=train_sizes[best_idx]; best_f1=res['f1_scores'][best_idx]; best_std=res['f1_std'][best_idx]
-            self.optimal_configs[model_name]={ 
-                'train_size':float(best_ts), 'test_size':float(1-best_ts), 
-                'f1_score':float(best_f1), 'f1_std':float(best_std), 
-                'recall':float(res['recall_scores'][best_idx]), 
-                'precision':float(res['precision_scores'][best_idx]), 
-                'avt':float(res['avt_scores'][best_idx]), 
-                'n_jobs': MODELS_CONFIG[model_name]['n_jobs'] 
+            if not self.load_data():
+                return
+            if not self.running:
+                return
+            
+            if not self.prepare_data():
+                return
+            if not self.running:
+                return
+            
+            self.log_live('ETAPE 3: Grid Search\n\n', 'info')
+            
+            model_configs = {
+                'Logistic Regression': LogisticRegression,
+                'Naive Bayes': GaussianNB,
+                'Decision Tree': DecisionTreeClassifier,
+                'Random Forest': RandomForestClassifier,
             }
-            self.results[model_name]=res
-            self.log_verbose(f"  [OPTIMAL] {best_ts*100:.0f}% train (F1={best_f1:.4f} ± {best_std:.4f})", 'ok')
+            
+            self.total_operations = sum(
+                len(self.generate_param_combinations(name)) * K_FOLD 
+                for name in model_configs.keys()
+            )
+            
+            for i, (name, ModelClass) in enumerate(model_configs.items(), 1):
+                self.log_live(f'\n{i}/4. {name}\n', 'info')
+                
+                combinations = self.generate_param_combinations(name)
+                self.log_live(f'  Testage: {len(combinations)} combinaisons\n', 'info')
+                
+                best_score = 0
+                best_params = None
+                all_results = []
+                
+                for combo_idx, params in enumerate(combinations, 1):
+                    if not self.running:
+                        return
+                    
+                    f1_runs = []
+                    
+                    for fold in range(K_FOLD):
+                        try:
+                            X_train, X_test, y_train, y_test = train_test_split(
+                                self.X_scaled, self.y,
+                                test_size=0.2 if name != 'Decision Tree' else 0.3,
+                                random_state=42 + fold,
+                                stratify=self.y
+                            )
+                            
+                            model = ModelClass(**params, random_state=42) if name != 'Naive Bayes' else ModelClass(**params)
+                            model.fit(X_train, y_train)
+                            y_pred = model.predict(X_test)
+                            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                            f1_runs.append(f1)
+                        except:
+                            f1_runs.append(0)
+                        
+                        self.completed_operations += 1
+                        
+                        if not MemoryManager.check_memory():
+                            time.sleep(1)
+                    
+                    mean_f1 = np.mean(f1_runs) if f1_runs else 0
+                    params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
+                    self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
+                    
+                    all_results.append({'params': params, 'f1': mean_f1})
+                    
+                    if mean_f1 > best_score:
+                        best_score = mean_f1
+                        best_params = params
+                    
+                    self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
+                
+                self.results[name] = {
+                    'all_results': all_results,
+                    'best_params': best_params,
+                    'best_f1': best_score
+                }
+                
+                self.optimal_configs[name] = {
+                    'params': best_params,
+                    'f1_score': float(best_score)
+                }
+                
+                self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
+            
+            self.log_live('\nETAPE 4: Rapports\n', 'info')
+            self.generate_reports()
+            
+            self.log_live('\n' + '='*60 + '\n', 'info')
+            self.log_live('GRID SEARCH TERMINEE\n', 'info')
+            
+            self.status_label.config(text='Succes', fg='#27ae60')
+            self.add_alert('GRID SEARCH COMPLETE')
+            self.graphs_btn.config(state=tk.NORMAL)
+        
         except Exception as e:
-            self.log_verbose(f"❌ ERREUR: {e}", 'error')
+            self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
+            self.status_label.config(text='Erreur', fg='#d32f2f')
+        
+        finally:
+            self.running = False
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
 
     def generate_reports(self):
         try:
-            self.log_verbose('  [RAPPORTS] Génération...','info')
-            with open('cv_results_summary.txt','w',encoding='utf-8') as f:
-                f.write('═'*100+'\n')
-                f.write('CV OPTIMIZATION V3 - FINAL (FIX 1 & 2)\n')
-                f.write('═'*100+'\n\n')
-                f.write('✅ FIX 1: StratifiedShuffleSplit\n')
-                f.write('✅ FIX 2: Decision Tree max 80%\n')
-                f.write('✅ NPZ Compression: 9.7x\n\n')
+            with open('cv_results_summary.txt', 'w', encoding='utf-8') as f:
+                f.write('='*80 + '\n')
+                f.write('CV OPTIMIZATION V3 - GRID SEARCH\n')
+                f.write('='*80 + '\n\n')
+                
                 for name in sorted(self.optimal_configs.keys()):
-                    cfg=self.optimal_configs[name]
-                    f.write(f"{name:<25} Train:{cfg['train_size']*100:>5.0f}% F1:{cfg['f1_score']:>7.4f} ± {cfg.get('f1_std',0):>6.4f}\n")
-                f.write('═'*100+'\n')
-            self.log_verbose('✅ cv_results_summary.txt','ok')
-            pd.DataFrame(self.results).T.to_csv('cv_detailed_metrics.csv')
-            with open('cv_optimal_splits_kfold.json','w',encoding='utf-8') as jf:
-                json.dump(self.optimal_configs, jf, ensure_ascii=False, indent=2)
-            self.log_verbose('✅ Rapports générés','ok')
-            self.add_alert('✓ Rapports OK')
+                    cfg = self.optimal_configs[name]
+                    f.write(f"{name:<25} F1:{cfg['f1_score']:>7.4f}\n")
+                    f.write(f"  Params: {str(cfg['params'])}\n\n")
+                
+                f.write('='*80 + '\n')
+            
+            self.log_live('OK: cv_results_summary.txt\n', 'info')
+            
+            with open('cv_optimal_splits.json', 'w', encoding='utf-8') as jf:
+                json.dump(self.optimal_configs, jf, ensure_ascii=False, indent=2, default=str)
+            
+            self.log_live('OK: cv_optimal_splits.json\n', 'info')
+        
         except Exception as e:
-            self.log_verbose(f"❌ ERREUR: {e}", 'error')
+            self.log_live(f'Erreur rapports: {e}\n', 'info')
 
-    def generate_graphs(self):
-        try:
-            self.log_verbose('  [GRAPHIQUES] Génération...','info')
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            sns.set_style('darkgrid')
-            for algo,res in self.results.items():
-                if not self.running: return
-                self.log_verbose(f"  [GRAPH] {algo}...", 'info')
-                fig,axes=plt.subplots(2,2,figsize=(14,10))
-                fig.suptitle(f'{algo} (FIX 1 & 2)', fontsize=14, fontweight='bold')
-                ts=np.array(res['train_sizes']); f1=np.array(res['f1_scores']); f1s=np.array(res['f1_std'])
-                recall=np.array(res['recall_scores']); precision=np.array(res['precision_scores'])
-                avt_ms=np.array([1000.0/x if x>0 else np.nan for x in res['avt_scores']])
-                axes[0,0].plot(ts,f1,'o-',linewidth=2.5,markersize=8,color='#3498db')
-                axes[0,0].fill_between(ts,f1-f1s,f1+f1s,alpha=0.2)
-                axes[0,0].set_title('F1'); axes[0,0].set_ylim([0,1]); axes[0,0].set_ylabel('Score')
-                axes[0,1].plot(ts,recall,'s-',linewidth=2.5,markersize=8,color='#e74c3c')
-                axes[0,1].set_title('Recall'); axes[0,1].set_ylim([0,1]); axes[0,1].set_ylabel('Score')
-                axes[1,0].plot(ts,precision,'^-',linewidth=2.5,markersize=8,color='#f39c12')
-                axes[1,0].set_title('Precision'); axes[1,0].set_ylim([0,1]); axes[1,0].set_ylabel('Score')
-                axes[1,0].set_xlabel('Train size (%)')
-                axes[1,1].plot(ts,avt_ms,'d-',linewidth=2.5,markersize=8,color='#27ae60')
-                axes[1,1].set_title('AVT (ms)'); axes[1,1].set_xlabel('Train size (%)')
-                plt.tight_layout()
-                fname=f"graph_cv_{algo.replace(' ','_').lower()}.png"
-                plt.savefig(fname,dpi=150,bbox_inches='tight')
-                plt.close()
-                self.log_verbose(f"✅ {fname}", 'ok')
-                gc.collect()
-            self.add_alert('✓ Graphiques OK')
-        except Exception as e:
-            self.log_verbose(f"❌ ERREUR: {e}", 'error')
+    def show_graphs(self):
+        """Affiche les graphiques scrollables"""
+        if not self.results:
+            messagebox.showinfo('Info', 'Pas de resultats')
+            return
+        
+        graph_window = tk.Toplevel(self.root)
+        graph_window.title('Graphiques - Hyperparamètres vs F1 Scores')
+        graph_window.geometry('1400x900')
+        
+        main_frame = tk.Frame(graph_window)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        canvas = tk.Canvas(main_frame, bg='white')
+        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg='white')
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        for model_name, results_data in self.results.items():
+            all_results = results_data['all_results']
+            
+            if not all_results:
+                continue
+            
+            fig = Figure(figsize=(13, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            x_labels = [str(i+1) for i in range(len(all_results))]
+            y_scores = [r['f1'] for r in all_results]
+            
+            ax.plot(x_labels, y_scores, 'o-', linewidth=2.5, markersize=8, color='#3498db')
+            ax.fill_between(range(len(y_scores)), y_scores, alpha=0.2, color='#3498db')
+            ax.set_xlabel('Combinaison Paramètres (#)', fontsize=11)
+            ax.set_ylabel('F1 Score', fontsize=11)
+            ax.set_title(f'{model_name} - Hyperparamètres vs F1 Score', fontsize=13, fontweight='bold')
+            ax.set_ylim([0, 1])
+            ax.grid(True, alpha=0.3)
+            
+            best_idx = np.argmax(y_scores)
+            best_params = all_results[best_idx]['params']
+            params_str = '\n'.join([f"{k}={v}" for k, v in list(best_params.items())[:3]])
+            
+            ax.text(0.02, 0.98, f'BEST (#{best_idx+1}):\n{params_str}...',
+                   transform=ax.transAxes, fontsize=10,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='#ffffcc', alpha=0.9))
+            
+            fig.tight_layout()
+            
+            canvas_frame = tk.Frame(scrollable_frame, bg='white')
+            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+            
+            canvas_plot = FigureCanvasTkAgg(fig, master=canvas_frame)
+            canvas_plot.draw()
+            canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        canvas.yview_moveto(0)
 
 
 def main():
     try:
-        print('🔧 CV OPTIMIZATION V3 - FINAL')
-        root=tk.Tk()
-        app=CVOptimizationV3GUI(root)
-        print('✅ Interface lancée')
+        root = tk.Tk()
+        app = CVOptimizationGUI(root)
         root.mainloop()
     except Exception as e:
-        print(f"❌ ERREUR: {e}")
+        print(f'Erreur: {e}')
+        traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
