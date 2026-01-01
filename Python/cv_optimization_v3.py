@@ -173,7 +173,7 @@ class CVOptimizationGUI:
         self.start_time = None
         self.completed_operations = 0
         self.total_operations = 0
-        self.current_workers = max(1, min(NUM_CORES, 4))
+        self.current_workers = max(3, min(NUM_CORES, 4))
         self.checkpoint_path = Path(".run_state/cv_checkpoint.json")
         self.ckpt = {"model_idx": 0, "combo_idx": 0, "best_score": 0.0}
         self.rows_seen = 0
@@ -185,6 +185,7 @@ class CVOptimizationGUI:
         self.worker_thread: threading.Thread | None = None
         self._last_ai_ts = time.time()
         self._last_ai_rows = 0
+        self.graph_auto_opened = False
 
         # Core data containers
         self.df = None
@@ -285,7 +286,7 @@ class CVOptimizationGUI:
             )
             rec = self.ai_server.get_recommendation(timeout=0.02)
             if rec:
-                new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                new_workers = max(3, min(NUM_CORES, self.current_workers + rec.d_workers))
                 if new_workers != self.current_workers:
                     self.current_workers = new_workers
                     self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
@@ -295,6 +296,24 @@ class CVOptimizationGUI:
                 self.ui_shell.set_ai_recommendation(rec.reason)
                 # surface throughput + server instruction
                 self.log_live(f"[AI] instr: {rec.reason} | rows/s≈{tp:,.1f}", "info")
+        except Exception:
+            pass
+
+    def _refresh_graphs_if_open(self):
+        """Recreate graph window with latest results if it is already open."""
+        try:
+            if self.graph_ui and getattr(self.graph_ui, "window", None) and self.graph_ui.window.winfo_exists():
+                # destroy and recreate with fresh data
+                try:
+                    self.graph_ui.window.destroy()
+                except Exception:
+                    pass
+                self.graph_ui = CVGraphicsWindowV2(
+                    parent=self.root,
+                    results=self.results,
+                    optimal_configs=self.optimal_configs,
+                )
+                self.graph_window = getattr(self.graph_ui, "window", None)
         except Exception:
             pass
 
@@ -875,6 +894,7 @@ class CVOptimizationGUI:
                 self.log_live(f'\n{i}/4. {name}\n', 'info')
                 self._ui_tasks(f"{name} grid search")
                 self._ui_model(name, 0.0)
+                self.log_live(f'[GRID] Start model {name} | workers={self.current_workers} | chunk={self.current_chunk_size:,}', 'info')
                 
                 combinations = self.generate_param_combinations(name)
                 self.log_live(f'  Testage: {len(combinations)} combinaisons\n', 'info')
@@ -882,12 +902,19 @@ class CVOptimizationGUI:
                 best_score = 0
                 best_params = None
                 all_results = []
+                # live structure for graphs
+                self.results[name] = {
+                    'all_results': all_results,
+                    'best_params': None,
+                    'best_f1': 0.0,
+                }
                 
                 for combo_idx, params in enumerate(combinations, 1):
                     if i == start_model_idx and combo_idx <= start_combo_idx:
                         continue
                     if not self.running:
                         return
+                    self.log_live(f'    >> Combo {combo_idx}/{len(combinations)} | params={params} | workers={self.current_workers} | chunk={self.current_chunk_size:,}', 'info')
                 
                 def run_fold(fold):
                     try:
@@ -914,10 +941,11 @@ class CVOptimizationGUI:
                     except Exception:
                         return 0, 0
 
-                results = Parallel(n_jobs=int(self.current_workers), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
+                results = Parallel(n_jobs=max(3, int(self.current_workers)), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
                 f1_runs = []
-                for f1_val, rows_proc in results:
+                for fold_idx, (f1_val, rows_proc) in enumerate(results, 1):
                     f1_runs.append(f1_val)
+                    self.log_live(f'      Fold {fold_idx}/{K_FOLD}: F1={f1_val:.4f} rows={rows_proc}', 'info')
                     self.completed_operations += 1
                     progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
                     self._ui_stage("grid", progress_grid)
@@ -929,16 +957,24 @@ class CVOptimizationGUI:
                     pct = min(100.0, (combo_idx / max(len(combinations), 1)) * 100.0)
                     try:
                         self._ui_thread(
-                            tid, pct, f"{name} combo {combo_idx}/{len(combinations)}", combo_idx, len(combinations)
+                            tid, pct, f"{name} combo {combo_idx}/{len(combinations)} fold {fold_idx}/{K_FOLD}", combo_idx, len(combinations)
                         )
                     except Exception:
-                        self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)}")
+                        self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)} fold {fold_idx}/{K_FOLD}")
                     self._update_stage_eta("grid", combo_idx, len(combinations))
                     # model-level progress
                     try:
                         self._ui_model(name, pct)
                     except Exception:
                         pass
+                    # checkpoint per fold
+                    self.ckpt["model_idx"] = i
+                    self.ckpt["combo_idx"] = combo_idx
+                    self.ckpt["best_score"] = best_score
+                    self.ckpt["current_workers"] = self.current_workers
+                    self.ckpt["current_chunk_size"] = self.current_chunk_size
+                    self.ckpt["completed_ops"] = self.completed_operations
+                    self._write_checkpoint(force=False)
                 
                 mean_f1 = np.mean(f1_runs) if f1_runs else 0
                 params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
@@ -949,12 +985,25 @@ class CVOptimizationGUI:
                     'info'
                 )
                 all_results.append({'params': params, 'f1': mean_f1})
+                self.results[name] = {
+                    'all_results': all_results,
+                    'best_params': best_params,
+                    'best_f1': max(best_score, mean_f1),
+                }
+                self._refresh_graphs_if_open()
+                if not self.graph_auto_opened and len(all_results) > 0:
+                    try:
+                        self.show_graphs()
+                        self.graph_auto_opened = True
+                    except Exception:
+                        pass
                 
                 if mean_f1 > best_score:
                     best_score = mean_f1
                     best_params = params
                 self._ui_best_score(f"{best_score:.4f}")
                 self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
+                self.log_live(f'    << Combo {combo_idx}/{len(combinations)} done | mean F1={mean_f1:.4f} | best so far={best_score:.4f}', 'info')
                 # pull AI recommendation after each combo
                 rec = self.ai_server.get_recommendation(timeout=0.02)
                 if rec:
