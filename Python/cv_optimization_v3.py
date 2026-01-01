@@ -20,6 +20,7 @@ import traceback
 import psutil
 import threading
 import multiprocessing
+import warnings
 from joblib import Parallel, delayed
 from datetime import datetime, timedelta
 from itertools import product
@@ -56,6 +57,10 @@ try:
 except ImportError:
     print("Erreur: sklearn non installé")
     sys.exit(1)
+# Silence sklearn deprecations for logistic regression penalty/n_jobs
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.linear_model._logistic")
+warnings.filterwarnings("ignore", message=".*penalty.*deprecated.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*n_jobs.*has no effect.*", category=FutureWarning)
 
 try:
     import tkinter as tk
@@ -77,9 +82,9 @@ RAM_THRESHOLD = 90.0
 # GRID SEARCH CONFIGURATION
 PARAM_GRIDS = {
     'Logistic Regression': {
+        # penalty deprecated in >=1.8; keep default penalty and tune via C only
         'C': [0.1, 1, 10],
         'max_iter': [1000, 2000],
-        'penalty': ['l2'],
     },
     'Naive Bayes': {
         'var_smoothing': [1e-9, 1e-8, 1e-7],
@@ -459,9 +464,7 @@ class CVOptimizationGUI:
         try:
             ram = psutil.virtual_memory().percent
             cpu = psutil.cpu_percent(interval=0.1)
-            if ram >= 90.0:
-                self.add_alert(f"RAM >=90% ({ram:.1f}%)", "WARN")
-            
+            # update only CPU; RAM stays silent (no alert, no log)
             self.ram_label.config(text=f'{ram:.1f}%')
             self.ram_progress['value'] = ram
             self.cpu_label.config(text=f'{cpu:.1f}%')
@@ -656,6 +659,11 @@ class CVOptimizationGUI:
             return True
         except Exception as e:
             self.log_live(f'Erreur: {e}\n', 'info')
+            # also push to alert canvas
+            try:
+                self.add_alert(f'Erreur: {e}', 'ERROR')
+            except Exception:
+                pass
             return False
 
     def prepare_data(self):
@@ -882,10 +890,13 @@ class CVOptimizationGUI:
                             stratify=self.y
                         )
                         kwargs = params.copy()
-                        if name in ('Logistic Regression', 'Random Forest'):
-                            kwargs['n_jobs'] = int(self.current_workers)
+                        # n_jobs has no effect for LogisticRegression in new sklearn; keep only for RF
+                        if name == 'Random Forest':
+                            kwargs['n_jobs'] = max(1, int(self.current_workers))
                         if name != 'Naive Bayes':
                             kwargs['random_state'] = 42
+                        if name == 'Logistic Regression':
+                            kwargs.setdefault('solver', 'lbfgs')
                         model = ModelClass(**kwargs)
                         model.fit(X_train, y_train)
                         y_pred = model.predict(X_test)
@@ -923,7 +934,12 @@ class CVOptimizationGUI:
                 
                 mean_f1 = np.mean(f1_runs) if f1_runs else 0
                 params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
-                self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
+                self.log_live(
+                    f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f} '
+                    f'| workers={self.current_workers} | chunk={self.current_chunk_size:,} '
+                    f'| f1_runs={["%.4f" % x for x in f1_runs]}',
+                    'info'
+                )
                 all_results.append({'params': params, 'f1': mean_f1})
                 
                 if mean_f1 > best_score:
