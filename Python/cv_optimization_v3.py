@@ -252,6 +252,19 @@ class CVOptimizationGUI:
             self.extra_canvas.create_text(10, 10, anchor='nw', text='Canvas: prêt', fill='black')
         except Exception:
             pass
+
+        # Force graphs window visible (sinon tu peux la rater derrière)
+        try:
+            self.graph_window.deiconify()
+            self.graph_window.lift()
+            self.graph_window.attributes("-topmost", True)
+            self.graph_window.after(250, lambda: self.graph_window.attributes("-topmost", False))
+        except Exception:
+            pass
+
+        # Canvas d'estimation dans la fenêtre principale
+        self.main_estimate_canvas = None
+        self._attach_main_estimate_canvas()
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
             max_workers=1,
@@ -614,7 +627,459 @@ class CVOptimizationGUI:
             except Exception:
                 pass
 
+
     def start_optimization(self):
+        """Start button handler: opens a preflight window (bench + ETA), then launches the real run on OK."""
+        try:
+            if getattr(self, "running", False):
+                try:
+                    messagebox.showwarning("Attention", "Déjà en cours")
+                except Exception:
+                    pass
+                return
+            self._open_preflight_window()
+        except Exception as e:
+            # fallback: if preflight crashes, still allow run
+            try:
+                self.log_live(f"[WARN] Préflight KO: {e} → lancement direct", "info")
+            except Exception:
+                pass
+            self._start_main_run()
+
+    def _open_preflight_window(self):
+        """Popup that benchmarks the machine quickly and estimates total runtime."""
+        # close previous preflight if any
+        try:
+            if getattr(self, "pref_win", None) is not None and self.pref_win.winfo_exists():
+                self.pref_win.destroy()
+        except Exception:
+            pass
+
+        self.pref_done = False
+        self.pref_cancelled = False
+
+        w = tk.Toplevel(self.root)
+        self.pref_win = w
+        w.title("Préflight - Perf PC + Estimation")
+        try:
+            w.geometry("900x620")
+        except Exception:
+            pass
+
+        # Keep on top shortly so user sees it
+        try:
+            w.attributes("-topmost", True)
+            w.after(250, lambda: w.attributes("-topmost", False))
+        except Exception:
+            pass
+
+        top = ttk.Frame(w, padding=10)
+        top.pack(fill="x")
+
+        self.pref_cpu_var = tk.StringVar(value="CPU: --")
+        self.pref_ram_var = tk.StringVar(value="RAM: --")
+        ttk.Label(top, textvariable=self.pref_cpu_var, font=("Arial", 11, "bold")).pack(side="left", padx=(0, 12))
+        ttk.Label(top, textvariable=self.pref_ram_var, font=("Arial", 11, "bold")).pack(side="left")
+
+        mid = ttk.Frame(w, padding=(10, 0))
+        mid.pack(fill="both", expand=True)
+
+        left = ttk.Frame(mid)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+        right = ttk.Frame(mid)
+        right.pack(side="right", fill="both", expand=False)
+
+        ttk.Label(left, text="Infos dataset + réglages", font=("Arial", 11, "bold")).pack(anchor="w")
+        self.pref_info = scrolledtext.ScrolledText(left, height=14, font=("Consolas", 9))
+        self.pref_info.pack(fill="both", expand=False, pady=(6, 10))
+
+        ttk.Label(left, text="Estimation temps (minutes) par modèle", font=("Arial", 11, "bold")).pack(anchor="w")
+
+        # Matplotlib bar chart
+        self.pref_fig = Figure(figsize=(7.0, 3.2), dpi=100)
+        self.pref_ax = self.pref_fig.add_subplot(111)
+        self.pref_canvas = FigureCanvasTkAgg(self.pref_fig, master=left)
+        self.pref_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Small canvas as “gauge”
+        self.pref_gauge = tk.Canvas(right, width=220, height=220, bg="white", highlightthickness=1, highlightbackground="#ddd")
+        self.pref_gauge.pack(pady=(22, 8))
+        self.pref_gauge_text = ttk.Label(right, text="Benchmark: en cours...", font=("Arial", 10, "bold"))
+        self.pref_gauge_text.pack()
+
+        self.pref_status_var = tk.StringVar(value="→ Scan dataset + mini bench (~10–30s)")
+        ttk.Label(right, textvariable=self.pref_status_var, wraplength=220).pack(pady=(10, 0))
+
+        btns = ttk.Frame(w, padding=10)
+        btns.pack(fill="x")
+
+        self.pref_ok_btn = ttk.Button(btns, text="OK (lancer)", state="disabled", command=self._pref_on_ok)
+        self.pref_ok_btn.pack(side="right", padx=(8, 0))
+        ttk.Button(btns, text="Annuler", command=self._pref_on_cancel).pack(side="right")
+
+        # start live sys monitor
+        self._pref_update_sys()
+
+        # start benchmark thread
+        threading.Thread(target=self._pref_run_benchmark, daemon=True, name="PreflightBench").start()
+
+        # close hook
+        try:
+            w.protocol("WM_DELETE_WINDOW", self._pref_on_cancel)
+        except Exception:
+            pass
+
+    def _pref_on_cancel(self):
+        self.pref_cancelled = True
+        try:
+            if getattr(self, "pref_win", None) is not None and self.pref_win.winfo_exists():
+                self.pref_win.destroy()
+        except Exception:
+            pass
+
+    def _pref_on_ok(self):
+        # Apply recommended settings if present
+        try:
+            rec = getattr(self, "pref_reco", None) or {}
+            if rec.get("workers"):
+                self.current_workers = int(rec["workers"])
+            if rec.get("chunk_size"):
+                self.current_chunk_size = int(rec["chunk_size"])
+        except Exception:
+            pass
+        try:
+            if getattr(self, "pref_win", None) is not None and self.pref_win.winfo_exists():
+                self.pref_win.destroy()
+        except Exception:
+            pass
+        self._start_main_run()
+
+    def _pref_update_sys(self):
+        if getattr(self, "pref_cancelled", False):
+            return
+        try:
+            cpu = psutil.cpu_percent(interval=0.0)
+            ram = psutil.virtual_memory().percent
+            self.pref_cpu_var.set(f"CPU: {cpu:.0f}%")
+            self.pref_ram_var.set(f"RAM: {ram:.0f}%")
+            # gauge drawing
+            self.pref_gauge.delete("all")
+            self.pref_gauge.create_oval(10, 10, 210, 210, outline="#ddd")
+            # CPU arc
+            self.pref_gauge.create_arc(10, 10, 210, 210, start=90, extent=-3.6*min(cpu,100), style="arc", width=12, outline="#3498db")
+            # RAM arc (inner)
+            self.pref_gauge.create_arc(28, 28, 192, 192, start=90, extent=-3.6*min(ram,100), style="arc", width=12, outline="#e74c3c")
+            self.pref_gauge.create_text(110, 110, text=f"{cpu:.0f}% CPU\n{ram:.0f}% RAM", font=("Arial", 10, "bold"))
+        except Exception:
+            pass
+        try:
+            if getattr(self, "pref_win", None) is not None and self.pref_win.winfo_exists():
+                self.pref_win.after(500, self._pref_update_sys)
+        except Exception:
+            pass
+
+    def _can_stratify(self, y, test_size: float):
+        """Return (ok, reason, min_required) for using stratify in train_test_split.
+
+        Stratified split requires enough samples per class AND enough room in train/test
+        to place at least one sample per class in each split.
+        """
+        try:
+            y_arr = np.asarray(y, dtype=int)
+            n = int(y_arr.shape[0])
+            if n < 2:
+                return False, "n<2", 2
+            counts_all = np.bincount(y_arr)
+            present = counts_all > 0
+            n_classes = int(present.sum())
+            if n_classes <= 1:
+                return False, "n_classes<=1", 2
+            min_count = int(counts_all[present].min())
+            # Minimum needed to guarantee at least 1 sample per class in both train and test
+            if not (0.0 < float(test_size) < 1.0):
+                return False, "bad test_size", 2
+            min_required = max(2, int(np.ceil(1.0 / float(test_size))), int(np.ceil(1.0 / float(1.0 - float(test_size)))))
+            n_test = int(np.ceil(n * float(test_size)))
+            n_train = n - n_test
+            if min_count < min_required:
+                return False, f"min_count={min_count} < {min_required}", min_required
+            if n_test < n_classes or n_train < n_classes:
+                return False, f"too many classes for split (classes={n_classes}, test={n_test}, train={n_train})", min_required
+            return True, "ok", min_required
+        except Exception as e:
+            return False, f"check_failed: {e}", 2
+
+
+    def _pref_run_benchmark(self):
+        """Runs a quick benchmark + produces per-model ETA in minutes."""
+        try:
+            if getattr(self, "pref_cancelled", False):
+                return
+
+            # Detect dataset file (same logic as load_data)
+            files = ['fusion_train_smart6.csv', 'fusion_test_smart6.csv']
+            fichier = next((f for f in files if os.path.exists(f)), None)
+
+            if not fichier:
+                self.root.after(0, lambda: self.pref_info.insert(tk.END, "Dataset: CSV non trouvé (fusion_train_smart6.csv / fusion_test_smart6.csv)\n"))
+                self.root.after(0, lambda: self.pref_status_var.set("❌ CSV non trouvé → OK dispo (lancement direct possible)"))
+                self.root.after(0, lambda: self.pref_ok_btn.config(state="normal"))
+                return
+
+            file_size = os.path.getsize(fichier)
+            sample_n = 5000
+            # Read small sample for columns + avg bytes/row
+            df_s = pd.read_csv(fichier, nrows=sample_n, low_memory=False, encoding='utf-8')
+            df_s = _normalize_label_column(df_s)
+
+            # estimate rows (rough)
+            try:
+                avg_bytes_per_row = max(float(df_s.memory_usage(deep=True).sum()) / max(len(df_s), 1), 1.0)
+                est_total_rows = max(int(file_size / avg_bytes_per_row), len(df_s))
+            except Exception:
+                est_total_rows = None
+
+            numeric_cols = df_s.select_dtypes(include=[np.number]).columns.tolist()
+            if 'Label' in numeric_cols:
+                numeric_cols.remove('Label')
+            D = len(numeric_cols)
+
+            # grid sizes
+            grid_sizes = {name: len(self.generate_param_combinations(name)) for name in PARAM_GRIDS.keys()}
+            G_total = sum(grid_sizes.values())
+            total_ops = sum(v * K_FOLD for v in grid_sizes.values())
+
+            # Recommend workers & chunk
+            avail_gb = MemoryManager.get_available_ram_gb()
+            base_workers = max(1, min(NUM_CORES, 4))
+            # be conservative if low RAM
+            if avail_gb < 6:
+                base_workers = max(1, min(base_workers, 2))
+            rec_chunk = MemoryManager.get_optimal_chunk_size(min_chunk=MIN_CHUNK_SIZE)
+
+            self.pref_reco = {"workers": int(base_workers), "chunk_size": int(rec_chunk)}
+
+            # Write info box
+            def _info(text):
+                try:
+                    self.pref_info.insert(tk.END, text)
+                    self.pref_info.see(tk.END)
+                except Exception:
+                    pass
+
+            lines = []
+            lines.append(f"Dataset: {fichier}\n")
+            lines.append(f"Taille fichier: {file_size/1024/1024:.1f} MB\n")
+            if est_total_rows:
+                lines.append(f"Estimation lignes S≈{est_total_rows:,}\n")
+            lines.append(f"Sample bench: n={len(df_s):,} lignes\n")
+            lines.append(f"Features numériques D={D}\n")
+            lines.append(f"K={K_FOLD}\n")
+            lines.append("Grid combos par modèle:\n")
+            for k, v in grid_sizes.items():
+                lines.append(f"  - {k}: {v} combos\n")
+            lines.append(f"Total folds (combos×K): {total_ops:,}\n")
+            lines.append(f"Reco workers≈{base_workers} | chunk≈{rec_chunk:,}\n\n")
+
+            self.root.after(0, lambda: (self.pref_info.delete(1.0, tk.END), _info(''.join(lines))))
+
+            # Prepare sample arrays for bench
+            if 'Label' not in df_s.columns:
+                self.root.after(0, lambda: _info("WARN: colonne Label introuvable → bench impossible\n"))
+                self.root.after(0, lambda: self.pref_ok_btn.config(state="normal"))
+                return
+
+            df_s = df_s.dropna(subset=['Label']).copy()
+            df_s['Label'] = df_s['Label'].astype(str)
+
+            # ---- Label distribution (sample) + problematic classes for stratified split ----
+            try:
+                vc = df_s['Label'].value_counts()
+                n_classes = int(len(vc))
+                min_count = int(vc.min()) if n_classes else 0
+                max_count = int(vc.max()) if n_classes else 0
+                _info(f"Classes (sample): {n_classes} | min={min_count} | max={max_count}\n")
+
+                # Show a quick preview
+                head_n = min(10, n_classes)
+                tail_n = min(10, n_classes)
+                if n_classes:
+                    _info("\nTop classes (sample):\n")
+                    _info(vc.head(head_n).to_string() + "\n")
+                    _info("\nRare classes (sample):\n")
+                    _info(vc.tail(tail_n).to_string() + "\n")
+
+                    # Always-failing for stratify: count < 2
+                    bad2 = vc[vc < 2]
+                    if len(bad2):
+                        _info(f"\n⚠️ Classes avec <2 exemples (stratify IMPOSSIBLE): {len(bad2)}\n")
+                        _info(bad2.head(30).to_string() + ("\n...\n" if len(bad2) > 30 else "\n"))
+
+                    # Risky for specific test_size values used in this script
+                    for ts in (0.2, 0.3):
+                        min_req = max(2, int(np.ceil(1.0 / ts)), int(np.ceil(1.0 / (1.0 - ts))))
+                        bad = vc[vc < min_req]
+                        if len(bad):
+                            _info(f"\n⚠️ Trop rare pour stratify avec test_size={ts} (min_req={min_req}): {len(bad)}\n")
+                            _info(bad.head(30).to_string() + ("\n...\n" if len(bad) > 30 else "\n"))
+            except Exception as _e:
+                _info(f"[WARN] analyse classes sample impossible: {_e}\n")
+
+
+            # Clean numeric
+            for col in numeric_cols:
+                df_s[col] = df_s[col].replace([np.inf, -np.inf], np.nan).clip(-1e6, 1e6)
+
+            X = df_s[numeric_cols].apply(pd.to_numeric, errors="coerce")
+            for col in X.columns:
+                m = X[col].mean()
+                X[col] = X[col].fillna(0.0 if pd.isna(m) else m)
+
+            le = LabelEncoder()
+            y = le.fit_transform(df_s['Label'])
+
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
+
+            # Choose one "representative" params per model (middle of grid)
+            def pick_params(model_name):
+                combos = self.generate_param_combinations(model_name)
+                if not combos:
+                    return {}
+                return combos[len(combos)//2]
+
+            bench_models = {
+                'Logistic Regression': LogisticRegression,
+                'Naive Bayes': GaussianNB,
+                'Decision Tree': DecisionTreeClassifier,
+                'Random Forest': RandomForestClassifier,
+            }
+
+            # Benchmark: 1 fold per model (fast), with small workers
+            t0 = {}
+            S0 = len(Xs)
+            p = 0.2
+
+            self.root.after(0, lambda: self.pref_status_var.set("Benchmark: fit+predict (sample)…"))
+
+            for name, ModelClass in bench_models.items():
+                if getattr(self, "pref_cancelled", False):
+                    return
+                t_start = time.perf_counter()
+                ts = (0.3 if name=='Decision Tree' else 0.2)
+                ok_strat, reason_strat, min_req = self._can_stratify(y, ts)
+                if not ok_strat:
+                    _info(f"[bench] {name}: stratify OFF ({reason_strat})\\n")
+                try:
+                    try:
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            Xs, y, test_size=(0.3 if name=='Decision Tree' else 0.2), random_state=42,
+                            stratify=(y if ok_strat else None)
+                        )
+                    except ValueError as ve:
+                        _info(f"[bench] {name}: split stratifié impossible ({ve}) -> stratify OFF\\n")
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            Xs, y, test_size=(0.3 if name=='Decision Tree' else 0.2), random_state=42,
+                            stratify=None
+                        )
+                    params = pick_params(name)
+                    kwargs = dict(params)
+                    if name in ('Logistic Regression', 'Random Forest'):
+                        kwargs['n_jobs'] = 1
+                    if name != 'Naive Bayes':
+                        kwargs['random_state'] = 42
+                    model = ModelClass(**kwargs)
+                    model.fit(X_train, y_train)
+                    y_pred = model.predict(X_test)
+                    _ = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                    t_end = time.perf_counter()
+                    t0[name] = max(t_end - t_start, 1e-6)
+                    self.root.after(0, lambda n=name, dt=t0[name]: _info(f"[bench] {n}: {dt:.3f}s / fold (sample)\n"))
+                except Exception as e:
+                    t0[name] = None
+                    self.root.after(0, lambda n=name, er=e: _info(f"[bench] {n}: FAIL ({er})\n"))
+
+            # Extrapolate to full dataset size (seconds)
+            S_full = est_total_rows or S0
+            log_full = math.log(max(S_full, 2), 2)
+            log0 = math.log(max(S0, 2), 2)
+            W_eff = max(1.0, 0.75 * float(base_workers))
+
+            def scale_nb(t):  # ~ S
+                return t * (S_full / S0)
+
+            def scale_lr(t):  # ~ S (I absorbed in t0)
+                return t * (S_full / S0)
+
+            def scale_dt(t):  # ~ S log S
+                return t * ((S_full * log_full) / (S0 * log0))
+
+            def scale_rf(t):  # ~ S log S (n_estimators absorbed in t0)
+                return t * ((S_full * log_full) / (S0 * log0))
+
+            scalers = {
+                'Naive Bayes': scale_nb,
+                'Logistic Regression': scale_lr,
+                'Decision Tree': scale_dt,
+                'Random Forest': scale_rf,
+            }
+
+            eta_min = {}
+            eta_min_opt = {}
+            eta_min_pess = {}
+
+            for name in bench_models.keys():
+                base = t0.get(name)
+                if not base:
+                    continue
+                t_fold_full = scalers[name](base)
+                Gm = grid_sizes.get(name, 1)
+                t_total_sec = (Gm * K_FOLD / W_eff) * t_fold_full
+                mins = t_total_sec / 60.0
+                eta_min[name] = mins
+                eta_min_opt[name] = mins * 0.8
+                eta_min_pess[name] = mins * 1.3
+
+            # Plot bars
+            def draw_plot():
+                self.pref_ax.clear()
+                labels = list(bench_models.keys())
+                x = np.arange(len(labels))
+                real = [eta_min.get(l, 0.0) for l in labels]
+                opt = [eta_min_opt.get(l, 0.0) for l in labels]
+                pess = [eta_min_pess.get(l, 0.0) for l in labels]
+                width = 0.25
+                self.pref_ax.bar(x - width, opt, width, label="Opt")
+                self.pref_ax.bar(x, real, width, label="Réaliste")
+                self.pref_ax.bar(x + width, pess, width, label="Pess")
+                self.pref_ax.set_xticks(x)
+                self.pref_ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
+                self.pref_ax.set_ylabel("Minutes")
+                self.pref_ax.grid(axis="y", alpha=0.3)
+                self.pref_ax.legend(fontsize=9)
+                self.pref_fig.tight_layout()
+                self.pref_canvas.draw_idle()
+
+            self.root.after(0, draw_plot)
+
+            total_real = sum(eta_min.values())
+            total_opt = sum(eta_min_opt.values())
+            total_pess = sum(eta_min_pess.values())
+            self.root.after(0, lambda: _info(f"\nTOTAL estimé: opt≈{total_opt:.1f} min | réal≈{total_real:.1f} min | pess≈{total_pess:.1f} min\n"))
+            self.root.after(0, lambda: self.pref_gauge_text.config(text=f"Total réal≈{total_real:.1f} min"))
+            self.root.after(0, lambda: self.pref_status_var.set("✅ OK pour lancer (réglages recommandés appliqués)"))
+            self.root.after(0, lambda: self.pref_ok_btn.config(state="normal"))
+            self.pref_done = True
+
+        except Exception as e:
+            try:
+                self.root.after(0, lambda: self.pref_status_var.set(f"Préflight crash: {e}"))
+                self.root.after(0, lambda: self.pref_ok_btn.config(state="normal"))
+            except Exception:
+                pass
+
+    def _start_main_run(self):
         if self.running:
             messagebox.showwarning('Attention', 'Deja en cours')
             return
@@ -670,6 +1135,7 @@ class CVOptimizationGUI:
         self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
         self.worker_thread.start()
         self.root.after(500, self.update_stats)
+
 
     def stop_optimization(self):
         self.running = False
@@ -928,6 +1394,62 @@ class CVOptimizationGUI:
             return f"{m}m {sec:02d}s"
         return f"{sec}s"
 
+
+    def _attach_main_estimate_canvas(self):
+        """Ajoute un canvas d'estimation dans la fenêtre principale (dans 'Monitoring + Progress' si possible)."""
+        try:
+            monitor = None
+            for w in self.root.winfo_children():
+                try:
+                    if isinstance(w, tk.LabelFrame) and str(w.cget("text")) == "Monitoring + Progress":
+                        monitor = w
+                        break
+                except Exception:
+                    continue
+            parent = monitor if monitor is not None else self.root
+
+            self.main_estimate_canvas = tk.Canvas(parent, height=90, bg="white", highlightthickness=1)
+            self.main_estimate_canvas.pack(fill="x", padx=6, pady=6)
+            try:
+                self.main_estimate_canvas.create_text(10, 10, anchor="nw", text="Estimation: en attente…", fill="black")
+            except Exception:
+                pass
+        except Exception:
+            self.main_estimate_canvas = None
+
+    def _draw_estimate_bars(self, canvas):
+        """Dessine la barre opt/real/pess sur un canvas Tk."""
+        try:
+            if canvas is None:
+                return
+            canvas.delete("all")
+            wpx = int(canvas.winfo_width() or 900)
+            pad = 12
+            text_space = 10
+            bar_w = max(wpx - 2 * pad, 200)
+            y0 = 42
+
+            opt_s = float(getattr(self, "estimated_total_seconds_opt", 0.0) or 0.0)
+            real_s = float(getattr(self, "estimated_total_seconds", 0.0) or 0.0)
+            pess_s = float(getattr(self, "estimated_total_seconds_pess", 0.0) or 0.0)
+            denom = max(pess_s, 1.0)
+            opt_r = min(max(opt_s / denom, 0.0), 1.0)
+            real_r = min(max(real_s / denom, 0.0), 1.0)
+
+            canvas.create_text(pad, 10, anchor="nw", text="Temps estimé (opt / réaliste / pess)", fill="black")
+            canvas.create_rectangle(pad, y0, pad + bar_w, y0 + 18, outline="black")
+
+            # opt (top band)
+            canvas.create_rectangle(pad, y0, pad + int(bar_w * opt_r), y0 + 6, outline="", fill="#7bd389")
+            # real (middle band)
+            canvas.create_rectangle(pad, y0 + 6, pad + int(bar_w * real_r), y0 + 12, outline="", fill="#4ea8de")
+            # pess (bottom band full)
+            canvas.create_rectangle(pad, y0 + 12, pad + bar_w, y0 + 18, outline="", fill="#f77f7f")
+
+            txt = f"opt: {self._human_time(opt_s)} | real: {self._human_time(real_s)} | pess: {self._human_time(pess_s)}"
+            canvas.create_text(pad, y0 + 26, anchor="nw", text=txt, fill="black")
+        except Exception:
+            pass
     def _hardware_profile(self) -> dict:
         try:
             vm = psutil.virtual_memory()
@@ -1094,10 +1616,11 @@ class CVOptimizationGUI:
             return info
 
 
+
     def _maybe_show_time_estimate(self):
         """Log + surface l'estimation (appelable après prepare_data)."""
         try:
-            # Auto-tune workers from RAM (soft guard)
+            # Soft guard sur workers selon RAM dispo
             try:
                 avail = MemoryManager.get_available_ram_gb()
                 if avail < 4:
@@ -1125,7 +1648,6 @@ class CVOptimizationGUI:
             self.log_live(f"[ESTIMATE] Matos: {cores} cores | RAM {ram_total_s} | workers={w}", "info")
             self.log_live(f"[ESTIMATE] Dataset: {n_rows:,} lignes × {n_feats} features (bench={info.get('bench_rows')})", "info")
 
-            # Per-model (realistic)
             for k, v in info.get("by_model_seconds", {}).items():
                 self.log_live(f"[ESTIMATE] {k}: ~{self._human_time(v)}", "info")
 
@@ -1138,45 +1660,21 @@ class CVOptimizationGUI:
             except Exception:
                 pass
 
-            # Mini visuel sur le canvas: barre opt/real/pess (thread-safe)
+            # Dessin sur le canvas de la fenêtre Graphs + celui de la fenêtre principale
+            def _draw_all():
+                try:
+                    self._draw_estimate_bars(getattr(self, "extra_canvas", None))
+                except Exception:
+                    pass
+                try:
+                    self._draw_estimate_bars(getattr(self, "main_estimate_canvas", None))
+                except Exception:
+                    pass
+
             try:
-                c = getattr(self, "extra_canvas", None)
-                if c is not None:
-                    def _draw():
-                        try:
-                            c.delete("all")
-                            wpx = int(c.winfo_width() or 600)
-                            hpx = int(c.winfo_height() or 120)
-                            pad = 12
-                            bar_w = max(wpx - 2 * pad, 200)
-                            y0 = 42
-                            denom = max(float(self.estimated_total_seconds_pess or 1.0), 1.0)
-                            opt_r = min(max(float(self.estimated_total_seconds_opt or 0.0) / denom, 0.0), 1.0)
-                            real_r = min(max(float(self.estimated_total_seconds or 0.0) / denom, 0.0), 1.0)
-
-                            c.create_text(pad, 10, anchor="nw", text="Temps estimé (opt / réaliste / pess)", fill="black")
-                            c.create_rectangle(pad, y0, pad + bar_w, y0 + 18, outline="black")
-
-                            # opt (top band)
-                            c.create_rectangle(pad, y0, pad + int(bar_w * opt_r), y0 + 6, outline="", fill="#7bd389")
-                            # real (middle band)
-                            c.create_rectangle(pad, y0 + 6, pad + int(bar_w * real_r), y0 + 12, outline="", fill="#4ea8de")
-                            # pess (bottom band full)
-                            c.create_rectangle(pad, y0 + 12, pad + bar_w, y0 + 18, outline="", fill="#f77f7f")
-
-                            c.create_text(pad, y0 + 26, anchor="nw",
-                                          text=f"opt: {self._human_time(self.estimated_total_seconds_opt)} | "
-                                               f"real: {self._human_time(self.estimated_total_seconds)} | "
-                                               f"pess: {self._human_time(self.estimated_total_seconds_pess)}",
-                                          fill="black")
-                        except Exception:
-                            pass
-                    try:
-                        self.root.after(0, _draw)
-                    except Exception:
-                        _draw()
+                self.root.after(0, _draw_all)
             except Exception:
-                pass
+                _draw_all()
         except Exception:
             pass
 
@@ -1293,12 +1791,21 @@ class CVOptimizationGUI:
                     # ✅ FIX #1: def run_fold IS NOW INSIDE THE LOOP (5 indents instead of 4)
                     def run_fold(fold):
                         try:
-                            X_train, X_test, y_train, y_test = train_test_split(
-                                self.X_scaled, self.y,
-                                test_size=0.2 if name != 'Decision Tree' else 0.3,
-                                random_state=42 + fold,
-                                stratify=self.y
-                            )
+                            try:
+                                X_train, X_test, y_train, y_test = train_test_split(
+                                    self.X_scaled, self.y,
+                                    test_size=0.2 if name != 'Decision Tree' else 0.3,
+                                    random_state=42 + fold,
+                                    stratify=self.y
+                                )
+                            except ValueError:
+                                # Fallback if some classes are too rare for a stratified split
+                                X_train, X_test, y_train, y_test = train_test_split(
+                                    self.X_scaled, self.y,
+                                    test_size=0.2 if name != 'Decision Tree' else 0.3,
+                                    random_state=42 + fold,
+                                    stratify=None
+                                )
                             kwargs = params.copy()
                             if name in ('Logistic Regression', 'Random Forest'):
                                 kwargs['n_jobs'] = int(self.current_workers)
