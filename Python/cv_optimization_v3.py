@@ -557,6 +557,12 @@ class CVOptimizationGUI:
         self.log_live('Hyperparamètres variables par algo\n\n', 'info')
         
         self.start_time = time.time()
+        # open graph window immediately so it is visible during the run
+        try:
+            self.show_graphs()
+            self.graph_auto_opened = True
+        except Exception:
+            self.graph_auto_opened = False
         # Launch optimization in background to keep UI responsive
         self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
         self.worker_thread.start()
