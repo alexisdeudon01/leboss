@@ -326,7 +326,7 @@ class CVOptimizationGUI:
     def load_data(self):
         try:
             self.log_live('ETAPE 1: Chargement CSV\n', 'info')
-            files = ['fusion_train_smart4.csv', 'fusion_ton_iot_cic_final_smart4.csv']
+            files = ['fusion_train_smart6.csv', 'fusion_test_smart6.csv']
             fichier = next((f for f in files if os.path.exists(f)), None)
             
             if not fichier:
