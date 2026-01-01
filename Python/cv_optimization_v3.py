@@ -240,9 +240,6 @@ class CVOptimizationGUI:
         self.live_curves: dict[str, list[float]] = {}
         self.live_params_label = ttk.Label(self.graph_window, text="Params: --", anchor="w", justify="left")
         self.live_params_label.pack(fill="x", padx=6, pady=4)
-        # zone texte pour hyperparamètres courant
-        self.live_params_label = ttk.Label(self.graph_window, text="Params: --", anchor="w", justify="left")
-        self.live_params_label.pack(fill="x", padx=6, pady=4)
 
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
@@ -294,6 +291,12 @@ class CVOptimizationGUI:
                 pretty = pretty[:217] + "..."
             msg = f"{model}: {pretty}"
             self.root.after(0, lambda: self.live_params_label.config(text=msg))
+        except Exception:
+            pass
+
+        # Keep AI server alive with stage heartbeat
+        try:
+            self._send_ai_metric(rows=0, chunk_size=int(self.current_chunk_size))
         except Exception:
             pass
 
@@ -878,6 +881,21 @@ class RegressionVisualizerLite:
             self._ui_stage("load", 100.0)
             self._update_stage_eta("load", 1, 1)
             self._maybe_checkpoint()
+            # push final load metrics to AI
+            try:
+                self.ai_server.send_metrics(
+                    AIMetrics(
+                        timestamp=time.time(),
+                        num_workers=int(self.current_workers),
+                        chunk_size=int(self.current_chunk_size),
+                        rows_processed=int(total_rows),
+                        ram_percent=float(psutil.virtual_memory().percent),
+                        cpu_percent=float(psutil.cpu_percent(interval=0.0)),
+                        throughput=float(self.rows_seen / max(time.time() - self.start_time, 1e-3)),
+                    )
+                )
+            except Exception:
+                pass
             return True
         except Exception as e:
             self.log_live(f'Erreur: {e}\n', 'info')
@@ -982,6 +1000,10 @@ class RegressionVisualizerLite:
             self.rows_seen += len(self.X_scaled)
             self._ui_stage("prep", 100.0)
             self._update_stage_eta("prep", 1, 1)
+            try:
+                self._send_ai_metric(rows=0, chunk_size=int(self.current_chunk_size))
+            except Exception:
+                pass
             self._maybe_checkpoint()
             del self.df, X
             gc.collect()
@@ -1127,10 +1149,16 @@ class RegressionVisualizerLite:
                         except Exception:
                             return 0, 0
 
+                    params_str_verbose = ", ".join(f"{k}={v}" for k, v in params.items())
+                    self.log_live(f"[{name}] combo {combo_idx}/{len(combinations)} | params: {params_str_verbose}", "info")
                     results = Parallel(n_jobs=int(self.current_workers), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
                     f1_runs = []
                     for f1_val, rows_proc in results:
                         f1_runs.append(f1_val)
+                        try:
+                            self.rows_seen += int(rows_proc)
+                        except Exception:
+                            pass
                         self.completed_operations += 1
                         progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
                         self._ui_stage("grid", progress_grid)
@@ -1224,6 +1252,10 @@ class RegressionVisualizerLite:
             self._ui_overall(90.0)
             self._ui_stage("transit_grid", 100.0)
             self._update_stage_eta("transit_grid", 1, 1)
+            try:
+                self._send_ai_metric(rows=0, chunk_size=int(self.current_chunk_size))
+            except Exception:
+                pass
             self._maybe_checkpoint()
             self._ui_stage("transit_grid", 0.0)
             self.root.after(0, lambda: self.ui_shell.set_status("Completed"))
