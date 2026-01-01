@@ -38,7 +38,6 @@ import time
 import queue
 import shutil
 import hashlib
-import re
 import traceback
 import threading
 from dataclasses import dataclass
@@ -179,89 +178,6 @@ def mp_ensure_label_is_standard(df: "pd.DataFrame") -> "pd.DataFrame":
     except Exception:
         return df
 
-
-# ============================================================
-# Binary label mapping: DDOS vs BENIGN (TON-IoT + CIC)
-# ============================================================
-
-BINARY_LABEL_BENIGN = "BENIGN"
-BINARY_LABEL_DDOS = "DDOS"
-
-# Heuristics: CICDDoS2019 contains many DDoS subclasses (Syn, MSSQL, DrDoS_*, etc.)
-# We'll treat any non-benign label as DDOS, with a small safety net for numeric labels.
-_CIC_BENIGN_ALIASES = {"BENIGN", "NORMAL", "0"}
-_CIC_DDOS_ALIASES = {"1"}
-
-# TON-IoT often has 'type' (attack family) + 'label' (0/1). We only keep DDOS or BENIGN.
-_TON_BENIGN_ALIASES = {"benign", "normal", "-", "none", ""}
-
-_DDOS_REGEX = re.compile(r"(ddos|drdos|dos)", re.IGNORECASE)
-
-def _ensure_source_col(df: "pd.DataFrame", source_name: str) -> "pd.DataFrame":
-    try:
-        if "Source" not in df.columns:
-            df["Source"] = source_name
-        else:
-            # don't overwrite if already present, just fill missing
-            df["Source"] = df["Source"].astype(str).replace({"nan": ""})
-            df.loc[df["Source"].eq(""), "Source"] = source_name
-    except Exception:
-        pass
-    return df
-
-def _map_binary_label_cic(df: "pd.DataFrame") -> "pd.DataFrame":
-    if "Label" not in df.columns:
-        return df.iloc[0:0].copy()  # empty (can't train without labels)
-
-    s = df["Label"].astype(str).str.strip()
-    s_up = s.str.upper()
-
-    is_benign = s_up.isin(_CIC_BENIGN_ALIASES)
-    is_ddos = s_up.isin(_CIC_DDOS_ALIASES) | (~is_benign & s.ne("") & s.ne("nan"))
-
-    keep = is_benign | is_ddos
-    out = df.loc[keep].copy()
-    out["Label"] = np.where(is_benign.loc[keep].to_numpy(), BINARY_LABEL_BENIGN, BINARY_LABEL_DDOS)
-    return out
-
-def _map_binary_label_ton(df: "pd.DataFrame") -> "pd.DataFrame":
-    # Prefer 'type' column for TON-IoT (attack family). Fallback: keep only benign if label==0.
-    type_col = None
-    for c in ("type", "Type", "attack_type", "Attack", "attack"):
-        if c in df.columns:
-            type_col = c
-            break
-
-    if type_col is not None:
-        t = df[type_col].astype(str).str.strip().str.lower()
-        is_benign = t.isin(_TON_BENIGN_ALIASES)
-        is_ddos = t.str.contains(_DDOS_REGEX)
-
-        keep = is_benign | is_ddos
-        out = df.loc[keep].copy()
-        out["Label"] = np.where(is_benign.loc[keep].to_numpy(), BINARY_LABEL_BENIGN, BINARY_LABEL_DDOS)
-        return out
-
-    # fallback (no attack family column): keep only benign rows if label is 0 / benign; drop attacks (can't isolate DDOS)
-    if "Label" not in df.columns:
-        return df.iloc[0:0].copy()
-    s = df["Label"].astype(str).str.strip()
-    is_benign = s.eq("0") | s.str.upper().eq("BENIGN")
-    out = df.loc[is_benign].copy()
-    out["Label"] = BINARY_LABEL_BENIGN
-    return out
-
-def apply_binary_ddos_vs_benign(df: "pd.DataFrame", *, source_name: str) -> "pd.DataFrame":
-    """Return df filtered to (DDOS,BENIGN) and with Label standardized."""
-    df = _ensure_source_col(df, source_name)
-    if source_name.upper().startswith("CIC"):
-        return _map_binary_label_cic(df)
-    if source_name.upper().startswith("TON"):
-        return _map_binary_label_ton(df)
-    # default: try CIC rules
-    return _map_binary_label_cic(df)
-
-
 def mp_split_train_test_streaming(df: "pd.DataFrame", train_ratio: float, counters: dict[str, tuple[int, int]]):
     if "Label" not in df.columns:
         mask = np.random.RandomState(42).rand(len(df)) < train_ratio
@@ -360,11 +276,13 @@ def mp_process_file_to_parts(
         df = pd.read_csv(filepath, nrows=int(sample_rows), low_memory=False, memory_map=True)
         df = mp_optimize_dtypes(mp_ensure_label_is_standard(df))
         df = mp_sanitize_chunk(df)
-        df = df.reindex(columns=union_cols)
-        # Keep only DDOS vs BENIGN (CIC assumed here)
+        # ✅ keep only {DDOS,BENIGN} and map to compact canonical features
         df = apply_binary_ddos_vs_benign(df, source_name="CIC")
         if len(df) == 0:
             return filepath, 0, 0
+        df = map_features_to_canonical(df, source_name="CIC")
+        df = mp_optimize_dtypes(df)
+        df = df.reindex(columns=union_cols)
         tr_df, te_df = mp_split_train_test_streaming(df, train_ratio, counters)
         if len(tr_df) > 0:
             mp_write_csv_append(str(train_part), tr_df)
@@ -376,11 +294,13 @@ def mp_process_file_to_parts(
     for chunk in reader:
         chunk = mp_optimize_dtypes(mp_ensure_label_is_standard(chunk))
         chunk = mp_sanitize_chunk(chunk)
-        chunk = chunk.reindex(columns=union_cols)
-        # Keep only DDOS vs BENIGN (CIC assumed here)
+        # ✅ keep only {DDOS,BENIGN} and map to compact canonical features
         chunk = apply_binary_ddos_vs_benign(chunk, source_name="CIC")
         if len(chunk) == 0:
             continue
+        chunk = map_features_to_canonical(chunk, source_name="CIC")
+        chunk = mp_optimize_dtypes(chunk)
+        chunk = chunk.reindex(columns=union_cols)
 
         tr_df, te_df = mp_split_train_test_streaming(chunk, train_ratio, counters)
         if len(tr_df) > 0:
@@ -392,6 +312,271 @@ def mp_process_file_to_parts(
         test_written += len(te_df)
 
     return filepath, int(train_written), int(test_written)
+
+# ============================================================
+# DDOS vs BENIGN — Binary label mapping + Canonical features
+# ============================================================
+#
+# Goal: merge TON-IoT + CICDDoS2019 cleanly with the SAME feature columns,
+# and a binary target: {BENIGN, DDOS}.
+#
+# Output schema (small + consistent):
+#   CANONICAL_FEATURES + ["Source","Label"]
+
+BINARY_LABEL_BENIGN = "BENIGN"
+BINARY_LABEL_DDOS = "DDOS"
+
+# CICDDoS2019 contains many DDoS subclasses (Syn, MSSQL, DrDoS_*, etc.).
+# We'll treat ANY non-benign label as DDOS.
+_CIC_BENIGN_ALIASES = {"BENIGN", "NORMAL", "0"}
+_CIC_DDOS_ALIASES = {"1"}  # sometimes the label is numeric
+
+# TON-IoT: keep only BENIGN + DDOS. Many attack families exist, but we filter on type.
+_TON_BENIGN_ALIASES = {"benign", "normal", "-", "none", "", "nan"}
+_DDOS_REGEX = re.compile(r"(ddos|drdos|dos)", re.IGNORECASE)
+
+# You can override duration units via env vars if needed:
+#   CIC_DURATION_UNIT in {"us","ms","s"}   (default: us)
+#   TON_DURATION_UNIT in {"us","ms","s"}   (default: s)
+CIC_DURATION_UNIT = os.getenv("CIC_DURATION_UNIT", "us").strip().lower()
+TON_DURATION_UNIT = os.getenv("TON_DURATION_UNIT", "s").strip().lower()
+
+CANONICAL_FEATURES = [
+    "duration_s",
+    "fwd_pkts",
+    "bwd_pkts",
+    "fwd_bytes",
+    "bwd_bytes",
+    "flow_pkts_s",
+    "flow_bytes_s",
+    "mean_pkt_size",
+    "mean_iat_s",
+    "src_port",
+    "dst_port",
+    "proto",
+]
+CANONICAL_SCHEMA = CANONICAL_FEATURES + ["Source", "Label"]
+
+_PROTO_STR_MAP = {
+    "tcp": 6,
+    "udp": 17,
+    "icmp": 1,
+    "igmp": 2,
+}
+
+def _ensure_source_col(df: "pd.DataFrame", source_name: str) -> "pd.DataFrame":
+    try:
+        if "Source" not in df.columns:
+            df["Source"] = source_name
+        else:
+            df["Source"] = df["Source"].astype(str).replace({"nan": ""})
+            df.loc[df["Source"].eq(""), "Source"] = source_name
+    except Exception:
+        pass
+    return df
+
+def _map_binary_label_cic(df: "pd.DataFrame") -> "pd.DataFrame":
+    if "Label" not in df.columns:
+        return df.iloc[0:0].copy()
+
+    s = df["Label"].astype(str).str.strip()
+    s_up = s.str.upper()
+
+    is_benign = s_up.isin(_CIC_BENIGN_ALIASES)
+    # anything non-benign and non-empty counts as DDOS for CICDDoS2019
+    is_ddos = s_up.isin(_CIC_DDOS_ALIASES) | (~is_benign & s.ne("") & (~s_up.eq("NAN")))
+
+    keep = is_benign | is_ddos
+    out = df.loc[keep].copy()
+    out["Label"] = np.where(is_benign.loc[keep].to_numpy(), BINARY_LABEL_BENIGN, BINARY_LABEL_DDOS)
+    return out
+
+def _map_binary_label_ton(df: "pd.DataFrame") -> "pd.DataFrame":
+    # Prefer attack-family column to isolate DDOS
+    type_col = None
+    for c in ("type", "Type", "attack_type", "Attack", "attack", "attack_category"):
+        if c in df.columns:
+            type_col = c
+            break
+
+    if type_col is not None:
+        t = df[type_col].astype(str).str.strip().str.lower()
+        is_benign = t.isin(_TON_BENIGN_ALIASES)
+        is_ddos = t.str.contains(_DDOS_REGEX, na=False)
+
+        keep = is_benign | is_ddos
+        out = df.loc[keep].copy()
+        out["Label"] = np.where(is_benign.loc[keep].to_numpy(), BINARY_LABEL_BENIGN, BINARY_LABEL_DDOS)
+        return out
+
+    # Fallback: if no type column exists, only keep benign rows (can't isolate ddos safely)
+    if "Label" not in df.columns:
+        return df.iloc[0:0].copy()
+    s = df["Label"].astype(str).str.strip()
+    is_benign = s.eq("0") | s.str.upper().eq("BENIGN") | s.str.lower().eq("normal")
+    out = df.loc[is_benign].copy()
+    out["Label"] = BINARY_LABEL_BENIGN
+    return out
+
+def apply_binary_ddos_vs_benign(df: "pd.DataFrame", *, source_name: str) -> "pd.DataFrame":
+    """Filter to {DDOS,BENIGN} and standardize Label values."""
+    df = _ensure_source_col(df, source_name)
+    src = str(source_name).upper()
+    if src.startswith("CIC"):
+        return _map_binary_label_cic(df)
+    if src.startswith("TON"):
+        return _map_binary_label_ton(df)
+    # default: CIC-like
+    return _map_binary_label_cic(df)
+
+def _pick_col(df: "pd.DataFrame", candidates: list[str]) -> str | None:
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    # case-insensitive fallback
+    lower = {str(c).lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
+
+def _to_num(s: "pd.Series") -> "pd.Series":
+    return pd.to_numeric(s, errors="coerce")
+
+def _convert_duration_to_seconds(x: "pd.Series", *, unit: str) -> "pd.Series":
+    v = _to_num(x).astype(np.float64)
+    unit = (unit or "s").lower()
+    if unit == "us":
+        return v / 1e6
+    if unit == "ms":
+        return v / 1e3
+    return v
+
+def _normalize_proto(series: "pd.Series") -> "pd.Series":
+    if series is None:
+        return pd.Series(dtype=np.float64)
+    s = series
+    # numeric already?
+    if np.issubdtype(s.dtype, np.number):
+        return _to_num(s)
+    t = s.astype(str).str.strip().str.lower()
+    mapped = t.map(_PROTO_STR_MAP).astype("float64")
+    # try numeric strings if mapping failed
+    num = pd.to_numeric(t, errors="coerce")
+    mapped = mapped.fillna(num)
+    return mapped
+
+def map_features_to_canonical(df: "pd.DataFrame", *, source_name: str) -> "pd.DataFrame":
+    """
+    Create a compact, common feature set across TON-IoT and CICDDoS2019.
+    Requires df to already have Label (binary) + Source.
+    """
+    src = str(source_name).upper()
+
+    # Candidates (robust to slightly different column names)
+    if src.startswith("CIC"):
+        dur_c = _pick_col(df, ["Flow Duration", "flow_duration", "FlowDuration", "Duration"])
+        fwd_pkts_c = _pick_col(df, ["Tot Fwd Pkts", "Total Fwd Packets", "TotFwdPkts"])
+        bwd_pkts_c = _pick_col(df, ["Tot Bwd Pkts", "Total Backward Packets", "TotBwdPkts"])
+        fwd_bytes_c = _pick_col(df, ["TotLen Fwd Pkts", "Total Length of Fwd Packets", "TotLenFwdPkts"])
+        bwd_bytes_c = _pick_col(df, ["TotLen Bwd Pkts", "Total Length of Bwd Packets", "TotLenBwdPkts"])
+        pkts_s_c = _pick_col(df, ["Flow Pkts/s", "Flow Packets/s", "FlowPkts/s"])
+        byts_s_c = _pick_col(df, ["Flow Byts/s", "Flow Bytes/s", "FlowByts/s"])
+        src_port_c = _pick_col(df, ["Src Port", "Source Port", "src_port", "sport"])
+        dst_port_c = _pick_col(df, ["Dst Port", "Destination Port", "dst_port", "dport"])
+        proto_c = _pick_col(df, ["Protocol", "proto", "protocol"])
+
+        duration_s = _convert_duration_to_seconds(df[dur_c] if dur_c else pd.Series(0, index=df.index), unit=CIC_DURATION_UNIT)
+
+        fwd_pkts = _to_num(df[fwd_pkts_c]) if fwd_pkts_c else pd.Series(0, index=df.index, dtype="float64")
+        bwd_pkts = _to_num(df[bwd_pkts_c]) if bwd_pkts_c else pd.Series(0, index=df.index, dtype="float64")
+        fwd_bytes = _to_num(df[fwd_bytes_c]) if fwd_bytes_c else pd.Series(0, index=df.index, dtype="float64")
+        bwd_bytes = _to_num(df[bwd_bytes_c]) if bwd_bytes_c else pd.Series(0, index=df.index, dtype="float64")
+
+        flow_pkts_s = _to_num(df[pkts_s_c]) if pkts_s_c else None
+        flow_bytes_s = _to_num(df[byts_s_c]) if byts_s_c else None
+
+        src_port = _to_num(df[src_port_c]) if src_port_c else pd.Series(-1, index=df.index, dtype="float64")
+        dst_port = _to_num(df[dst_port_c]) if dst_port_c else pd.Series(-1, index=df.index, dtype="float64")
+        proto = _normalize_proto(df[proto_c]) if proto_c else pd.Series(-1, index=df.index, dtype="float64")
+
+    else:
+        # TON-IoT (network)
+        dur_c = _pick_col(df, ["duration", "Duration", "flow_duration", "Flow Duration", "dur"])
+        fwd_pkts_c = _pick_col(df, ["src_pkts", "SrcPkts", "spkts", "s_pkts", "s_packets"])
+        bwd_pkts_c = _pick_col(df, ["dst_pkts", "DstPkts", "dpkts", "d_pkts", "d_packets"])
+        fwd_bytes_c = _pick_col(df, ["src_bytes", "src_ip_bytes", "SrcBytes", "SrcIPBytes", "sbytes", "s_bytes", "s_ip_bytes"])
+        bwd_bytes_c = _pick_col(df, ["dst_bytes", "dst_ip_bytes", "DstBytes", "DstIPBytes", "dbytes", "d_bytes", "d_ip_bytes"])
+        src_port_c = _pick_col(df, ["src_port", "SrcPort", "sport", "s_port"])
+        dst_port_c = _pick_col(df, ["dst_port", "DstPort", "dport", "d_port"])
+        proto_c = _pick_col(df, ["proto", "Proto", "protocol", "Protocol"])
+
+        duration_s = _convert_duration_to_seconds(df[dur_c] if dur_c else pd.Series(0, index=df.index), unit=TON_DURATION_UNIT)
+
+        fwd_pkts = _to_num(df[fwd_pkts_c]) if fwd_pkts_c else pd.Series(0, index=df.index, dtype="float64")
+        bwd_pkts = _to_num(df[bwd_pkts_c]) if bwd_pkts_c else pd.Series(0, index=df.index, dtype="float64")
+        fwd_bytes = _to_num(df[fwd_bytes_c]) if fwd_bytes_c else pd.Series(0, index=df.index, dtype="float64")
+        bwd_bytes = _to_num(df[bwd_bytes_c]) if bwd_bytes_c else pd.Series(0, index=df.index, dtype="float64")
+
+        flow_pkts_s = None
+        flow_bytes_s = None
+
+        src_port = _to_num(df[src_port_c]) if src_port_c else pd.Series(-1, index=df.index, dtype="float64")
+        dst_port = _to_num(df[dst_port_c]) if dst_port_c else pd.Series(-1, index=df.index, dtype="float64")
+        proto = _normalize_proto(df[proto_c]) if proto_c else pd.Series(-1, index=df.index, dtype="float64")
+
+    # Build canonical frame
+    out = pd.DataFrame(index=df.index)
+    out["duration_s"] = duration_s
+    out["fwd_pkts"] = fwd_pkts
+    out["bwd_pkts"] = bwd_pkts
+    out["fwd_bytes"] = fwd_bytes
+    out["bwd_bytes"] = bwd_bytes
+
+    # derived totals
+    total_pkts = (_to_num(out["fwd_pkts"]).fillna(0.0) + _to_num(out["bwd_pkts"]).fillna(0.0))
+    total_bytes = (_to_num(out["fwd_bytes"]).fillna(0.0) + _to_num(out["bwd_bytes"]).fillna(0.0))
+
+    dur = _to_num(out["duration_s"]).fillna(0.0)
+    dur_safe = dur.where(dur > 0, 1e-6)
+    pkts_safe = total_pkts.where(total_pkts > 0, 1.0)
+
+    if flow_pkts_s is None:
+        out["flow_pkts_s"] = total_pkts / dur_safe
+    else:
+        out["flow_pkts_s"] = flow_pkts_s.replace([np.inf, -np.inf], np.nan)
+
+    if flow_bytes_s is None:
+        out["flow_bytes_s"] = total_bytes / dur_safe
+    else:
+        out["flow_bytes_s"] = flow_bytes_s.replace([np.inf, -np.inf], np.nan)
+
+    out["mean_pkt_size"] = (total_bytes / pkts_safe)
+    out["mean_iat_s"] = (dur / pkts_safe)
+
+    # ports/proto (keep numeric)
+    out["src_port"] = src_port
+    out["dst_port"] = dst_port
+    out["proto"] = proto
+
+    # clamp basic ranges
+    for c in ["src_port", "dst_port"]:
+        out[c] = out[c].clip(-1, 65535)
+
+    # keep traceability
+    out["Source"] = df["Source"] if "Source" in df.columns else str(source_name)
+    out["Label"] = df["Label"] if "Label" in df.columns else BINARY_LABEL_BENIGN
+
+    # final numeric cleanup
+    num_cols = [c for c in CANONICAL_FEATURES if c in out.columns]
+    out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce")
+    out[num_cols] = out[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out[num_cols] = out[num_cols].astype(np.float32, copy=False)
+
+    return out
+
+
 
 
 class CanvasFeed:
@@ -761,35 +946,9 @@ class OptimizedDataProcessor:
     # --------------------------
 
     def build_union_columns(self, toniot: str, cic_files: list[str], sample_rows: int | None) -> list[str]:
-        cols: set[str] = set()
-
-        def _add_cols(path: str) -> None:
-            try:
-                df0 = pd.read_csv(path, nrows=0, low_memory=False)
-                cols.update([str(c) for c in df0.columns])
-            except Exception:
-                self._log(f"[SCHEMA] failed header read: {Path(path).name}", "WARN")
-
-        _add_cols(toniot)
-        for p in cic_files:
-            _add_cols(p)
-
-        # normalize label name in schema
-        cols_norm = []
-        has_label = False
-        for c in cols:
-            if c.strip().lower() == "label":
-                has_label = True
-            else:
-                cols_norm.append(c)
-        if has_label:
-            cols_norm.append("Label")
-
-        # stable order: keep Label at end if present
-        # We also add a 'Source' column (TON vs CIC) for traceability/debug (won't be used as numeric feature).
-        cols_norm.append("Source")
-        cols_norm = sorted(set(cols_norm), key=lambda x: (x == "Label", x.lower()))
-        return cols_norm
+        # ✅ Small common schema for TON-IoT + CICDDoS2019 (DDOS vs BENIGN only)
+        # Avoids a massive sparse union of columns and makes ML consistent.
+        return CANONICAL_SCHEMA.copy()
 
     # --------------------------
     # chunk sizing
@@ -924,7 +1083,6 @@ class OptimizedDataProcessor:
         union_cols: list[str],
         out_dir: Path,
         sample_rows: int | None,
-        source_name: str = "UNK",
         callback=None,
         thread_id: int = 0,
         stop_flag: threading.Event | None = None,
@@ -984,11 +1142,13 @@ class OptimizedDataProcessor:
             df = pd.read_csv(filepath, nrows=sample_rows, low_memory=False, memory_map=True)
             df = self._optimize_dtypes(self.ensure_label_is_standard(df))
             df = self._sanitize_chunk(df)
-            df = df.reindex(columns=union_cols)
-            # Keep only DDOS vs BENIGN (TON assumed here)
+            # ✅ keep only {DDOS,BENIGN} and map to compact canonical features
             df = apply_binary_ddos_vs_benign(df, source_name=str(source_name))
             if len(df) == 0:
                 return filepath, 0, 0
+            df = map_features_to_canonical(df, source_name=str(source_name))
+            df = self._optimize_dtypes(df)
+            df = df.reindex(columns=union_cols)
             tr_df, te_df = self._split_train_test_streaming(df, TRAIN_RATIO, counters)
             if len(tr_df) > 0:
                 self._write_csv_append(train_part, tr_df)
@@ -1014,12 +1174,14 @@ class OptimizedDataProcessor:
                 chunk_i += 1
                 chunk = self._optimize_dtypes(self.ensure_label_is_standard(chunk))
                 chunk = self._sanitize_chunk(chunk)
-                chunk = chunk.reindex(columns=union_cols)
-                # Keep only DDOS vs BENIGN (TON assumed here)
+                # ✅ keep only {DDOS,BENIGN} and map to compact canonical features
                 chunk = apply_binary_ddos_vs_benign(chunk, source_name=str(source_name))
                 if len(chunk) == 0:
                     _progress(chunk_i, 0)
                     continue
+                chunk = map_features_to_canonical(chunk, source_name=str(source_name))
+                chunk = self._optimize_dtypes(chunk)
+                chunk = chunk.reindex(columns=union_cols)
 
                 tr_df, te_df = self._split_train_test_streaming(chunk, TRAIN_RATIO, counters)
                 if len(tr_df) > 0:
@@ -1914,7 +2076,6 @@ class ConsolidationGUIEnhanced:
             union_cols=union_cols,
             out_dir=part_dir,
             sample_rows=sample_rows,
-            source_name=stage_name,
             callback=cb,
             thread_id=0,
             stop_flag=self.stop_event,
