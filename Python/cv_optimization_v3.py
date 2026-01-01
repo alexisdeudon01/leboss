@@ -26,6 +26,7 @@ from itertools import product
 import numpy as np
 import pandas as pd
 from pipeline_ui_template import PipelineWindowTemplate
+from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 NPZ_FLOAT_DTYPE = np.float64
 
@@ -166,6 +167,7 @@ class CVOptimizationGUI:
         self.start_time = None
         self.completed_operations = 0
         self.total_operations = 0
+        self.current_workers = max(1, min(NUM_CORES, 4))
         
         self.df = None
         self.X_scaled = None
@@ -173,6 +175,18 @@ class CVOptimizationGUI:
         self.label_encoder = None
         
         self.setup_ui()
+        # AI optimization server (headless)
+        self.ai_server = AIOptimizationServer(
+            max_workers=1,
+            max_chunk_size=1_000_000,
+            min_chunk_size=50_000,
+            max_ram_percent=90.0,
+            with_gui=False,
+        )
+        self.ai_server_thread = threading.Thread(target=self.ai_server.run, daemon=True, name="AIOptimizationServer")
+        self.ai_server_thread.start()
+        self.rows_seen = 0
+        self.current_chunk_size = MemoryManager.get_optimal_chunk_size()
 
     def setup_ui(self):
         """Setup UI"""
@@ -316,6 +330,21 @@ class CVOptimizationGUI:
             self.progress_label.config(text=f'{self.completed_operations}/{self.total_operations}')
             self.ui_shell.set_overall_progress(percent)
             self.ui_shell.set_stage_progress("overall", percent)
+            # push periodic metrics to AI server (no chunk update here, just heartbeat)
+            try:
+                self.ai_server.send_metrics(
+                    AIMetrics(
+                        timestamp=time.time(),
+                        num_workers=int(self.current_workers),
+                        chunk_size=int(self.current_chunk_size),
+                        rows_processed=0,
+                        ram_percent=float(ram),
+                        cpu_percent=float(cpu),
+                        throughput=0.0,
+                    )
+                )
+            except Exception:
+                pass
             
             self.root.after(500, self.update_stats)
         except:
@@ -365,7 +394,9 @@ class CVOptimizationGUI:
             
             chunks = []
             total_rows = 0
-            chunk_size = MemoryManager.get_optimal_chunk_size()
+            chunk_size = max(50_000, self.current_chunk_size)
+            t_last = time.time()
+            next_metrics_time = t_last
             
             for chunk in pd.read_csv(fichier, low_memory=False, chunksize=chunk_size, encoding='utf-8'):
                 if not self.running:
@@ -373,6 +404,41 @@ class CVOptimizationGUI:
                 chunks.append(chunk)
                 total_rows += len(chunk)
                 self.log_live(f'+{len(chunk):,} (total {total_rows:,})\n', 'info')
+                
+                # metrics to AI server (adaptive cadence)
+                now = time.time()
+                dt = max(now - t_last, 1e-3)
+                tp = len(chunk) / dt
+                send_interval = max(0.5, min(5.0, chunk_size / 300_000.0))
+                if now >= next_metrics_time:
+                    ram = psutil.virtual_memory().percent
+                    cpu = psutil.cpu_percent(interval=0.0)
+                    try:
+                        self.ai_server.send_metrics(
+                            AIMetrics(
+                                timestamp=now,
+                                num_workers=int(self.current_workers),
+                                chunk_size=int(chunk_size),
+                                rows_processed=len(chunk),
+                                ram_percent=float(ram),
+                                cpu_percent=float(cpu),
+                                throughput=float(tp),
+                            )
+                        )
+                        rec = self.ai_server.get_recommendation(timeout=0.02)
+                        if rec:
+                            new_chunk = int(chunk_size * rec.chunk_mult)
+                            chunk_size = max(20_000, min(1_000_000, new_chunk))
+                            self.current_chunk_size = chunk_size
+                            new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                            if new_workers != self.current_workers:
+                                self.current_workers = new_workers
+                                self.log_live(f"[AI] workers->{new_workers}", "info")
+                            self.log_live(f"[AI] chunk->{chunk_size:,} (reason: {rec.reason})", "info")
+                    except Exception:
+                        pass
+                    next_metrics_time = now + send_interval
+                t_last = now
                 
                 if not MemoryManager.check_memory():
                     self.log_live(f'[WARN] RAM critique, attente...\n', 'info')
@@ -493,7 +559,12 @@ class CVOptimizationGUI:
                                 stratify=self.y
                             )
                             
-                            model = ModelClass(**params, random_state=42) if name != 'Naive Bayes' else ModelClass(**params)
+                            kwargs = params.copy()
+                            if name in ('Logistic Regression', 'Random Forest'):
+                                kwargs['n_jobs'] = int(self.current_workers)
+                            if name != 'Naive Bayes':
+                                kwargs['random_state'] = 42
+                            model = ModelClass(**kwargs)
                             model.fit(X_train, y_train)
                             y_pred = model.predict(X_test)
                             f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)

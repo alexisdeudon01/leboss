@@ -39,6 +39,7 @@ from sklearn.metrics import f1_score, recall_score, precision_score, confusion_m
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import KFold
 import json
+from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 try:
     from progress_gui import GenericProgressGUI
@@ -92,6 +93,16 @@ class MLEvaluationRunner:
         self.X_test = None
         self.y_test = None
         self.classes = None
+        self.current_workers = max(1, min(NUM_CORES, 4))
+        self.ai_server = AIOptimizationServer(
+            max_workers=4,
+            max_chunk_size=1_000_000,
+            min_chunk_size=50_000,
+            max_ram_percent=90.0,
+            with_gui=False,
+        )
+        self.ai_thread = threading.Thread(target=self.ai_server.run, daemon=True, name="AIOptimizationServer")
+        self.ai_thread.start()
         
         if self.ui:
             self.ui.add_stage("load", "Chargement train/test")
@@ -127,6 +138,25 @@ class MLEvaluationRunner:
         else:
             print(f"[ALERT] {msg}")
 
+    def _send_metrics(self, rows: int, chunk_size: int = 100_000, throughput: float | None = None):
+        try:
+            ram = psutil.virtual_memory().percent
+            cpu = psutil.cpu_percent(interval=0.0)
+            tp = throughput if throughput is not None else rows
+            self.ai_server.send_metrics(
+                AIMetrics(
+                    timestamp=time.time(),
+                    num_workers=int(self.current_workers),
+                    chunk_size=int(chunk_size),
+                    rows_processed=int(rows),
+                    ram_percent=float(ram),
+                    cpu_percent=float(cpu),
+                    throughput=float(tp),
+                )
+            )
+        except Exception:
+            pass
+
     def load_data(self):
         """Charge train et test avec gestion RAM"""
         npz_files = ["preprocessed_dataset.npz", "tensor_data.npz"]
@@ -153,6 +183,10 @@ class MLEvaluationRunner:
             self.log(f"Train NPZ chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
             self.log(f"Classes: {list(self.classes)}", level="OK")
             self.log(f"RAM: {MemoryManager.get_ram_usage():.1f}%", level="DETAIL")
+            self._send_metrics(rows=len(self.y_train), chunk_size=min(len(self.y_train), 200_000))
+            rec = self.ai_server.get_recommendation(timeout=0.02)
+            if rec:
+                self.current_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
 
             # Charger test holdout
             if not os.path.exists("fusion_test_smart4.csv"):
@@ -187,8 +221,12 @@ class MLEvaluationRunner:
             lbl.classes_ = self.classes
             y_test_raw = df_test["Label"].astype(str).values
             self.y_test = lbl.transform(y_test_raw)
-            
+
             self.log(f"Test normalisé: X={self.X_test.shape}, y={len(self.y_test):,}", level="OK")
+            self._send_metrics(rows=len(self.y_test), chunk_size=min(len(self.y_test), 200_000))
+            rec = self.ai_server.get_recommendation(timeout=0.02)
+            if rec:
+                self.current_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
             
             if self.ui:
                 self.ui.update_stage("load", 1, 1, "Train/Test chargés")
@@ -214,10 +252,10 @@ class MLEvaluationRunner:
                 self.shell.set_status("Train/Eval")
                 self.shell.set_stage_progress("train", 0.0)
             models = [
-                ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)),
+                ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42, n_jobs=self.current_workers)),
                 ("Naive Bayes", GaussianNB()),
                 ("Decision Tree", DecisionTreeClassifier(random_state=42, max_depth=20, min_samples_split=10)),
-                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)),
+                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=self.current_workers)),
             ]
             
             kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -274,6 +312,13 @@ class MLEvaluationRunner:
                     if self.ui:
                         self.ui.update_file_progress(f"{name}", int(fold / 5 * 100),
                                                     f"Fold {fold}/5 F1={f1:.4f}")
+                    self._send_metrics(rows=len(y_train_combined) + len(y_val), chunk_size=min(len(y_train_combined), 200_000))
+                    rec = self.ai_server.get_recommendation(timeout=0.02)
+                    if rec:
+                        new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                        if new_workers != self.current_workers:
+                            self.current_workers = new_workers
+                            self.log(f"[AI] workers->{new_workers} (reason: {rec.reason})", level="info")
                 
                 # Résultats finaux
                 mean_f1 = np.mean(f1_runs)
