@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CV OPTIMIZATION V3 - AMÉLIORÉ
+CV OPTIMIZATION V3 - AMÉLIORÉ & CORRIGÉ
 ======================================
 ✅ Grid Search: Hyperparamètres variables
 ✅ Graphiques scrollables (paramètres vs scores)
 ✅ Gestion RAM dynamique (<90%)
 ✅ Tkinter GUI avancée
 ✅ Visualisation complète résultats
+✅ FIXE ERREUR #1: Indentation def run_fold
+✅ FIXE ERREUR #2: Nettoyage infinity prepare_data
 ======================================
 """
 
@@ -20,7 +22,6 @@ import traceback
 import psutil
 import threading
 import multiprocessing
-import warnings
 from joblib import Parallel, delayed
 from datetime import datetime, timedelta
 from itertools import product
@@ -30,8 +31,7 @@ import numpy as np
 import pandas as pd
 from consolidation_style_shell import ConsolidationStyleShell
 from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
-from cv_graphics_window_v2_revised import CVGraphicsWindowV2
-from cv_graphics_window_v2_revised import CVGraphicsWindowV2
+
 NPZ_FLOAT_DTYPE = np.float64
 
 def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -57,10 +57,6 @@ try:
 except ImportError:
     print("Erreur: sklearn non installé")
     sys.exit(1)
-# Silence sklearn deprecations for logistic regression penalty/n_jobs
-warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.linear_model._logistic")
-warnings.filterwarnings("ignore", message=".*penalty.*deprecated.*", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*n_jobs.*has no effect.*", category=FutureWarning)
 
 try:
     import tkinter as tk
@@ -82,9 +78,9 @@ RAM_THRESHOLD = 90.0
 # GRID SEARCH CONFIGURATION
 PARAM_GRIDS = {
     'Logistic Regression': {
-        # penalty deprecated in >=1.8; keep default penalty and tune via C only
         'C': [0.1, 1, 10],
         'max_iter': [1000, 2000],
+        'penalty': ['l2'],
     },
     'Naive Bayes': {
         'var_smoothing': [1e-9, 1e-8, 1e-7],
@@ -173,7 +169,7 @@ class CVOptimizationGUI:
         self.start_time = None
         self.completed_operations = 0
         self.total_operations = 0
-        self.current_workers = max(3, min(NUM_CORES, 4))
+        self.current_workers = max(1, min(NUM_CORES, 4))
         self.checkpoint_path = Path(".run_state/cv_checkpoint.json")
         self.ckpt = {"model_idx": 0, "combo_idx": 0, "best_score": 0.0}
         self.rows_seen = 0
@@ -185,7 +181,6 @@ class CVOptimizationGUI:
         self.worker_thread: threading.Thread | None = None
         self._last_ai_ts = time.time()
         self._last_ai_rows = 0
-        self.graph_auto_opened = False
 
         # Core data containers
         self.df = None
@@ -219,9 +214,14 @@ class CVOptimizationGUI:
         self.graphs_btn = self.ui_shell.reset_btn  # placeholder, not used
         self.thread_slots = len(self.ui_shell.thread_vars)
 
-        # graph window will be created on demand with CVGraphicsWindowV2
-        self.graph_window = None
-        self.graph_ui = None
+        # single graphs window (no extra placeholders)
+        self.graph_window = tk.Toplevel(self.root)
+        self.graph_window.title("Graphs")
+        try:
+            self.graph_window.geometry("800x600")
+        except Exception:
+            pass
+        tk.Label(self.graph_window, text="Graphs window").pack(fill="both", expand=True, pady=20)
 
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
@@ -286,7 +286,7 @@ class CVOptimizationGUI:
             )
             rec = self.ai_server.get_recommendation(timeout=0.02)
             if rec:
-                new_workers = max(3, min(NUM_CORES, self.current_workers + rec.d_workers))
+                new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
                 if new_workers != self.current_workers:
                     self.current_workers = new_workers
                     self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
@@ -296,24 +296,6 @@ class CVOptimizationGUI:
                 self.ui_shell.set_ai_recommendation(rec.reason)
                 # surface throughput + server instruction
                 self.log_live(f"[AI] instr: {rec.reason} | rows/s≈{tp:,.1f}", "info")
-        except Exception:
-            pass
-
-    def _refresh_graphs_if_open(self):
-        """Recreate graph window with latest results if it is already open."""
-        try:
-            if self.graph_ui and getattr(self.graph_ui, "window", None) and self.graph_ui.window.winfo_exists():
-                # destroy and recreate with fresh data
-                try:
-                    self.graph_ui.window.destroy()
-                except Exception:
-                    pass
-                self.graph_ui = CVGraphicsWindowV2(
-                    parent=self.root,
-                    results=self.results,
-                    optimal_configs=self.optimal_configs,
-                )
-                self.graph_window = getattr(self.graph_ui, "window", None)
         except Exception:
             pass
 
@@ -436,8 +418,12 @@ class CVOptimizationGUI:
                                   padx=15, pady=8, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        # Pas de bouton "Voir Graphiques" (fenêtre graphes lancée autrement si besoin)
-        self.graphs_btn = None
+        self.graphs_btn = tk.Button(btn_frame, text='Voir Graphiques',
+                                    command=self.show_graphs,
+                                    bg='#3498db', fg='white',
+                                    font=('Arial', 11, 'bold'),
+                                    padx=15, pady=8, state=tk.DISABLED)
+        self.graphs_btn.pack(side=tk.LEFT, padx=5)
         
         self.status_label = tk.Label(footer, text='Prêt',
                                      font=('Arial', 10, 'bold'),
@@ -462,13 +448,13 @@ class CVOptimizationGUI:
             except Exception:
                 pass
 
-    def add_alert(self, msg, level: str = "INFO"):
+    def add_alert(self, msg):
         """Thread-safe alert entry."""
         def _append():
             try:
                 self.alerts_text.insert(tk.END, f'• {msg}\n')
                 self.alerts_text.see(tk.END)
-                self.ui_shell.add_alert(msg, level.upper() if isinstance(level, str) else "INFO")
+                self.ui_shell.add_alert(msg, "INFO")
             except Exception:
                 pass
         if threading.current_thread() is threading.main_thread():
@@ -483,7 +469,9 @@ class CVOptimizationGUI:
         try:
             ram = psutil.virtual_memory().percent
             cpu = psutil.cpu_percent(interval=0.1)
-            # update only CPU; RAM stays silent (no alert, no log)
+            if ram >= 90.0:
+                self.add_alert(f"RAM >=90% ({ram:.1f}%)", "WARN")
+            
             self.ram_label.config(text=f'{ram:.1f}%')
             self.ram_progress['value'] = ram
             self.cpu_label.config(text=f'{cpu:.1f}%')
@@ -569,11 +557,6 @@ class CVOptimizationGUI:
         self.log_live('Hyperparamètres variables par algo\n\n', 'info')
         
         self.start_time = time.time()
-        # open graph window immediately (even if results empty)
-        try:
-            self.show_graphs()
-        except Exception:
-            pass
         # Launch optimization in background to keep UI responsive
         self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
         self.worker_thread.start()
@@ -678,76 +661,28 @@ class CVOptimizationGUI:
             return True
         except Exception as e:
             self.log_live(f'Erreur: {e}\n', 'info')
-            # also push to alert canvas
-            try:
-                self.add_alert(f'Erreur: {e}', 'ERROR')
-            except Exception:
-                pass
             return False
 
     def prepare_data(self):
-        """ETAPE 2: Preparation des donnees (FIXED)"""
+        """ETAPE 2: Preparation (VERSION FIXÉE - ERREUR #2 CORRIGÉE)"""
         try:
             self.log_live('ETAPE 2: Preparation\n', 'info')
             
-            # Step 1: Normalize Label column name
-            if 'Label' not in self.df.columns:
-                for col in self.df.columns:
-                    if str(col).strip().lower() == 'label':
-                        self.df = self.df.rename(columns={col: 'Label'})
-                        self.log_live(f'Renamed column {col} -> Label\n', 'info')
-                        break
-            
-            # Step 2: Select numeric columns
             numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
             if 'Label' in numeric_cols:
                 numeric_cols.remove('Label')
             
-            if not numeric_cols:
-                self.log_live('ERROR: No numeric columns found!\n', 'error')
-                self.add_alert('No numeric columns found', 'error')
-                return False
+            self.df = self.df.dropna(subset=['Label'])
             
-            self.log_live(f'Dataset: {len(self.df):,} rows | {len(numeric_cols)} numeric features\n', 'info')
-            
-            # Step 3: Drop rows without Label
-            if 'Label' in self.df.columns:
-                original_rows = len(self.df)
-                self.df = self.df.dropna(subset=['Label'])
-                self.df['Label'] = self.df['Label'].astype(str)
-                dropped = original_rows - len(self.df)
-                if dropped > 0:
-                    self.log_live(f'Dropped {dropped:,} rows without Label\n', 'info')
-                self.log_live(f'Labels: {self.df["Label"].nunique()} unique classes\n', 'info')
-            else:
-                self.log_live('ERROR: Label column not found!\n', 'error')
-                self.add_alert('Label column not found', 'error')
-                return False
-            
-            # Step 4: Stratified sampling (only if >=2 classes), else simple head sample
             n_samples = int(len(self.df) * STRATIFIED_SAMPLE_RATIO)
-            unique_classes = self.df["Label"].unique()
-            if len(unique_classes) >= 2 and len(self.df) > n_samples:
-                self.log_live(f'Sampling (stratified): {n_samples:,} / {len(self.df):,} rows\n', 'info')
-                stratifier = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
-                try:
-                    for train_idx, _ in stratifier.split(self.df, self.df['Label']):
-                        self.df = self.df.iloc[train_idx[:n_samples]]
-                        break
-                except Exception as e:
-                    self.log_live(f'[WARN] Stratified sample failed: {e}; fallback to simple sample\n', 'info')
-                    self.df = self.df.iloc[:n_samples].copy()
-            elif len(self.df) > n_samples:
-                self.log_live(f'Sampling (simple): {n_samples:,} / {len(self.df):,} rows\n', 'info')
-                self.df = self.df.iloc[:n_samples].copy()
+            stratifier = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+            for train_idx, _ in stratifier.split(self.df, self.df['Label']):
+                self.df = self.df.iloc[train_idx[:n_samples]]
+                break
             
-            self.log_live(f'After sampling: {len(self.df):,} rows\n', 'info')
-            try:
-                self._send_ai_metric(rows=len(self.df), chunk_size=max(1, self.current_chunk_size))
-            except Exception:
-                pass
+            self.log_live(f'Dataset: {len(self.df):,} lignes\n', 'info')
             
-            # ✅ CRITICAL STEP: Clean infinity and extreme values FIRST
+            # ✅ CRITICAL STEP FIX #2: Clean infinity and extreme values FIRST
             self.log_live('Cleaning infinity and extreme values...\n', 'info')
             for col in numeric_cols:
                 try:
@@ -756,9 +691,9 @@ class CVOptimizationGUI:
                     # Clip extreme values to ±1e6
                     self.df[col] = self.df[col].clip(-1e6, 1e6)
                 except Exception as e:
-                    self.log_live(f'WARN: Error cleaning column {col}: {e}\n', 'warn')
+                    self.log_live(f'WARN: Error cleaning column {col}: {e}\n', 'info')
             
-            # Step 5: Extract features X
+            # Extract features X
             X = self.df[numeric_cols].copy()
             
             # ✅ FILL NaN with column mean (REQUIRED)
@@ -771,14 +706,14 @@ class CVOptimizationGUI:
                 else:
                     X[col] = X[col].fillna(col_mean)
             
-            # Step 6: Convert to float64 then float32 (safe conversion)
+            # Convert to float64 then float32 (safe conversion)
             self.log_live('Converting data types...\n', 'info')
             try:
                 X = X.astype(np.float64)
                 X = X.astype(NPZ_FLOAT_DTYPE)  # float32
             except Exception as e:
-                self.log_live(f'ERROR converting types: {e}\n', 'error')
-                self.add_alert(f'Type conversion failed: {e}', 'error')
+                self.log_live(f'ERROR converting types: {e}\n', 'info')
+                self.add_alert(f'Type conversion failed: {e}')
                 return False
             
             # ✅ VALIDATE: Check no infinity/NaN remain
@@ -786,65 +721,37 @@ class CVOptimizationGUI:
             n_nan = np.isnan(X.values).sum()
             
             if n_inf > 0 or n_nan > 0:
-                self.log_live(f'WARN: Found {n_inf} inf and {n_nan} NaN after cleaning!\n', 'warn')
+                self.log_live(f'WARN: Found {n_inf} inf and {n_nan} NaN after cleaning!\n', 'info')
                 # Final force fill
                 X = X.fillna(0.0)
                 X = X.replace([np.inf, -np.inf], 1e6)
                 self.log_live(f'Force-filled NaN/inf\n', 'info')
-            try:
-                self._send_ai_metric(rows=len(X), chunk_size=max(1, self.current_chunk_size))
-            except Exception:
-                pass
             
             self.log_live(f'Features validated (no inf/nan) ✓\n', 'info')
             
-            # Step 7: Encode Label
             self.label_encoder = LabelEncoder()
-            try:
-                self.y = self.label_encoder.fit_transform(self.df['Label'].astype(str))
-            except Exception as e:
-                self.log_live(f'ERROR encoding labels: {e}\n', 'error')
-                self.add_alert(f'Label encoding failed: {e}', 'error')
-                return False
+            self.y = self.label_encoder.fit_transform(self.df['Label'])
             
-            self.log_live(f'Labels encoded: {len(self.label_encoder.classes_)} classes\n', 'info')
-            
-            # Step 8: Standardize features
             scaler = StandardScaler()
-            try:
-                self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
-            except Exception as e:
-                self.log_live(f'ERROR standardizing: {e}\n', 'error')
-                self.add_alert(f'Scaling failed: {e}', 'error')
-                return False
+            self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
             
             self.log_live(f'Data standardized: X shape {self.X_scaled.shape}\n', 'info')
             
-            # Step 9: Save NPZ
-            try:
-                np.savez_compressed(
-                    'preprocessed_dataset.npz',
-                    X=self.X_scaled,
-                    y=self.y,
-                    classes=self.label_encoder.classes_
-                )
-                self.log_live(f'NPZ saved successfully\n\n', 'info')
-            except Exception as e:
-                self.log_live(f'WARN: NPZ save failed: {e}\n', 'warn')
+            np.savez_compressed('preprocessed_dataset.npz',
+                               X=self.X_scaled,
+                               y=self.y,
+                               classes=self.label_encoder.classes_)
             
+            self.log_live(f'NPZ saved successfully\n\n', 'info')
             self.rows_seen += len(self.X_scaled)
             self._ui_stage("prep", 100.0)
             self._update_stage_eta("prep", 1, 1)
-            
-            # Cleanup
             del self.df, X
             gc.collect()
-            
             return True
-            
         except Exception as e:
-            self.log_live(f'ERREUR PREP: {e}\n{traceback.format_exc()}\n', 'error')
-            self.add_alert(f'Prep failed: {e}', 'error')
+            self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
+            self.add_alert(f'Prep failed: {e}')
             return False
 
     def generate_param_combinations(self, model_name):
@@ -894,7 +801,6 @@ class CVOptimizationGUI:
                 self.log_live(f'\n{i}/4. {name}\n', 'info')
                 self._ui_tasks(f"{name} grid search")
                 self._ui_model(name, 0.0)
-                self.log_live(f'[GRID] Start model {name} | workers={self.current_workers} | chunk={self.current_chunk_size:,}', 'info')
                 
                 combinations = self.generate_param_combinations(name)
                 self.log_live(f'  Testage: {len(combinations)} combinaisons\n', 'info')
@@ -902,72 +808,85 @@ class CVOptimizationGUI:
                 best_score = 0
                 best_params = None
                 all_results = []
-                # live structure for graphs
-                self.results[name] = {
-                    'all_results': all_results,
-                    'best_params': None,
-                    'best_f1': 0.0,
-                }
                 
+                # ✅ FIX #1: THIS LOOP AND ALL INNER CODE IS NOW PROPERLY INDENTED
                 for combo_idx, params in enumerate(combinations, 1):
                     if i == start_model_idx and combo_idx <= start_combo_idx:
                         continue
                     if not self.running:
                         return
-                    self.log_live(f'    >> Combo {combo_idx}/{len(combinations)} | params={params} | workers={self.current_workers} | chunk={self.current_chunk_size:,}', 'info')
-                
-                def run_fold(fold):
-                    try:
-                        X_train, X_test, y_train, y_test = train_test_split(
-                            self.X_scaled, self.y,
-                            test_size=0.2 if name != 'Decision Tree' else 0.3,
-                            random_state=42 + fold,
-                            stratify=self.y
-                        )
-                        kwargs = params.copy()
-                        # n_jobs has no effect for LogisticRegression in new sklearn; keep only for RF
-                        if name == 'Random Forest':
-                            kwargs['n_jobs'] = max(1, int(self.current_workers))
-                        if name != 'Naive Bayes':
-                            kwargs['random_state'] = 42
-                        if name == 'Logistic Regression':
-                            kwargs.setdefault('solver', 'lbfgs')
-                        model = ModelClass(**kwargs)
-                        model.fit(X_train, y_train)
-                        y_pred = model.predict(X_test)
-                        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-                        rows_proc = len(X_train) + len(X_test)
-                        return f1, rows_proc
-                    except Exception:
-                        return 0, 0
+                    
+                    # ✅ FIX #1: def run_fold IS NOW INSIDE THE LOOP (5 indents instead of 4)
+                    def run_fold(fold):
+                        try:
+                            X_train, X_test, y_train, y_test = train_test_split(
+                                self.X_scaled, self.y,
+                                test_size=0.2 if name != 'Decision Tree' else 0.3,
+                                random_state=42 + fold,
+                                stratify=self.y
+                            )
+                            kwargs = params.copy()
+                            if name in ('Logistic Regression', 'Random Forest'):
+                                kwargs['n_jobs'] = int(self.current_workers)
+                            if name != 'Naive Bayes':
+                                kwargs['random_state'] = 42
+                            model = ModelClass(**kwargs)
+                            model.fit(X_train, y_train)
+                            y_pred = model.predict(X_test)
+                            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                            rows_proc = len(X_train) + len(X_test)
+                            return f1, rows_proc
+                        except Exception:
+                            return 0, 0
 
-                results = Parallel(n_jobs=max(3, int(self.current_workers)), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
-                f1_runs = []
-                for fold_idx, (f1_val, rows_proc) in enumerate(results, 1):
-                    f1_runs.append(f1_val)
-                    self.log_live(f'      Fold {fold_idx}/{K_FOLD}: F1={f1_val:.4f} rows={rows_proc}', 'info')
-                    self.completed_operations += 1
-                    progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
-                    self._ui_stage("grid", progress_grid)
-                    self._ui_overall(progress_grid)
-                    self._ui_stage("overall", progress_grid)
-                    self._send_ai_metric(rows_proc, chunk_size=self.current_chunk_size)
-                    # update thread bars (round-robin mapping) and ETA grid
-                    tid = (self.completed_operations - 1) % self.thread_slots
-                    pct = min(100.0, (combo_idx / max(len(combinations), 1)) * 100.0)
-                    try:
-                        self._ui_thread(
-                            tid, pct, f"{name} combo {combo_idx}/{len(combinations)} fold {fold_idx}/{K_FOLD}", combo_idx, len(combinations)
-                        )
-                    except Exception:
-                        self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)} fold {fold_idx}/{K_FOLD}")
-                    self._update_stage_eta("grid", combo_idx, len(combinations))
-                    # model-level progress
-                    try:
-                        self._ui_model(name, pct)
-                    except Exception:
-                        pass
-                    # checkpoint per fold
+                    results = Parallel(n_jobs=int(self.current_workers), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
+                    f1_runs = []
+                    for f1_val, rows_proc in results:
+                        f1_runs.append(f1_val)
+                        self.completed_operations += 1
+                        progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
+                        self._ui_stage("grid", progress_grid)
+                        self._ui_overall(progress_grid)
+                        self._ui_stage("overall", progress_grid)
+                        self._send_ai_metric(rows_proc, chunk_size=self.current_chunk_size)
+                        # update thread bars (round-robin mapping) and ETA grid
+                        tid = (self.completed_operations - 1) % self.thread_slots
+                        pct = min(100.0, (combo_idx / max(len(combinations), 1)) * 100.0)
+                        try:
+                            self._ui_thread(
+                                tid, pct, f"{name} combo {combo_idx}/{len(combinations)}", combo_idx, len(combinations)
+                            )
+                        except Exception:
+                            self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)}")
+                        self._update_stage_eta("grid", combo_idx, len(combinations))
+                        # model-level progress
+                        try:
+                            self._ui_model(name, pct)
+                        except Exception:
+                            pass
+                    
+                    mean_f1 = np.mean(f1_runs) if f1_runs else 0
+                    params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
+                    self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
+                    all_results.append({'params': params, 'f1': mean_f1})
+                    
+                    if mean_f1 > best_score:
+                        best_score = mean_f1
+                        best_params = params
+                    self._ui_best_score(f"{best_score:.4f}")
+                    self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
+                    # pull AI recommendation after each combo
+                    rec = self.ai_server.get_recommendation(timeout=0.02)
+                    if rec:
+                        new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                        if new_workers != self.current_workers:
+                            self.current_workers = new_workers
+                            self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
+                        new_chunk = int(self.current_chunk_size * rec.chunk_mult)
+                        self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
+                        self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
+                        self._ui_ai_rec(rec.reason)
+                    # checkpoint after each combo
                     self.ckpt["model_idx"] = i
                     self.ckpt["combo_idx"] = combo_idx
                     self.ckpt["best_score"] = best_score
@@ -976,75 +895,28 @@ class CVOptimizationGUI:
                     self.ckpt["completed_ops"] = self.completed_operations
                     self._write_checkpoint(force=False)
                 
-                mean_f1 = np.mean(f1_runs) if f1_runs else 0
-                params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
-                self.log_live(
-                    f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f} '
-                    f'| workers={self.current_workers} | chunk={self.current_chunk_size:,} '
-                    f'| f1_runs={["%.4f" % x for x in f1_runs]}',
-                    'info'
-                )
-                all_results.append({'params': params, 'f1': mean_f1})
+                # persist results for this model
                 self.results[name] = {
                     'all_results': all_results,
                     'best_params': best_params,
-                    'best_f1': max(best_score, mean_f1),
+                    'best_f1': best_score,
                 }
-                self._refresh_graphs_if_open()
-                if not self.graph_auto_opened and len(all_results) > 0:
-                    try:
-                        self.show_graphs()
-                        self.graph_auto_opened = True
-                    except Exception:
-                        pass
-                
-                if mean_f1 > best_score:
-                    best_score = mean_f1
-                    best_params = params
-                self._ui_best_score(f"{best_score:.4f}")
-                self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
-                self.log_live(f'    << Combo {combo_idx}/{len(combinations)} done | mean F1={mean_f1:.4f} | best so far={best_score:.4f}', 'info')
-                # pull AI recommendation after each combo
-                rec = self.ai_server.get_recommendation(timeout=0.02)
-                if rec:
-                    new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
-                    if new_workers != self.current_workers:
-                        self.current_workers = new_workers
-                        self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
-                    new_chunk = int(self.current_chunk_size * rec.chunk_mult)
-                    self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
-                    self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
-                    self._ui_ai_rec(rec.reason)
-                # checkpoint after each combo
+                self._reset_thread_bars()
+                self.optimal_configs[name] = {
+                    'params': best_params,
+                    'f1_score': float(best_score),
+                }
+                # checkpoint at end of model
                 self.ckpt["model_idx"] = i
-                self.ckpt["combo_idx"] = combo_idx
+                self.ckpt["combo_idx"] = 0
                 self.ckpt["best_score"] = best_score
                 self.ckpt["current_workers"] = self.current_workers
                 self.ckpt["current_chunk_size"] = self.current_chunk_size
                 self.ckpt["completed_ops"] = self.completed_operations
-                self._write_checkpoint(force=False)
-            # persist results for this model
-            self.results[name] = {
-                'all_results': all_results,
-                'best_params': best_params,
-                'best_f1': best_score,
-            }
-            self._reset_thread_bars()
-            self.optimal_configs[name] = {
-                'params': best_params,
-                'f1_score': float(best_score),
-            }
-            # checkpoint at end of model
-            self.ckpt["model_idx"] = i
-            self.ckpt["combo_idx"] = 0
-            self.ckpt["best_score"] = best_score
-            self.ckpt["current_workers"] = self.current_workers
-            self.ckpt["current_chunk_size"] = self.current_chunk_size
-            self.ckpt["completed_ops"] = self.completed_operations
-            self._write_checkpoint(force=True)
+                self._write_checkpoint(force=True)
 
-            self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
-            self._ui_best_score(f"{best_score:.4f}")
+                self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
+                self._ui_best_score(f"{best_score:.4f}")
         
             # Final report + status after all models
             self.log_live('\nETAPE 4: Rapports\n', 'info')
@@ -1055,6 +927,7 @@ class CVOptimizationGUI:
             self.add_alert('GRID SEARCH COMPLETE')
             self._ui_stage("grid", 100.0)
             self._ui_overall(100.0)
+            self.root.after(0, lambda: self.graphs_btn.config(state=tk.NORMAL))
 
         except Exception as e:
             self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
@@ -1094,26 +967,71 @@ class CVOptimizationGUI:
             self.log_live(f'Erreur rapports: {e}\n', 'info')
 
     def show_graphs(self):
-        """Affiche les graphiques avancés - Version 2"""
-        # Reuse existing graph window if still alive
-        try:
-            if self.graph_ui and getattr(self.graph_ui, "window", None) and self.graph_ui.window.winfo_exists():
-                self.graph_ui.window.lift()
-                self.graph_ui.window.focus_force()
-                return
-        except Exception:
-            pass
-
-        # Utiliser la nouvelle fenêtre graphique (ouvre même si résultats vides)
-        try:
-            self.graph_ui = CVGraphicsWindowV2(
-                parent=self.root,
-                results=self.results,
-                optimal_configs=self.optimal_configs
-            )
-            self.graph_window = getattr(self.graph_ui, "window", None)
-        except Exception as e:
-            messagebox.showerror('Erreur', f'Impossible d\'afficher les graphiques:\n{e}')
+        """Affiche les graphiques scrollables"""
+        if not self.results:
+            messagebox.showinfo('Info', 'Pas de resultats')
+            return
+        
+        graph_window = tk.Toplevel(self.root)
+        graph_window.title('Graphiques - Hyperparamètres vs F1 Scores')
+        graph_window.geometry('1400x900')
+        
+        main_frame = tk.Frame(graph_window)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        canvas = tk.Canvas(main_frame, bg='white')
+        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg='white')
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        for model_name, results_data in self.results.items():
+            all_results = results_data['all_results']
+            
+            if not all_results:
+                continue
+            
+            fig = Figure(figsize=(13, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            x_labels = [str(i+1) for i in range(len(all_results))]
+            y_scores = [r['f1'] for r in all_results]
+            
+            ax.plot(x_labels, y_scores, 'o-', linewidth=2.5, markersize=8, color='#3498db')
+            ax.fill_between(range(len(y_scores)), y_scores, alpha=0.2, color='#3498db')
+            ax.set_xlabel('Combinaison Paramètres (#)', fontsize=11)
+            ax.set_ylabel('F1 Score', fontsize=11)
+            ax.set_title(f'{model_name} - Hyperparamètres vs F1 Score', fontsize=13, fontweight='bold')
+            ax.set_ylim([0, 1])
+            ax.grid(True, alpha=0.3)
+            
+            best_idx = np.argmax(y_scores)
+            best_params = all_results[best_idx]['params']
+            params_str = '\n'.join([f"{k}={v}" for k, v in list(best_params.items())[:3]])
+            
+            ax.text(0.02, 0.98, f'BEST (#{best_idx+1}):\n{params_str}...',
+                   transform=ax.transAxes, fontsize=10,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='#ffffcc', alpha=0.9))
+            
+            fig.tight_layout()
+            
+            canvas_frame = tk.Frame(scrollable_frame, bg='white')
+            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+            
+            canvas_plot = FigureCanvasTkAgg(fig, master=canvas_frame)
+            canvas_plot.draw()
+            canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        canvas.yview_moveto(0)
 
 
 def main():
