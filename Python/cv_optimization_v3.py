@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CV OPTIMIZATION V3 - AMÉLIORÉ
+CV OPTIMIZATION V3 - AMÉLIORÉ & CORRIGÉ
 ======================================
 ✅ Grid Search: Hyperparamètres variables
 ✅ Graphiques scrollables (paramètres vs scores)
 ✅ Gestion RAM dynamique (<90%)
 ✅ Tkinter GUI avancée
 ✅ Visualisation complète résultats
+✅ FIXE ERREUR #1: Indentation def run_fold
+✅ FIXE ERREUR #2: Nettoyage infinity prepare_data
 ======================================
 """
 
@@ -555,6 +557,12 @@ class CVOptimizationGUI:
         self.log_live('Hyperparamètres variables par algo\n\n', 'info')
         
         self.start_time = time.time()
+        # open graph window immediately so it is visible during the run
+        try:
+            self.show_graphs()
+            self.graph_auto_opened = True
+        except Exception:
+            self.graph_auto_opened = False
         # Launch optimization in background to keep UI responsive
         self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
         self.worker_thread.start()
@@ -662,6 +670,7 @@ class CVOptimizationGUI:
             return False
 
     def prepare_data(self):
+        """ETAPE 2: Preparation (VERSION FIXÉE - ERREUR #2 CORRIGÉE)"""
         try:
             self.log_live('ETAPE 2: Preparation\n', 'info')
             
@@ -679,8 +688,52 @@ class CVOptimizationGUI:
             
             self.log_live(f'Dataset: {len(self.df):,} lignes\n', 'info')
             
-            X = self.df[numeric_cols].astype(NPZ_FLOAT_DTYPE).copy()
-            X = X.fillna(X.mean())
+            # ✅ CRITICAL STEP FIX #2: Clean infinity and extreme values FIRST
+            self.log_live('Cleaning infinity and extreme values...\n', 'info')
+            for col in numeric_cols:
+                try:
+                    # Replace infinity with NaN (must be BEFORE dtype conversion)
+                    self.df[col] = self.df[col].replace([np.inf, -np.inf], np.nan)
+                    # Clip extreme values to ±1e6
+                    self.df[col] = self.df[col].clip(-1e6, 1e6)
+                except Exception as e:
+                    self.log_live(f'WARN: Error cleaning column {col}: {e}\n', 'info')
+            
+            # Extract features X
+            X = self.df[numeric_cols].copy()
+            
+            # ✅ FILL NaN with column mean (REQUIRED)
+            self.log_live('Filling NaN values with column mean...\n', 'info')
+            for col in X.columns:
+                col_mean = X[col].mean()
+                if pd.isna(col_mean):
+                    # If entire column is NaN, use 0
+                    X[col] = X[col].fillna(0.0)
+                else:
+                    X[col] = X[col].fillna(col_mean)
+            
+            # Convert to float64 then float32 (safe conversion)
+            self.log_live('Converting data types...\n', 'info')
+            try:
+                X = X.astype(np.float64)
+                X = X.astype(NPZ_FLOAT_DTYPE)  # float32
+            except Exception as e:
+                self.log_live(f'ERROR converting types: {e}\n', 'info')
+                self.add_alert(f'Type conversion failed: {e}')
+                return False
+            
+            # ✅ VALIDATE: Check no infinity/NaN remain
+            n_inf = np.isinf(X.values).sum()
+            n_nan = np.isnan(X.values).sum()
+            
+            if n_inf > 0 or n_nan > 0:
+                self.log_live(f'WARN: Found {n_inf} inf and {n_nan} NaN after cleaning!\n', 'info')
+                # Final force fill
+                X = X.fillna(0.0)
+                X = X.replace([np.inf, -np.inf], 1e6)
+                self.log_live(f'Force-filled NaN/inf\n', 'info')
+            
+            self.log_live(f'Features validated (no inf/nan) ✓\n', 'info')
             
             self.label_encoder = LabelEncoder()
             self.y = self.label_encoder.fit_transform(self.df['Label'])
@@ -688,14 +741,14 @@ class CVOptimizationGUI:
             scaler = StandardScaler()
             self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
             
-            self.log_live(f'Data normalisee: X={self.X_scaled.shape}\n', 'info')
+            self.log_live(f'Data standardized: X shape {self.X_scaled.shape}\n', 'info')
             
             np.savez_compressed('preprocessed_dataset.npz',
                                X=self.X_scaled,
                                y=self.y,
                                classes=self.label_encoder.classes_)
             
-            self.log_live(f'NPZ sauvegarde\n\n', 'info')
+            self.log_live(f'NPZ saved successfully\n\n', 'info')
             self.rows_seen += len(self.X_scaled)
             self._ui_stage("prep", 100.0)
             self._update_stage_eta("prep", 1, 1)
@@ -703,7 +756,8 @@ class CVOptimizationGUI:
             gc.collect()
             return True
         except Exception as e:
-            self.log_live(f'Erreur: {e}\n', 'info')
+            self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
+            self.add_alert(f'Prep failed: {e}')
             return False
 
     def generate_param_combinations(self, model_name):
@@ -761,111 +815,114 @@ class CVOptimizationGUI:
                 best_params = None
                 all_results = []
                 
+                # ✅ FIX #1: THIS LOOP AND ALL INNER CODE IS NOW PROPERLY INDENTED
                 for combo_idx, params in enumerate(combinations, 1):
                     if i == start_model_idx and combo_idx <= start_combo_idx:
                         continue
                     if not self.running:
                         return
-                
-                def run_fold(fold):
-                    try:
-                        X_train, X_test, y_train, y_test = train_test_split(
-                            self.X_scaled, self.y,
-                            test_size=0.2 if name != 'Decision Tree' else 0.3,
-                            random_state=42 + fold,
-                            stratify=self.y
-                        )
-                        kwargs = params.copy()
-                        if name in ('Logistic Regression', 'Random Forest'):
-                            kwargs['n_jobs'] = int(self.current_workers)
-                        if name != 'Naive Bayes':
-                            kwargs['random_state'] = 42
-                        model = ModelClass(**kwargs)
-                        model.fit(X_train, y_train)
-                        y_pred = model.predict(X_test)
-                        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-                        rows_proc = len(X_train) + len(X_test)
-                        return f1, rows_proc
-                    except Exception:
-                        return 0, 0
+                    
+                    # ✅ FIX #1: def run_fold IS NOW INSIDE THE LOOP (5 indents instead of 4)
+                    def run_fold(fold):
+                        try:
+                            X_train, X_test, y_train, y_test = train_test_split(
+                                self.X_scaled, self.y,
+                                test_size=0.2 if name != 'Decision Tree' else 0.3,
+                                random_state=42 + fold,
+                                stratify=self.y
+                            )
+                            kwargs = params.copy()
+                            if name in ('Logistic Regression', 'Random Forest'):
+                                kwargs['n_jobs'] = int(self.current_workers)
+                            if name != 'Naive Bayes':
+                                kwargs['random_state'] = 42
+                            model = ModelClass(**kwargs)
+                            model.fit(X_train, y_train)
+                            y_pred = model.predict(X_test)
+                            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                            rows_proc = len(X_train) + len(X_test)
+                            return f1, rows_proc
+                        except Exception:
+                            return 0, 0
 
-                results = Parallel(n_jobs=int(self.current_workers), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
-                f1_runs = []
-                for f1_val, rows_proc in results:
-                    f1_runs.append(f1_val)
-                    self.completed_operations += 1
-                    progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
-                    self._ui_stage("grid", progress_grid)
-                    self._ui_overall(progress_grid)
-                    self._ui_stage("overall", progress_grid)
-                    self._send_ai_metric(rows_proc, chunk_size=self.current_chunk_size)
-                    # update thread bars (round-robin mapping) and ETA grid
-                    tid = (self.completed_operations - 1) % self.thread_slots
-                    pct = min(100.0, (combo_idx / max(len(combinations), 1)) * 100.0)
-                    try:
-                        self._ui_thread(
-                            tid, pct, f"{name} combo {combo_idx}/{len(combinations)}", combo_idx, len(combinations)
-                        )
-                    except Exception:
-                        self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)}")
-                    self._update_stage_eta("grid", combo_idx, len(combinations))
-                    # model-level progress
-                    try:
-                        self._ui_model(name, pct)
-                    except Exception:
-                        pass
+                    results = Parallel(n_jobs=int(self.current_workers), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
+                    f1_runs = []
+                    for f1_val, rows_proc in results:
+                        f1_runs.append(f1_val)
+                        self.completed_operations += 1
+                        progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
+                        self._ui_stage("grid", progress_grid)
+                        self._ui_overall(progress_grid)
+                        self._ui_stage("overall", progress_grid)
+                        self._send_ai_metric(rows_proc, chunk_size=self.current_chunk_size)
+                        # update thread bars (round-robin mapping) and ETA grid
+                        tid = (self.completed_operations - 1) % self.thread_slots
+                        pct = min(100.0, (combo_idx / max(len(combinations), 1)) * 100.0)
+                        try:
+                            self._ui_thread(
+                                tid, pct, f"{name} combo {combo_idx}/{len(combinations)}", combo_idx, len(combinations)
+                            )
+                        except Exception:
+                            self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)}")
+                        self._update_stage_eta("grid", combo_idx, len(combinations))
+                        # model-level progress
+                        try:
+                            self._ui_model(name, pct)
+                        except Exception:
+                            pass
+                    
+                    mean_f1 = np.mean(f1_runs) if f1_runs else 0
+                    params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
+                    self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
+                    all_results.append({'params': params, 'f1': mean_f1})
+                    
+                    if mean_f1 > best_score:
+                        best_score = mean_f1
+                        best_params = params
+                    self._ui_best_score(f"{best_score:.4f}")
+                    self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
+                    # pull AI recommendation after each combo
+                    rec = self.ai_server.get_recommendation(timeout=0.02)
+                    if rec:
+                        new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                        if new_workers != self.current_workers:
+                            self.current_workers = new_workers
+                            self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
+                        new_chunk = int(self.current_chunk_size * rec.chunk_mult)
+                        self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
+                        self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
+                        self._ui_ai_rec(rec.reason)
+                    # checkpoint after each combo
+                    self.ckpt["model_idx"] = i
+                    self.ckpt["combo_idx"] = combo_idx
+                    self.ckpt["best_score"] = best_score
+                    self.ckpt["current_workers"] = self.current_workers
+                    self.ckpt["current_chunk_size"] = self.current_chunk_size
+                    self.ckpt["completed_ops"] = self.completed_operations
+                    self._write_checkpoint(force=False)
                 
-                mean_f1 = np.mean(f1_runs) if f1_runs else 0
-                params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
-                self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
-                all_results.append({'params': params, 'f1': mean_f1})
-                
-                if mean_f1 > best_score:
-                    best_score = mean_f1
-                    best_params = params
-                self._ui_best_score(f"{best_score:.4f}")
-                self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
-                # pull AI recommendation after each combo
-                rec = self.ai_server.get_recommendation(timeout=0.02)
-                if rec:
-                    new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
-                    if new_workers != self.current_workers:
-                        self.current_workers = new_workers
-                        self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
-                    new_chunk = int(self.current_chunk_size * rec.chunk_mult)
-                    self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
-                    self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
-                    self._ui_ai_rec(rec.reason)
-                # checkpoint after each combo
+                # persist results for this model
+                self.results[name] = {
+                    'all_results': all_results,
+                    'best_params': best_params,
+                    'best_f1': best_score,
+                }
+                self._reset_thread_bars()
+                self.optimal_configs[name] = {
+                    'params': best_params,
+                    'f1_score': float(best_score),
+                }
+                # checkpoint at end of model
                 self.ckpt["model_idx"] = i
-                self.ckpt["combo_idx"] = combo_idx
+                self.ckpt["combo_idx"] = 0
                 self.ckpt["best_score"] = best_score
                 self.ckpt["current_workers"] = self.current_workers
                 self.ckpt["current_chunk_size"] = self.current_chunk_size
                 self.ckpt["completed_ops"] = self.completed_operations
-                self._write_checkpoint(force=False)
-            # persist results for this model
-            self.results[name] = {
-                'all_results': all_results,
-                'best_params': best_params,
-                'best_f1': best_score,
-            }
-            self._reset_thread_bars()
-            self.optimal_configs[name] = {
-                'params': best_params,
-                'f1_score': float(best_score),
-            }
-            # checkpoint at end of model
-            self.ckpt["model_idx"] = i
-            self.ckpt["combo_idx"] = 0
-            self.ckpt["best_score"] = best_score
-            self.ckpt["current_workers"] = self.current_workers
-            self.ckpt["current_chunk_size"] = self.current_chunk_size
-            self.ckpt["completed_ops"] = self.completed_operations
-            self._write_checkpoint(force=True)
+                self._write_checkpoint(force=True)
 
-            self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
-            self._ui_best_score(f"{best_score:.4f}")
+                self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
+                self._ui_best_score(f"{best_score:.4f}")
         
             # Final report + status after all models
             self.log_live('\nETAPE 4: Rapports\n', 'info')
