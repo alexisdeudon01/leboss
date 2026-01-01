@@ -22,6 +22,7 @@ import traceback
 import psutil
 import threading
 import multiprocessing
+import math
 from joblib import Parallel, delayed
 from datetime import datetime, timedelta
 from itertools import product
@@ -49,6 +50,8 @@ def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
 try:
     from sklearn.model_selection import train_test_split, StratifiedKFold
     from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LinearRegression, Ridge, Lasso
+    from sklearn.metrics import mean_squared_error, r2_score
     from sklearn.naive_bayes import GaussianNB
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.ensemble import RandomForestClassifier
@@ -241,6 +244,14 @@ class CVOptimizationGUI:
         self.live_params_label = ttk.Label(self.graph_window, text="Params: --", anchor="w", justify="left")
         self.live_params_label.pack(fill="x", padx=6, pady=4)
 
+
+        # Extra Tk canvas (zone libre pour overlays / mini-visuels)
+        self.extra_canvas = tk.Canvas(self.graph_window, height=120, bg='white', highlightthickness=1)
+        self.extra_canvas.pack(fill='x', padx=6, pady=(0, 6))
+        try:
+            self.extra_canvas.create_text(10, 10, anchor='nw', text='Canvas: prêt', fill='black')
+        except Exception:
+            pass
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
             max_workers=1,
@@ -256,91 +267,6 @@ class CVOptimizationGUI:
         self.last_ckpt_ts = time.time()
 
     # -------------------- Lifecycle controls --------------------
-    def start_optimization(self):
-        if getattr(self, "running", False):
-            messagebox.showwarning("Attention", "Deja en cours")
-            return
-
-        self.running = True
-        try:
-            self.start_btn.config(state=tk.DISABLED)
-            self.stop_btn.config(state=tk.NORMAL)
-        except Exception:
-            pass
-
-        try:
-            self.ui_shell.set_status("Running")
-        except Exception:
-            pass
-
-        # reset stages
-        for k in ("load", "transit_load", "prep", "transit_mid", "grid", "transit_grid", "overall", "graphs"):
-            try:
-                self.ui_shell.set_stage_progress(k, 0.0)
-            except Exception:
-                pass
-        try:
-            self.ui_shell.set_overall_progress(0.0)
-            self.ui_shell.set_best_score("--")
-            self.ui_shell.set_ai_recommendation("Waiting...")
-            self._ui_tasks("Load → Prep → Grid → Reports")
-        except Exception:
-            pass
-
-        try:
-            self.live_text.delete(1.0, tk.END)
-            self.alerts_text.delete(1.0, tk.END)
-        except Exception:
-            pass
-
-        self.start_time = time.time()
-        self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
-        self.worker_thread.start()
-        try:
-            self.root.after(500, self.update_stats)
-        except Exception:
-            pass
-
-    def stop_optimization(self):
-        if not getattr(self, "running", False):
-            return
-        self.running = False
-        try:
-            self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
-        except Exception:
-            pass
-        try:
-            self.ui_shell.set_status("Stopped")
-        except Exception:
-            pass
-
-    # --------------- public controls ---------------
-    def start_optimization(self):
-        """Entry point bound to UI start button."""
-        if getattr(self, "running", False):
-            try:
-                self.ui_shell.log("[START] already running", level="INFO")
-            except Exception:
-                pass
-            return
-        self.running = True
-        try:
-            self.ui_shell.set_status("Running")
-        except Exception:
-            pass
-        # keep main UI responsive
-        threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker").start()
-
-    def stop_optimization(self):
-        """Public stop hook."""
-        self.running = False
-        try:
-            self.ui_shell.set_status("Stopped")
-        except Exception:
-            pass
-
-    # -------------------- UI safe setters (main thread) --------------------
     def _ui_stage(self, key: str, val: float):
         self.root.after(0, lambda: self.ui_shell.set_stage_progress(key, val))
 
@@ -386,164 +312,32 @@ class CVOptimizationGUI:
             pass
 
     def _update_live_graph(self, model: str, f1_values: list[float]):
-        """Update live graph window with latest F1 progression."""
+        """Update live graph window with latest F1 progression (thread-safe)."""
         try:
             self.live_curves[model] = list(f1_values)
-            self.ax_live.clear()
-            for name, vals in self.live_curves.items():
-                xs = list(range(1, len(vals) + 1))
-                if not xs:
-                    continue
-                self.ax_live.plot(xs, vals, marker="o", label=name)
-            self.ax_live.set_title("F1 en temps réel")
-            self.ax_live.set_xlabel("Combinaison #")
-            self.ax_live.set_ylabel("F1 pondéré")
-            self.ax_live.legend(loc="lower right", fontsize=8)
-            self.ax_live.grid(alpha=0.3)
-            self.canvas_live.draw_idle()
-            tor
-            
+
+            def _draw():
+                try:
+                    self.ax_live.clear()
+                    for name, vals in self.live_curves.items():
+                        xs = list(range(1, len(vals) + 1))
+                        if not xs:
+                            continue
+                        self.ax_live.plot(xs, vals, marker="o", label=name)
+                    self.ax_live.set_title("F1 en temps réel")
+                    self.ax_live.set_xlabel("Combinaison #")
+                    self.ax_live.set_ylabel("F1 pondéré")
+                    self.ax_live.legend(loc="lower right", fontsize=8)
+                    self.ax_live.grid(alpha=0.3)
+                    self.canvas_live.draw_idle()
+                except Exception:
+                    pass
+
+            try:
+                self.root.after(0, _draw)
+            except Exception:
+                _draw()
         except Exception:
-            pass
-
-
-class RegressionVisualizerLite:
-    """Interactive regression playground embedded as second tab."""
-
-    def __init__(self, parent):
-        self.parent = parent
-        self.seed = 42
-        np.random.seed(self.seed)
-        self.X = np.linspace(0, 10, 100).reshape(-1, 1)
-        self.y = 2.5 * self.X.flatten() + 5
-
-        self.alpha_var = tk.DoubleVar(value=0.1)
-        self.test_size_var = tk.DoubleVar(value=0.2)
-        self.noise_var = tk.DoubleVar(value=2.0)
-        self.model_type_var = tk.StringVar(value="Linear")
-
-        self._build_ui()
-        self._update_plot()
-
-    def _build_ui(self):
-        container = ttk.Frame(self.parent)
-        container.pack(fill="both", expand=True)
-        left = ttk.Frame(container, padding=10)
-        left.pack(side="left", fill="y")
-        right = ttk.Frame(container)
-        right.pack(side="right", fill="both", expand=True)
-
-        ttk.Label(left, text="Type de modèle", font=("Arial", 10, "bold")).pack(anchor="w", pady=4)
-        for model in ["Linear", "Ridge", "Lasso"]:
-            ttk.Radiobutton(left, text=model, variable=self.model_type_var,
-                            value=model, command=self._update_plot).pack(anchor="w")
-
-        ttk.Label(left, text="Alpha", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
-        ttk.Scale(left, from_=0.001, to=10.0, orient=tk.HORIZONTAL,
-                  variable=self.alpha_var, command=lambda _e: self._update_plot()).pack(fill="x")
-        self.alpha_lab = ttk.Label(left, text="")
-        self.alpha_lab.pack(anchor="w")
-
-        ttk.Label(left, text="Test size", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
-        ttk.Scale(left, from_=0.1, to=0.9, orient=tk.HORIZONTAL,
-                  variable=self.test_size_var, command=lambda _e: self._update_plot()).pack(fill="x")
-        self.test_lab = ttk.Label(left, text="")
-        self.test_lab.pack(anchor="w")
-
-        ttk.Label(left, text="Bruit σ", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
-        ttk.Scale(left, from_=0.0, to=10.0, orient=tk.HORIZONTAL,
-                  variable=self.noise_var, command=lambda _e: self._update_noise()).pack(fill="x")
-        self.noise_lab = ttk.Label(left, text="")
-        self.noise_lab.pack(anchor="w")
-
-        ttk.Button(left, text="Régénérer données", command=self._regen).pack(fill="x", pady=6)
-
-        self.fig_reg = Figure(figsize=(8, 6), dpi=100)
-        self.canvas_reg = FigureCanvasTkAgg(self.fig_reg, master=right)
-        self.canvas_reg.get_tk_widget().pack(fill="both", expand=True)
-
-    def _regen(self):
-        self.seed += 1
-        np.random.seed(self.seed)
-        self._update_plot()
-
-    def _update_noise(self):
-        self._update_plot()
-
-    def _generate_data(self):
-        self.y = 2.5 * self.X.flatten() + 5 + np.random.randn(len(self.X)) * self.noise_var.get()
-
-    def _update_plot(self):
-        try:
-            self.alpha_lab.config(text=f"α = {self.alpha_var.get():.4f}")
-            self.test_lab.config(text=f"Test size = {self.test_size_var.get():.2f}")
-            self.noise_lab.config(text=f"Bruit σ = {self.noise_var.get():.2f}")
-            self._generate_data()
-
-            X_train, X_test, y_train, y_test = train_test_split(
-                self.X, self.y, test_size=self.test_size_var.get(), random_state=42
-            )
-            model_type = self.model_type_var.get()
-            alpha = self.alpha_var.get()
-            if model_type == "Linear":
-                model = LinearRegression()
-            elif model_type == "Ridge":
-                model = Ridge(alpha=alpha)
-            else:
-                model = Lasso(alpha=alpha, max_iter=10000)
-
-            model.fit(X_train, y_train)
-            y_train_pred = model.predict(X_train)
-            y_test_pred = model.predict(X_test)
-            y_all_pred = model.predict(self.X)
-
-            mse_train = mean_squared_error(y_train, y_train_pred)
-            mse_test = mean_squared_error(y_test, y_test_pred)
-            r2_train = r2_score(y_train, y_train_pred)
-            r2_test = r2_score(y_test, y_test_pred)
-
-            self.fig_reg.clear()
-            ax1 = self.fig_reg.add_subplot(2, 2, 1)
-            ax2 = self.fig_reg.add_subplot(2, 2, 2)
-            ax3 = self.fig_reg.add_subplot(2, 2, 3)
-            ax4 = self.fig_reg.add_subplot(2, 2, 4)
-
-            ax1.scatter(X_train, y_train, color='blue', s=30, alpha=0.6, label='Train')
-            ax1.scatter(X_test, y_test, color='orange', s=30, alpha=0.6, label='Test')
-            ax1.plot(self.X, y_all_pred, color='red', linewidth=2, label='Modèle')
-            ax1.set_title(f'{model_type} (α={alpha:.3f})')
-            ax1.grid(True, alpha=0.3)
-            ax1.legend()
-
-            residuals_train = y_train - y_train_pred
-            ax2.scatter(X_train, residuals_train, color='green', s=30, alpha=0.6)
-            ax2.axhline(y=0, color='red', linestyle='--', linewidth=2)
-            ax2.set_title('Résidus Train')
-            ax2.grid(True, alpha=0.3)
-
-            residuals_all = self.y - y_all_pred
-            ax3.hist(residuals_all, bins=20, color='purple', alpha=0.7, edgecolor='black')
-            ax3.axvline(x=0, color='red', linestyle='--', linewidth=2)
-            ax3.set_title('Distribution résidus')
-            ax3.grid(True, alpha=0.3, axis='y')
-
-            ax4.axis('off')
-            metrics_text = (
-                f"MSE Train: {mse_train:.4f}\n"
-                f"MSE Test:  {mse_test:.4f}\n"
-                f"R2 Train :  {r2_train:.4f}\n"
-                f"R2 Test  :  {r2_test:.4f}\n"
-                f"Slope    :  {model.coef_[0]:.4f}\n"
-                f"Intercept:  {model.intercept_:.4f}\n"
-            )
-            ax4.text(0.05, 0.5, metrics_text, transform=ax4.transAxes,
-                     fontfamily='monospace', fontsize=10, va='center',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-            self.fig_reg.tight_layout()
-            self.canvas_reg.draw_idle()
-        except Exception:
-            # keep silent to avoid crashing main UI
             pass
 
     def _send_ai_metric(self, rows: int, chunk_size: int):
@@ -775,13 +569,19 @@ class RegressionVisualizerLite:
             self.cpu_label.config(text=f'{cpu:.1f}%')
             self.cpu_progress['value'] = min(cpu, 100)
             
+                        # ETA: prefer pre-estimation if available, fallback to avg-per-op
             if self.start_time and self.completed_operations > 0:
-                elapsed = time.time() - self.start_time
-                avg = elapsed / self.completed_operations
-                remaining = (self.total_operations - self.completed_operations) * avg
-                eta = datetime.now() + timedelta(seconds=remaining)
-                self.eta_label.config(text=eta.strftime('%H:%M:%S'))
-            
+                if getattr(self, "estimated_total_seconds", None) and self.total_operations > 0:
+                    pct = self.completed_operations / max(self.total_operations, 1)
+                    remaining = max(float(self.estimated_total_seconds) * (1.0 - pct), 0.0)
+                    eta = datetime.now() + timedelta(seconds=remaining)
+                    self.eta_label.config(text=eta.strftime('%H:%M:%S'))
+                else:
+                    elapsed = time.time() - self.start_time
+                    avg = elapsed / self.completed_operations
+                    remaining = (self.total_operations - self.completed_operations) * avg
+                    eta = datetime.now() + timedelta(seconds=remaining)
+                    self.eta_label.config(text=eta.strftime('%H:%M:%S'))
             percent = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
             self.progress_bar['value'] = percent
             self.progress_label.config(text=f'{self.completed_operations}/{self.total_operations}')
@@ -1077,6 +877,10 @@ class RegressionVisualizerLite:
             self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
             
             self.log_live(f'Data standardized: X shape {self.X_scaled.shape}\n', 'info')
+            try:
+                self._maybe_show_time_estimate()
+            except Exception:
+                pass
             
             np.savez_compressed('preprocessed_dataset.npz',
                                X=self.X_scaled,
@@ -1103,6 +907,279 @@ class RegressionVisualizerLite:
             except Exception:
                 pass
             return False
+
+
+
+    # -------------------- Runtime estimation (hardware + dataset) --------------------
+    def _human_time(self, seconds: float) -> str:
+        try:
+            seconds = float(seconds)
+        except Exception:
+            return "--"
+        if seconds < 0:
+            seconds = 0
+        s = int(seconds)
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        if h > 0:
+            return f"{h}h {m:02d}m {sec:02d}s"
+        if m > 0:
+            return f"{m}m {sec:02d}s"
+        return f"{sec}s"
+
+    def _hardware_profile(self) -> dict:
+        try:
+            vm = psutil.virtual_memory()
+            cpu_freq = getattr(psutil, "cpu_freq", lambda: None)()
+            freq_mhz = getattr(cpu_freq, "current", None) if cpu_freq else None
+            return {
+                "cores_logical": int(multiprocessing.cpu_count()),
+                "cores_physical": int(getattr(psutil, "cpu_count", lambda logical=False: None)(logical=False) or 0),
+                "ram_total_gb": float(vm.total / (1024**3)),
+                "ram_available_gb": float(vm.available / (1024**3)),
+                "cpu_freq_mhz": float(freq_mhz) if freq_mhz else None,
+            }
+        except Exception:
+            return {"cores_logical": int(multiprocessing.cpu_count())}
+
+    def _benchmark_one_fold(self, model_name: str, ModelClass, params: dict, bench_rows: int) -> float:
+        """Mesure rapide (1 fit/predict) sur un sous-échantillon. Renvoie seconds."""
+        try:
+            n = int(min(max(bench_rows, 2000), len(self.X_scaled)))
+            if n <= 0:
+                return 0.0
+            Xb = self.X_scaled[:n]
+            yb = self.y[:n]
+            t0 = time.perf_counter()
+            X_train, X_test, y_train, y_test = train_test_split(
+                Xb, yb,
+                test_size=0.2 if model_name != 'Decision Tree' else 0.3,
+                random_state=123,
+                stratify=yb if len(set(yb)) > 1 else None
+            )
+            kwargs = dict(params or {})
+            if model_name in ('Logistic Regression', 'Random Forest'):
+                kwargs['n_jobs'] = int(self.current_workers)
+            if model_name != 'Naive Bayes':
+                kwargs['random_state'] = 42
+            model = ModelClass(**kwargs)
+            model.fit(X_train, y_train)
+            _ = model.predict(X_test)
+            return max(time.perf_counter() - t0, 1e-6)
+        except Exception:
+            return 0.0
+
+    def estimate_total_runtime(self) -> dict:
+        """Estime le temps total (optimiste/réaliste/pessimiste) basé sur matos + dataset (best-effort)."""
+        info = {
+            "ok": False,
+            "total_seconds": None,          # realistic
+            "total_seconds_opt": None,
+            "total_seconds_pess": None,
+            "by_model_seconds": {},         # realistic
+            "by_model_seconds_opt": {},
+            "by_model_seconds_pess": {},
+            "bench_rows": None,
+            "workers": int(getattr(self, "current_workers", 1) or 1),
+            "dataset_shape": None,
+            "hardware": self._hardware_profile(),
+        }
+        try:
+            if self.X_scaled is None or self.y is None:
+                return info
+
+            n_rows, n_feats = int(self.X_scaled.shape[0]), int(self.X_scaled.shape[1])
+            info["dataset_shape"] = (n_rows, n_feats)
+            bench_rows = int(min(5000, n_rows))
+            info["bench_rows"] = bench_rows
+
+            model_configs = {
+                'Logistic Regression': LogisticRegression,
+                'Naive Bayes': GaussianNB,
+                'Decision Tree': DecisionTreeClassifier,
+                'Random Forest': RandomForestClassifier,
+            }
+
+            def pick_params(name: str, heavy: bool) -> dict:
+                g = PARAM_GRIDS.get(name, {}) or {}
+                p = {}
+                for k, vals in g.items():
+                    if not vals:
+                        continue
+                    if all(isinstance(v, (int, float)) for v in vals):
+                        p[k] = max(vals) if heavy else min(vals)
+                    else:
+                        p[k] = vals[-1] if heavy else vals[0]
+                # Safety fallbacks
+                if name == "Random Forest":
+                    p.setdefault("n_estimators", 200 if heavy else 50)
+                    p.setdefault("max_depth", 20 if heavy else 15)
+                if name == "Decision Tree":
+                    p.setdefault("max_depth", 20 if heavy else 10)
+                if name == "Logistic Regression":
+                    p.setdefault("max_iter", 2000 if heavy else 1000)
+                return p
+
+            # Parallelism: folds run in Parallel() per combo
+            workers = max(1, int(getattr(self, "current_workers", 1) or 1))
+            waves = int(math.ceil(K_FOLD / workers))
+
+            scale_rows = max(n_rows / max(bench_rows, 1), 1.0)
+
+            def overhead_multiplier(name: str) -> float:
+                # UI/log/joblib overhead differs slightly per model; keep simple
+                if name == "Random Forest":
+                    return 1.30
+                if name == "Decision Tree":
+                    return 1.20
+                return 1.15
+
+            total_opt = 0.0
+            total_real = 0.0
+            total_pess = 0.0
+
+            for model_name, ModelClass in model_configs.items():
+                combos = len(self.generate_param_combinations(model_name))
+
+                light_params = pick_params(model_name, heavy=False)
+                heavy_params = pick_params(model_name, heavy=True)
+
+                t_fold_light = self._benchmark_one_fold(model_name, ModelClass, light_params, bench_rows)
+                t_fold_heavy = self._benchmark_one_fold(model_name, ModelClass, heavy_params, bench_rows)
+
+                # Guard: if one bench fails, reuse the other
+                if t_fold_light <= 0 and t_fold_heavy > 0:
+                    t_fold_light = t_fold_heavy
+                if t_fold_heavy <= 0 and t_fold_light > 0:
+                    t_fold_heavy = t_fold_light
+                if t_fold_light <= 0 and t_fold_heavy <= 0:
+                    # can't benchmark => bail
+                    return info
+
+                # Extrapolate to full dataset
+                fold_opt = t_fold_light * scale_rows
+                fold_pess = t_fold_heavy * scale_rows
+                fold_real = (fold_opt + fold_pess) / 2.0
+
+                # Per-combo wall time (K folds in waves)
+                combo_opt = fold_opt * waves
+                combo_real = fold_real * waves
+                combo_pess = fold_pess * waves
+
+                mult = overhead_multiplier(model_name)
+                model_opt = combo_opt * combos * mult
+                model_real = combo_real * combos * mult
+                model_pess = combo_pess * combos * mult
+
+                info["by_model_seconds_opt"][model_name] = float(model_opt)
+                info["by_model_seconds"][model_name] = float(model_real)
+                info["by_model_seconds_pess"][model_name] = float(model_pess)
+
+                total_opt += model_opt
+                total_real += model_real
+                total_pess += model_pess
+
+            # Global safety margin
+            total_opt *= 1.05
+            total_real *= 1.10
+            total_pess *= 1.15
+
+            info["total_seconds_opt"] = float(total_opt)
+            info["total_seconds"] = float(total_real)
+            info["total_seconds_pess"] = float(total_pess)
+            info["ok"] = True
+            return info
+        except Exception:
+            return info
+
+
+    def _maybe_show_time_estimate(self):
+        """Log + surface l'estimation (appelable après prepare_data)."""
+        try:
+            # Auto-tune workers from RAM (soft guard)
+            try:
+                avail = MemoryManager.get_available_ram_gb()
+                if avail < 4:
+                    self.current_workers = min(int(self.current_workers), 1)
+                elif avail < 8:
+                    self.current_workers = min(int(self.current_workers), 2)
+            except Exception:
+                pass
+
+            info = self.estimate_total_runtime()
+            if not info.get("ok"):
+                return
+
+            self.estimated_total_seconds = float(info.get("total_seconds") or 0.0)
+            self.estimated_total_seconds_opt = float(info.get("total_seconds_opt") or 0.0)
+            self.estimated_total_seconds_pess = float(info.get("total_seconds_pess") or 0.0)
+
+            n_rows, n_feats = info.get("dataset_shape", ("?", "?"))
+            hw = info.get("hardware", {})
+            cores = hw.get("cores_logical", "?")
+            ram_total = hw.get("ram_total_gb", None)
+            ram_total_s = f"{ram_total:.1f}GB" if isinstance(ram_total, (int, float)) else "?"
+            w = info.get("workers", self.current_workers)
+
+            self.log_live(f"[ESTIMATE] Matos: {cores} cores | RAM {ram_total_s} | workers={w}", "info")
+            self.log_live(f"[ESTIMATE] Dataset: {n_rows:,} lignes × {n_feats} features (bench={info.get('bench_rows')})", "info")
+
+            # Per-model (realistic)
+            for k, v in info.get("by_model_seconds", {}).items():
+                self.log_live(f"[ESTIMATE] {k}: ~{self._human_time(v)}", "info")
+
+            self.log_live(f"[ESTIMATE] TOTAL (opt): ~{self._human_time(self.estimated_total_seconds_opt)}", "info")
+            self.log_live(f"[ESTIMATE] TOTAL (real): ~{self._human_time(self.estimated_total_seconds)}", "info")
+            self.log_live(f"[ESTIMATE] TOTAL (pess): ~{self._human_time(self.estimated_total_seconds_pess)}", "info")
+
+            try:
+                self._ui_tasks(f"Estimation: ~{self._human_time(self.estimated_total_seconds)}")
+            except Exception:
+                pass
+
+            # Mini visuel sur le canvas: barre opt/real/pess (thread-safe)
+            try:
+                c = getattr(self, "extra_canvas", None)
+                if c is not None:
+                    def _draw():
+                        try:
+                            c.delete("all")
+                            wpx = int(c.winfo_width() or 600)
+                            hpx = int(c.winfo_height() or 120)
+                            pad = 12
+                            bar_w = max(wpx - 2 * pad, 200)
+                            y0 = 42
+                            denom = max(float(self.estimated_total_seconds_pess or 1.0), 1.0)
+                            opt_r = min(max(float(self.estimated_total_seconds_opt or 0.0) / denom, 0.0), 1.0)
+                            real_r = min(max(float(self.estimated_total_seconds or 0.0) / denom, 0.0), 1.0)
+
+                            c.create_text(pad, 10, anchor="nw", text="Temps estimé (opt / réaliste / pess)", fill="black")
+                            c.create_rectangle(pad, y0, pad + bar_w, y0 + 18, outline="black")
+
+                            # opt (top band)
+                            c.create_rectangle(pad, y0, pad + int(bar_w * opt_r), y0 + 6, outline="", fill="#7bd389")
+                            # real (middle band)
+                            c.create_rectangle(pad, y0 + 6, pad + int(bar_w * real_r), y0 + 12, outline="", fill="#4ea8de")
+                            # pess (bottom band full)
+                            c.create_rectangle(pad, y0 + 12, pad + bar_w, y0 + 18, outline="", fill="#f77f7f")
+
+                            c.create_text(pad, y0 + 26, anchor="nw",
+                                          text=f"opt: {self._human_time(self.estimated_total_seconds_opt)} | "
+                                               f"real: {self._human_time(self.estimated_total_seconds)} | "
+                                               f"pess: {self._human_time(self.estimated_total_seconds_pess)}",
+                                          fill="black")
+                        except Exception:
+                            pass
+                    try:
+                        self.root.after(0, _draw)
+                    except Exception:
+                        _draw()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
 
     def generate_param_combinations(self, model_name):
         """Génère toutes les combinaisons de paramètres"""
@@ -1404,6 +1481,146 @@ class RegressionVisualizerLite:
         except Exception:
             pass
 
+
+
+class RegressionVisualizerLite:
+    """Interactive regression playground embedded as second tab."""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.seed = 42
+        np.random.seed(self.seed)
+        self.X = np.linspace(0, 10, 100).reshape(-1, 1)
+        self.y = 2.5 * self.X.flatten() + 5
+
+        self.alpha_var = tk.DoubleVar(value=0.1)
+        self.test_size_var = tk.DoubleVar(value=0.2)
+        self.noise_var = tk.DoubleVar(value=2.0)
+        self.model_type_var = tk.StringVar(value="Linear")
+
+        self._build_ui()
+        self._update_plot()
+
+    def _build_ui(self):
+        container = ttk.Frame(self.parent)
+        container.pack(fill="both", expand=True)
+        left = ttk.Frame(container, padding=10)
+        left.pack(side="left", fill="y")
+        right = ttk.Frame(container)
+        right.pack(side="right", fill="both", expand=True)
+
+        ttk.Label(left, text="Type de modèle", font=("Arial", 10, "bold")).pack(anchor="w", pady=4)
+        for model in ["Linear", "Ridge", "Lasso"]:
+            ttk.Radiobutton(left, text=model, variable=self.model_type_var,
+                            value=model, command=self._update_plot).pack(anchor="w")
+
+        ttk.Label(left, text="Alpha", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        ttk.Scale(left, from_=0.001, to=10.0, orient=tk.HORIZONTAL,
+                  variable=self.alpha_var, command=lambda _e: self._update_plot()).pack(fill="x")
+        self.alpha_lab = ttk.Label(left, text="")
+        self.alpha_lab.pack(anchor="w")
+
+        ttk.Label(left, text="Test size", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        ttk.Scale(left, from_=0.1, to=0.9, orient=tk.HORIZONTAL,
+                  variable=self.test_size_var, command=lambda _e: self._update_plot()).pack(fill="x")
+        self.test_lab = ttk.Label(left, text="")
+        self.test_lab.pack(anchor="w")
+
+        ttk.Label(left, text="Bruit σ", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        ttk.Scale(left, from_=0.0, to=10.0, orient=tk.HORIZONTAL,
+                  variable=self.noise_var, command=lambda _e: self._update_noise()).pack(fill="x")
+        self.noise_lab = ttk.Label(left, text="")
+        self.noise_lab.pack(anchor="w")
+
+        ttk.Button(left, text="Régénérer données", command=self._regen).pack(fill="x", pady=6)
+
+        self.fig_reg = Figure(figsize=(8, 6), dpi=100)
+        self.canvas_reg = FigureCanvasTkAgg(self.fig_reg, master=right)
+        self.canvas_reg.get_tk_widget().pack(fill="both", expand=True)
+
+    def _regen(self):
+        self.seed += 1
+        np.random.seed(self.seed)
+        self._update_plot()
+
+    def _update_noise(self):
+        self._update_plot()
+
+    def _generate_data(self):
+        self.y = 2.5 * self.X.flatten() + 5 + np.random.randn(len(self.X)) * self.noise_var.get()
+
+    def _update_plot(self):
+        try:
+            self.alpha_lab.config(text=f"α = {self.alpha_var.get():.4f}")
+            self.test_lab.config(text=f"Test size = {self.test_size_var.get():.2f}")
+            self.noise_lab.config(text=f"Bruit σ = {self.noise_var.get():.2f}")
+            self._generate_data()
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                self.X, self.y, test_size=self.test_size_var.get(), random_state=42
+            )
+            model_type = self.model_type_var.get()
+            alpha = self.alpha_var.get()
+            if model_type == "Linear":
+                model = LinearRegression()
+            elif model_type == "Ridge":
+                model = Ridge(alpha=alpha)
+            else:
+                model = Lasso(alpha=alpha, max_iter=10000)
+
+            model.fit(X_train, y_train)
+            y_train_pred = model.predict(X_train)
+            y_test_pred = model.predict(X_test)
+            y_all_pred = model.predict(self.X)
+
+            mse_train = mean_squared_error(y_train, y_train_pred)
+            mse_test = mean_squared_error(y_test, y_test_pred)
+            r2_train = r2_score(y_train, y_train_pred)
+            r2_test = r2_score(y_test, y_test_pred)
+
+            self.fig_reg.clear()
+            ax1 = self.fig_reg.add_subplot(2, 2, 1)
+            ax2 = self.fig_reg.add_subplot(2, 2, 2)
+            ax3 = self.fig_reg.add_subplot(2, 2, 3)
+            ax4 = self.fig_reg.add_subplot(2, 2, 4)
+
+            ax1.scatter(X_train, y_train, color='blue', s=30, alpha=0.6, label='Train')
+            ax1.scatter(X_test, y_test, color='orange', s=30, alpha=0.6, label='Test')
+            ax1.plot(self.X, y_all_pred, color='red', linewidth=2, label='Modèle')
+            ax1.set_title(f'{model_type} (α={alpha:.3f})')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+
+            residuals_train = y_train - y_train_pred
+            ax2.scatter(X_train, residuals_train, color='green', s=30, alpha=0.6)
+            ax2.axhline(y=0, color='red', linestyle='--', linewidth=2)
+            ax2.set_title('Résidus Train')
+            ax2.grid(True, alpha=0.3)
+
+            residuals_all = self.y - y_all_pred
+            ax3.hist(residuals_all, bins=20, color='purple', alpha=0.7, edgecolor='black')
+            ax3.axvline(x=0, color='red', linestyle='--', linewidth=2)
+            ax3.set_title('Distribution résidus')
+            ax3.grid(True, alpha=0.3, axis='y')
+
+            ax4.axis('off')
+            metrics_text = (
+                f"MSE Train: {mse_train:.4f}\n"
+                f"MSE Test:  {mse_test:.4f}\n"
+                f"R2 Train :  {r2_train:.4f}\n"
+                f"R2 Test  :  {r2_test:.4f}\n"
+                f"Slope    :  {model.coef_[0]:.4f}\n"
+                f"Intercept:  {model.intercept_:.4f}\n"
+            )
+            ax4.text(0.05, 0.5, metrics_text, transform=ax4.transAxes,
+                     fontfamily='monospace', fontsize=10, va='center',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+            self.fig_reg.tight_layout()
+            self.canvas_reg.draw_idle()
+        except Exception:
+            # keep silent to avoid crashing main UI
+            pass
 
 def main():
     try:
