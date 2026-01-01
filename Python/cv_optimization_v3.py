@@ -176,33 +176,43 @@ class CVOptimizationGUI:
         self.stage_eta = {}
         self.current_task = "Init"
         self.thread_slots = len(self.ui_shell.thread_vars)
+        self.worker_thread: threading.Thread | None = None
+        self._last_ai_ts = time.time()
+        self._last_ai_rows = 0
 
+        # Core data containers
         self.df = None
         self.X_scaled = None
         self.y = None
         self.label_encoder = None
-        
-        # Bind shell controls and placeholders for old UI elements
+
+        # Bind shell controls and placeholders for legacy UI handles
         self.ui_shell.start_btn.config(command=self.start_optimization)
         self.ui_shell.stop_btn.config(command=self.stop_optimization)
-        # placeholders to satisfy existing methods
+        self.start_btn = self.ui_shell.start_btn
+        self.stop_btn = self.ui_shell.stop_btn
         self.live_text = self.ui_shell.log_text
         self.alerts_text = self.ui_shell.alerts_text
-        class _Dummy:
-            def __init__(self, setter): self._setter = setter
-            def config(self, text=None, fg=None): 
-                if text is not None: self._setter(text)
-        self.status_label = _Dummy(lambda t: self.ui_shell.set_status(t))
+
+        class _StatusProxy:
+            def __init__(self, setter):
+                self._setter = setter
+
+            def config(self, text=None, fg=None):
+                if text is not None:
+                    self._setter(text)
+
+        self.status_label = _StatusProxy(lambda t: self.ui_shell.set_status(t))
         self.progress_bar = tk.DoubleVar(value=0.0)
-        self.progress_label = _Dummy(lambda t: None)
-        self.ram_label = _Dummy(lambda t: None)
-        self.cpu_label = _Dummy(lambda t: None)
-        self.ram_progress = {"value":0}
-        self.cpu_progress = {"value":0}
-        self.graphs_btn = _Dummy(lambda t: None)
+        self.progress_label = _StatusProxy(lambda t: self.ui_shell.set_tasks(t))
+        self.ram_label = _StatusProxy(lambda t: None)
+        self.cpu_label = _StatusProxy(lambda t: None)
+        self.ram_progress = {"value": 0}
+        self.cpu_progress = {"value": 0}
+        self.graphs_btn = self.ui_shell.reset_btn  # placeholder, not used
         self.thread_slots = len(self.ui_shell.thread_vars)
 
-        # secondary window reserved for future graphs
+        # single graphs window (no extra placeholders)
         self.graph_window = tk.Toplevel(self.root)
         self.graph_window.title("Graphs")
         try:
@@ -224,11 +234,43 @@ class CVOptimizationGUI:
         self.rows_seen = 0
         self.current_chunk_size = MemoryManager.get_optimal_chunk_size()
 
+    # -------------------- UI safe setters (main thread) --------------------
+    def _ui_stage(self, key: str, val: float):
+        self.root.after(0, lambda: self.ui_shell.set_stage_progress(key, val))
+
+    def _ui_overall(self, val: float):
+        self.root.after(0, lambda: self.ui_shell.set_overall_progress(val))
+
+    def _ui_eta(self, key: str, text: str):
+        self.root.after(0, lambda: self.ui_shell.set_stage_eta(key, text))
+
+    def _ui_model(self, key: str, val: float):
+        self.root.after(0, lambda: self.ui_shell.set_model_progress(key, val, key))
+
+    def _ui_thread(self, tid: int, val: float, msg: str, done: int | None = None, total: int | None = None):
+        try:
+            self.root.after(0, lambda: self.ui_shell.set_thread_progress(tid, val, msg, done, total))
+        except Exception:
+            self.root.after(0, lambda: self.ui_shell.update_thread(tid, val, msg))
+
+    def _ui_best_score(self, text: str):
+        self.root.after(0, lambda: self.ui_shell.set_best_score(text))
+
+    def _ui_ai_rec(self, text: str):
+        self.root.after(0, lambda: self.ui_shell.set_ai_recommendation(text))
+
+    def _ui_tasks(self, text: str):
+        self.root.after(0, lambda: self.ui_shell.set_tasks(text))
+
     def _send_ai_metric(self, rows: int, chunk_size: int):
         try:
             ram = psutil.virtual_memory().percent
             cpu = psutil.cpu_percent(interval=0.0)
-            tp = rows
+            now = time.time()
+            dt = max(now - self._last_ai_ts, 1e-6)
+            tp = rows / dt
+            self._last_ai_ts = now
+            self._last_ai_rows += rows
             self.ai_server.send_metrics(
                 AIMetrics(
                     timestamp=time.time(),
@@ -250,16 +292,18 @@ class CVOptimizationGUI:
                 self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
                 self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
                 self.ui_shell.set_ai_recommendation(rec.reason)
+                # surface throughput + server instruction
+                self.log_live(f"[AI] instr: {rec.reason} | rows/s≈{tp:,.1f}", "info")
         except Exception:
             pass
 
     def _reset_thread_bars(self):
         for tid in range(self.thread_slots):
-            self.ui_shell.update_thread(tid, 0.0, "Idle")
+            self._ui_thread(tid, 0.0, "Idle", 0, 0)
 
     def _update_stage_eta(self, key: str, done: int, total: int):
         if total <= 0:
-            self.ui_shell.set_stage_eta(key, "ETA: --")
+            self._ui_eta(key, "ETA: --")
             return
         now = time.time()
         if key not in self.stage_start:
@@ -268,7 +312,7 @@ class CVOptimizationGUI:
         pace = elapsed / max(done, 1)
         remaining = max(total - done, 0) * pace
         eta_dt = timedelta(seconds=int(remaining))
-        self.ui_shell.set_stage_eta(key, f"ETA: {eta_dt}")
+        self._ui_eta(key, f"ETA: {eta_dt}")
 
     def _write_checkpoint(self, force: bool = False):
         try:
@@ -385,23 +429,39 @@ class CVOptimizationGUI:
         self.status_label.pack(side=tk.RIGHT, padx=20, pady=10)
 
     def log_live(self, msg, tag='info'):
-        try:
-            self.live_text.insert(tk.END, msg + '\n', tag)
-            self.live_text.see(tk.END)
-            self.root.update_idletasks()
-            level = "INFO" if tag == "info" else str(tag).upper()
-            self.ui_shell.log(msg, level=level)
-        except:
-            pass
+        """Thread-safe log to the live console + shell log."""
+        def _append():
+            try:
+                self.live_text.insert(tk.END, msg + '\n', tag)
+                self.live_text.see(tk.END)
+                level = "INFO" if tag == "info" else str(tag).upper()
+                self.ui_shell.log(msg, level=level)
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            try:
+                self.root.after(0, _append)
+            except Exception:
+                pass
 
     def add_alert(self, msg):
-        try:
-            self.alerts_text.insert(tk.END, f'• {msg}\n')
-            self.alerts_text.see(tk.END)
-            self.root.update_idletasks()
-            self.ui_shell.add_alert(msg, "INFO")
-        except:
-            pass
+        """Thread-safe alert entry."""
+        def _append():
+            try:
+                self.alerts_text.insert(tk.END, f'• {msg}\n')
+                self.alerts_text.see(tk.END)
+                self.ui_shell.add_alert(msg, "INFO")
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            try:
+                self.root.after(0, _append)
+            except Exception:
+                pass
 
     def update_stats(self):
         try:
@@ -476,19 +536,29 @@ class CVOptimizationGUI:
         self.ui_shell.set_overall_progress(0.0)
         self.ui_shell.set_best_score("--")
         self.ui_shell.set_ai_recommendation("Waiting...")
-        self.ui_shell.set_tasks("Load → Prep → Grid → Reports")
+        self._ui_tasks("Load → Prep → Grid → Reports")
         self._reset_thread_bars()
         for key in ("load", "prep", "grid", "reports"):
             self.stage_start[key] = time.time()
+            self.stage_eta[key] = "ETA: --"
+            self._ui_eta(key, "ETA: --")
+        # init model bars
+        for name in ("Logistic Regression", "Naive Bayes", "Decision Tree", "Random Forest"):
+            try:
+                self._ui_model(name, 0.0)
+            except Exception:
+                pass
         self.live_text.delete(1.0, tk.END)
         self.alerts_text.delete(1.0, tk.END)
         
         self.log_live('CV OPTIMIZATION V3 - GRID SEARCH\n', 'info')
         self.log_live('Hyperparamètres variables par algo\n\n', 'info')
         
-        threading.Thread(target=self.run_optimization, daemon=True).start()
         self.start_time = time.time()
-        self.update_stats()
+        # Launch optimization in background to keep UI responsive
+        self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
+        self.worker_thread.start()
+        self.root.after(500, self.update_stats)
 
     def stop_optimization(self):
         self.running = False
@@ -567,7 +637,7 @@ class CVOptimizationGUI:
             self.log_live(f'OK: {len(self.df):,} lignes\n\n', 'info')
             self.rows_seen += len(self.df)
             self.files_done += 1
-            self.ui_shell.set_stage_progress("load", 100.0)
+            self._ui_stage("load", 100.0)
             self._update_stage_eta("load", 1, 1)
             return True
         except Exception as e:
@@ -609,7 +679,9 @@ class CVOptimizationGUI:
                                classes=self.label_encoder.classes_)
             
             self.log_live(f'NPZ sauvegarde\n\n', 'info')
-            self.ui_shell.set_stage_progress("prep", 100.0)
+            self.rows_seen += len(self.X_scaled)
+            self._ui_stage("prep", 100.0)
+            self._update_stage_eta("prep", 1, 1)
             del self.df, X
             gc.collect()
             return True
@@ -662,7 +734,8 @@ class CVOptimizationGUI:
                 if i < start_model_idx:
                     continue
                 self.log_live(f'\n{i}/4. {name}\n', 'info')
-                self.ui_shell.set_tasks(f"{name} grid search")
+                self._ui_tasks(f"{name} grid search")
+                self._ui_model(name, 0.0)
                 
                 combinations = self.generate_param_combinations(name)
                 self.log_live(f'  Testage: {len(combinations)} combinaisons\n', 'info')
@@ -699,16 +772,31 @@ class CVOptimizationGUI:
                     except Exception:
                         return 0, 0
 
-                results = Parallel(n_jobs=int(self.current_workers))(delayed(run_fold)(fold) for fold in range(K_FOLD))
+                results = Parallel(n_jobs=int(self.current_workers), backend="threading")(delayed(run_fold)(fold) for fold in range(K_FOLD))
                 f1_runs = []
                 for f1_val, rows_proc in results:
                     f1_runs.append(f1_val)
                     self.completed_operations += 1
                     progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
-                    self.ui_shell.set_stage_progress("grid", progress_grid)
-                    self.ui_shell.set_overall_progress(progress_grid)
-                    self.ui_shell.set_stage_progress("overall", progress_grid)
+                    self._ui_stage("grid", progress_grid)
+                    self._ui_overall(progress_grid)
+                    self._ui_stage("overall", progress_grid)
                     self._send_ai_metric(rows_proc, chunk_size=self.current_chunk_size)
+                    # update thread bars (round-robin mapping) and ETA grid
+                    tid = (self.completed_operations - 1) % self.thread_slots
+                    pct = min(100.0, (combo_idx / max(len(combinations), 1)) * 100.0)
+                    try:
+                        self._ui_thread(
+                            tid, pct, f"{name} combo {combo_idx}/{len(combinations)}", combo_idx, len(combinations)
+                        )
+                    except Exception:
+                        self.ui_shell.update_thread(tid, pct, f"{name} combo {combo_idx}/{len(combinations)}")
+                    self._update_stage_eta("grid", combo_idx, len(combinations))
+                    # model-level progress
+                    try:
+                        self._ui_model(name, pct)
+                    except Exception:
+                        pass
                 
                 mean_f1 = np.mean(f1_runs) if f1_runs else 0
                 params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
@@ -718,6 +806,7 @@ class CVOptimizationGUI:
                 if mean_f1 > best_score:
                     best_score = mean_f1
                     best_params = params
+                self._ui_best_score(f"{best_score:.4f}")
                 self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
                 # pull AI recommendation after each combo
                 rec = self.ai_server.get_recommendation(timeout=0.02)
@@ -729,57 +818,61 @@ class CVOptimizationGUI:
                     new_chunk = int(self.current_chunk_size * rec.chunk_mult)
                     self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
                     self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
-                    self.ui_shell.set_ai_recommendation(rec.reason)
+                    self._ui_ai_rec(rec.reason)
                 # checkpoint after each combo
                 self.ckpt["model_idx"] = i
                 self.ckpt["combo_idx"] = combo_idx
                 self.ckpt["best_score"] = best_score
-                self._write_checkpoint(force=False)
-                
-                self.results[name] = {
-                    'all_results': all_results,
-                    'best_params': best_params,
-                    'best_f1': best_score
-                }
-                
-                self.optimal_configs[name] = {
-                    'params': best_params,
-                    'f1_score': float(best_score)
-                }
-                # checkpoint after each model
-                self.ckpt["model_idx"] = i
-                self.ckpt["combo_idx"] = 0
-                self.ckpt["best_score"] = best_score
                 self.ckpt["current_workers"] = self.current_workers
                 self.ckpt["current_chunk_size"] = self.current_chunk_size
                 self.ckpt["completed_ops"] = self.completed_operations
-                self._write_checkpoint(force=True)
-                
+                self._write_checkpoint(force=False)
+            # persist results for this model
+            self.results[name] = {
+                'all_results': all_results,
+                'best_params': best_params,
+                'best_f1': best_score,
+            }
+            self._reset_thread_bars()
+            self.optimal_configs[name] = {
+                'params': best_params,
+                'f1_score': float(best_score),
+            }
+            # checkpoint at end of model
+            self.ckpt["model_idx"] = i
+            self.ckpt["combo_idx"] = 0
+            self.ckpt["best_score"] = best_score
+            self.ckpt["current_workers"] = self.current_workers
+            self.ckpt["current_chunk_size"] = self.current_chunk_size
+            self.ckpt["completed_ops"] = self.completed_operations
+            self._write_checkpoint(force=True)
+
             self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
-            self.ui_shell.set_best_score(f"{best_score:.4f}")
-            
+            self._ui_best_score(f"{best_score:.4f}")
+        
+            # Final report + status after all models
             self.log_live('\nETAPE 4: Rapports\n', 'info')
             self.generate_reports()
-            
             self.log_live('\n' + '='*60 + '\n', 'info')
             self.log_live('GRID SEARCH TERMINEE\n', 'info')
-            
-            self.status_label.config(text='Succes', fg='#27ae60')
+            self.root.after(0, lambda: self.ui_shell.set_status("Completed"))
             self.add_alert('GRID SEARCH COMPLETE')
-            self.ui_shell.set_stage_progress("grid", 100.0)
-            self.ui_shell.set_overall_progress(100.0)
-            self.ui_shell.set_status("Completed")
-            self.graphs_btn.config(state=tk.NORMAL)
-        
+            self._ui_stage("grid", 100.0)
+            self._ui_overall(100.0)
+            self.root.after(0, lambda: self.graphs_btn.config(state=tk.NORMAL))
+
         except Exception as e:
             self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
-            self.status_label.config(text='Erreur', fg='#d32f2f')
+            self.root.after(0, lambda: self.ui_shell.set_status("Erreur"))
         
         finally:
             self._write_checkpoint(force=True)
             self.running = False
-            self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
+            try:
+                self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+            except Exception:
+                pass
 
     def generate_reports(self):
         try:

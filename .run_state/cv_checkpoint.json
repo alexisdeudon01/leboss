@@ -1,0 +1,10 @@
+{
+  "model_idx": 0,
+  "combo_idx": 0,
+  "best_score": 0.0,
+  "rows_seen": 0,
+  "files_done": 0,
+  "current_workers": 1,
+  "current_chunk_size": 20480,
+  "completed_ops": 0
+}

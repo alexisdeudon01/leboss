@@ -57,11 +57,18 @@ class ConsolidationStyleShell:
 
         # Alerts
         alerts_frame = tk.LabelFrame(self.root, text="Alerts / Errors", bg="#f8fafc")
-        alerts_frame.pack(fill="x", padx=6, pady=4)
+        alerts_frame.pack(fill="both", padx=6, pady=4, expand=True)
+        alerts_canvas = tk.Canvas(alerts_frame, bg="#0f172a", highlightthickness=0, height=80)
+        alerts_scroll = ttk.Scrollbar(alerts_frame, orient="vertical", command=alerts_canvas.yview)
+        alerts_canvas.configure(yscrollcommand=alerts_scroll.set)
+        alerts_canvas.pack(side="left", fill="both", expand=True)
+        alerts_scroll.pack(side="right", fill="y")
         self.alerts_text = scrolledtext.ScrolledText(
-            alerts_frame, height=4, bg="#0f172a", fg="#e2e8f0", insertbackground="#e2e8f0"
+            alerts_canvas, height=6, bg="#0f172a", fg="#e2e8f0", insertbackground="#e2e8f0"
         )
-        self.alerts_text.pack(fill="x")
+        self.alerts_text.pack(fill="both", expand=True)
+        alerts_canvas.create_window((0, 0), window=self.alerts_text, anchor="nw")
+        self.alerts_text.bind("<Configure>", lambda e: alerts_canvas.configure(scrollregion=alerts_canvas.bbox("all")))
 
         # Monitoring + AI info
         monitor = tk.LabelFrame(self.root, text="Monitoring + Progress", bg="#f8fafc")
@@ -96,28 +103,59 @@ class ConsolidationStyleShell:
         self.overall_var = tk.DoubleVar(value=0.0)
         ttk.Progressbar(bars_frame, variable=self.overall_var, maximum=100.0).grid(row=0, column=1, sticky="ew", padx=4, pady=2)
         bars_frame.columnconfigure(1, weight=1)
+        # model-level bars container
+        self.model_frame = tk.Frame(bars_frame, bg="#f8fafc")
+        self.model_frame.grid(row=0, column=2, sticky="nw")
+        tk.Label(self.model_frame, text="Models:", bg="#f8fafc").pack(anchor="w")
+        self.model_vars: dict[str, tk.DoubleVar] = {}
+
+        # scrollable stages list
+        stages_frame = tk.Frame(bars_frame, bg="#f8fafc")
+        stages_frame.grid(row=1, column=0, columnspan=3, sticky="nsew")
+        bars_frame.rowconfigure(1, weight=1)
+        stage_canvas = tk.Canvas(stages_frame, bg="#f8fafc", highlightthickness=0, height=120)
+        stage_scroll = ttk.Scrollbar(stages_frame, orient="vertical", command=stage_canvas.yview)
+        stage_inner = tk.Frame(stage_canvas, bg="#f8fafc")
+        stage_inner.bind("<Configure>", lambda e: stage_canvas.configure(scrollregion=stage_canvas.bbox("all")))
+        stage_canvas.create_window((0, 0), window=stage_inner, anchor="nw")
+        stage_canvas.configure(yscrollcommand=stage_scroll.set)
+        stage_canvas.pack(side="left", fill="both", expand=True)
+        stage_scroll.pack(side="right", fill="y")
 
         self.stage_vars: dict[str, tk.DoubleVar] = {}
         self.stage_eta_vars: dict[str, tk.StringVar] = {}
-        r = 1
+        r = 0
         for key, label in self.stages:
-            tk.Label(bars_frame, text=f"{label}:", bg="#f8fafc").grid(row=r, column=0, sticky="w", padx=4, pady=2)
+            tk.Label(stage_inner, text=f"{label}:", bg="#f8fafc").grid(row=r, column=0, sticky="w", padx=4, pady=2)
             var = tk.DoubleVar(value=0.0)
-            ttk.Progressbar(bars_frame, variable=var, maximum=100.0).grid(row=r, column=1, sticky="ew", padx=4, pady=2)
+            ttk.Progressbar(stage_inner, variable=var, maximum=100.0).grid(row=r, column=1, sticky="ew", padx=4, pady=2)
             eta_var = tk.StringVar(value="ETA: --")
-            tk.Label(bars_frame, textvariable=eta_var, bg="#f8fafc", fg="#6b7280").grid(row=r, column=2, sticky="w", padx=4)
+            tk.Label(stage_inner, textvariable=eta_var, bg="#f8fafc", fg="#6b7280").grid(row=r, column=2, sticky="w", padx=4)
+            stage_inner.columnconfigure(1, weight=1)
             self.stage_vars[key] = var
             self.stage_eta_vars[key] = eta_var
             r += 1
-        self._bars_frame = bars_frame
+        self._bars_frame = stage_inner
 
         # Thread progress
         threads_frame = tk.LabelFrame(self.root, text="Thread progress (never empty)", bg="#f8fafc")
-        threads_frame.pack(fill="x", padx=6, pady=4)
+        threads_frame.pack(fill="both", padx=6, pady=4, expand=True)
         self.thread_vars: dict[int, tk.DoubleVar] = {}
         self.thread_labels: dict[int, tk.Label] = {}
+        # scrollable area for threads
+        thread_holder = tk.Frame(threads_frame, bg="#f8fafc")
+        thread_holder.pack(fill="both", expand=True)
+        self.thread_canvas = tk.Canvas(thread_holder, highlightthickness=0, bg="#f8fafc")
+        thread_scroll = ttk.Scrollbar(thread_holder, orient="vertical", command=self.thread_canvas.yview)
+        self.thread_canvas.configure(yscrollcommand=thread_scroll.set)
+        self.thread_inner = tk.Frame(self.thread_canvas, bg="#f8fafc")
+        inner_window = self.thread_canvas.create_window((0, 0), window=self.thread_inner, anchor="nw")
+        self.thread_inner.bind("<Configure>", lambda e: self.thread_canvas.configure(scrollregion=self.thread_canvas.bbox("all")))
+        self.thread_canvas.bind("<Configure>", lambda e: self.thread_canvas.itemconfigure(inner_window, width=e.width))
+        self.thread_canvas.pack(side="left", fill="both", expand=True)
+        thread_scroll.pack(side="right", fill="y")
         for tid in range(self.thread_slots):
-            row = tk.Frame(threads_frame, bg="#f8fafc")
+            row = tk.Frame(self.thread_inner, bg="#f8fafc")
             row.pack(fill="x", pady=1)
             tk.Label(row, text=f"T{tid}", width=4, bg="#f8fafc").pack(side="left")
             var = tk.DoubleVar(value=0.0)
@@ -178,6 +216,32 @@ class ConsolidationStyleShell:
         tk.Label(self._bars_frame, textvariable=eta_var, bg="#f8fafc", fg="#6b7280").grid(row=r, column=2, sticky="w", padx=4)
         self.stage_vars[key] = var
         self.stage_eta_vars[key] = eta_var
+
+    def set_model_progress(self, key: str, value: float, label: str | None = None) -> None:
+        if key not in self.model_vars:
+            var = tk.DoubleVar(value=0.0)
+            row = tk.Frame(self.model_frame, bg="#f8fafc")
+            row.pack(fill="x")
+            tk.Label(row, text=label or key, bg="#f8fafc").pack(side="left")
+            ttk.Progressbar(row, variable=var, maximum=100.0, length=120).pack(side="left", padx=4)
+            self.model_vars[key] = var
+        self.model_vars[key].set(max(0.0, min(100.0, value)))
+
+    def set_thread_progress(self, tid: int, value: float, msg: str | None = None, done: int | None = None, total: int | None = None) -> None:
+        """Update a thread bar with optional done/total details."""
+        try:
+            if tid in self.thread_vars:
+                self.thread_vars[tid].set(max(0.0, min(100.0, value)))
+            if tid in self.thread_labels:
+                suffix = ""
+                if done is not None and total is not None and total > 0:
+                    suffix = f" ({done}/{total})"
+                if msg:
+                    self.thread_labels[tid].configure(text=f"{msg}{suffix}")
+                elif suffix:
+                    self.thread_labels[tid].configure(text=suffix)
+        except Exception:
+            pass
 
     def update_thread(self, tid: int, value: float, msg: str | None = None) -> None:
         if tid in self.thread_vars:
