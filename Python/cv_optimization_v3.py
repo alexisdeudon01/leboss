@@ -255,6 +255,91 @@ class CVOptimizationGUI:
         self.current_chunk_size = MemoryManager.get_optimal_chunk_size(min_chunk=MIN_CHUNK_SIZE)
         self.last_ckpt_ts = time.time()
 
+    # -------------------- Lifecycle controls --------------------
+    def start_optimization(self):
+        if getattr(self, "running", False):
+            messagebox.showwarning("Attention", "Deja en cours")
+            return
+
+        self.running = True
+        try:
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+        except Exception:
+            pass
+
+        try:
+            self.ui_shell.set_status("Running")
+        except Exception:
+            pass
+
+        # reset stages
+        for k in ("load", "transit_load", "prep", "transit_mid", "grid", "transit_grid", "overall", "graphs"):
+            try:
+                self.ui_shell.set_stage_progress(k, 0.0)
+            except Exception:
+                pass
+        try:
+            self.ui_shell.set_overall_progress(0.0)
+            self.ui_shell.set_best_score("--")
+            self.ui_shell.set_ai_recommendation("Waiting...")
+            self._ui_tasks("Load → Prep → Grid → Reports")
+        except Exception:
+            pass
+
+        try:
+            self.live_text.delete(1.0, tk.END)
+            self.alerts_text.delete(1.0, tk.END)
+        except Exception:
+            pass
+
+        self.start_time = time.time()
+        self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
+        self.worker_thread.start()
+        try:
+            self.root.after(500, self.update_stats)
+        except Exception:
+            pass
+
+    def stop_optimization(self):
+        if not getattr(self, "running", False):
+            return
+        self.running = False
+        try:
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+        except Exception:
+            pass
+        try:
+            self.ui_shell.set_status("Stopped")
+        except Exception:
+            pass
+
+    # --------------- public controls ---------------
+    def start_optimization(self):
+        """Entry point bound to UI start button."""
+        if getattr(self, "running", False):
+            try:
+                self.ui_shell.log("[START] already running", level="INFO")
+            except Exception:
+                pass
+            return
+        self.running = True
+        try:
+            self.ui_shell.set_status("Running")
+        except Exception:
+            pass
+        # keep main UI responsive
+        threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker").start()
+
+    def stop_optimization(self):
+        """Public stop hook."""
+        self.running = False
+        try:
+            self.ui_shell.set_status("Stopped")
+        except Exception:
+            pass
+
     # -------------------- UI safe setters (main thread) --------------------
     def _ui_stage(self, key: str, val: float):
         self.root.after(0, lambda: self.ui_shell.set_stage_progress(key, val))
@@ -316,6 +401,8 @@ class CVOptimizationGUI:
             self.ax_live.legend(loc="lower right", fontsize=8)
             self.ax_live.grid(alpha=0.3)
             self.canvas_live.draw_idle()
+            tor
+            
         except Exception:
             pass
 
