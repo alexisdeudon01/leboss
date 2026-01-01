@@ -225,15 +225,24 @@ class CVOptimizationGUI:
             self.graph_window.geometry("800x600")
         except Exception:
             pass
+        # Single live graph (F1 progression par modèle)
+        live_tab = ttk.Frame(self.graph_window)
+        live_tab.pack(fill="both", expand=True)
+
         # Live graph (F1 progression per modèle)
         self.fig_live = Figure(figsize=(7, 4), dpi=100)
         self.ax_live = self.fig_live.add_subplot(111)
         self.ax_live.set_title("F1 en temps réel")
         self.ax_live.set_xlabel("Combinaison #")
         self.ax_live.set_ylabel("F1 pondéré")
-        self.canvas_live = FigureCanvasTkAgg(self.fig_live, master=self.graph_window)
+        self.canvas_live = FigureCanvasTkAgg(self.fig_live, master=live_tab)
         self.canvas_live.get_tk_widget().pack(fill="both", expand=True)
         self.live_curves: dict[str, list[float]] = {}
+        self.live_params_label = ttk.Label(self.graph_window, text="Params: --", anchor="w", justify="left")
+        self.live_params_label.pack(fill="x", padx=6, pady=4)
+        # zone texte pour hyperparamètres courant
+        self.live_params_label = ttk.Label(self.graph_window, text="Params: --", anchor="w", justify="left")
+        self.live_params_label.pack(fill="x", padx=6, pady=4)
 
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
@@ -277,6 +286,17 @@ class CVOptimizationGUI:
     def _ui_tasks(self, text: str):
         self.root.after(0, lambda: self.ui_shell.set_tasks(text))
 
+    def _set_live_params(self, model: str, params: dict):
+        """Render current hyperparameters below the F1 live chart."""
+        try:
+            pretty = ", ".join(f"{k}={v}" for k, v in params.items()) if params else "--"
+            if len(pretty) > 220:
+                pretty = pretty[:217] + "..."
+            msg = f"{model}: {pretty}"
+            self.root.after(0, lambda: self.live_params_label.config(text=msg))
+        except Exception:
+            pass
+
     def _update_live_graph(self, model: str, f1_values: list[float]):
         """Update live graph window with latest F1 progression."""
         try:
@@ -294,6 +314,146 @@ class CVOptimizationGUI:
             self.ax_live.grid(alpha=0.3)
             self.canvas_live.draw_idle()
         except Exception:
+            pass
+
+
+class RegressionVisualizerLite:
+    """Interactive regression playground embedded as second tab."""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.seed = 42
+        np.random.seed(self.seed)
+        self.X = np.linspace(0, 10, 100).reshape(-1, 1)
+        self.y = 2.5 * self.X.flatten() + 5
+
+        self.alpha_var = tk.DoubleVar(value=0.1)
+        self.test_size_var = tk.DoubleVar(value=0.2)
+        self.noise_var = tk.DoubleVar(value=2.0)
+        self.model_type_var = tk.StringVar(value="Linear")
+
+        self._build_ui()
+        self._update_plot()
+
+    def _build_ui(self):
+        container = ttk.Frame(self.parent)
+        container.pack(fill="both", expand=True)
+        left = ttk.Frame(container, padding=10)
+        left.pack(side="left", fill="y")
+        right = ttk.Frame(container)
+        right.pack(side="right", fill="both", expand=True)
+
+        ttk.Label(left, text="Type de modèle", font=("Arial", 10, "bold")).pack(anchor="w", pady=4)
+        for model in ["Linear", "Ridge", "Lasso"]:
+            ttk.Radiobutton(left, text=model, variable=self.model_type_var,
+                            value=model, command=self._update_plot).pack(anchor="w")
+
+        ttk.Label(left, text="Alpha", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        ttk.Scale(left, from_=0.001, to=10.0, orient=tk.HORIZONTAL,
+                  variable=self.alpha_var, command=lambda _e: self._update_plot()).pack(fill="x")
+        self.alpha_lab = ttk.Label(left, text="")
+        self.alpha_lab.pack(anchor="w")
+
+        ttk.Label(left, text="Test size", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        ttk.Scale(left, from_=0.1, to=0.9, orient=tk.HORIZONTAL,
+                  variable=self.test_size_var, command=lambda _e: self._update_plot()).pack(fill="x")
+        self.test_lab = ttk.Label(left, text="")
+        self.test_lab.pack(anchor="w")
+
+        ttk.Label(left, text="Bruit σ", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        ttk.Scale(left, from_=0.0, to=10.0, orient=tk.HORIZONTAL,
+                  variable=self.noise_var, command=lambda _e: self._update_noise()).pack(fill="x")
+        self.noise_lab = ttk.Label(left, text="")
+        self.noise_lab.pack(anchor="w")
+
+        ttk.Button(left, text="Régénérer données", command=self._regen).pack(fill="x", pady=6)
+
+        self.fig_reg = Figure(figsize=(8, 6), dpi=100)
+        self.canvas_reg = FigureCanvasTkAgg(self.fig_reg, master=right)
+        self.canvas_reg.get_tk_widget().pack(fill="both", expand=True)
+
+    def _regen(self):
+        self.seed += 1
+        np.random.seed(self.seed)
+        self._update_plot()
+
+    def _update_noise(self):
+        self._update_plot()
+
+    def _generate_data(self):
+        self.y = 2.5 * self.X.flatten() + 5 + np.random.randn(len(self.X)) * self.noise_var.get()
+
+    def _update_plot(self):
+        try:
+            self.alpha_lab.config(text=f"α = {self.alpha_var.get():.4f}")
+            self.test_lab.config(text=f"Test size = {self.test_size_var.get():.2f}")
+            self.noise_lab.config(text=f"Bruit σ = {self.noise_var.get():.2f}")
+            self._generate_data()
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                self.X, self.y, test_size=self.test_size_var.get(), random_state=42
+            )
+            model_type = self.model_type_var.get()
+            alpha = self.alpha_var.get()
+            if model_type == "Linear":
+                model = LinearRegression()
+            elif model_type == "Ridge":
+                model = Ridge(alpha=alpha)
+            else:
+                model = Lasso(alpha=alpha, max_iter=10000)
+
+            model.fit(X_train, y_train)
+            y_train_pred = model.predict(X_train)
+            y_test_pred = model.predict(X_test)
+            y_all_pred = model.predict(self.X)
+
+            mse_train = mean_squared_error(y_train, y_train_pred)
+            mse_test = mean_squared_error(y_test, y_test_pred)
+            r2_train = r2_score(y_train, y_train_pred)
+            r2_test = r2_score(y_test, y_test_pred)
+
+            self.fig_reg.clear()
+            ax1 = self.fig_reg.add_subplot(2, 2, 1)
+            ax2 = self.fig_reg.add_subplot(2, 2, 2)
+            ax3 = self.fig_reg.add_subplot(2, 2, 3)
+            ax4 = self.fig_reg.add_subplot(2, 2, 4)
+
+            ax1.scatter(X_train, y_train, color='blue', s=30, alpha=0.6, label='Train')
+            ax1.scatter(X_test, y_test, color='orange', s=30, alpha=0.6, label='Test')
+            ax1.plot(self.X, y_all_pred, color='red', linewidth=2, label='Modèle')
+            ax1.set_title(f'{model_type} (α={alpha:.3f})')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+
+            residuals_train = y_train - y_train_pred
+            ax2.scatter(X_train, residuals_train, color='green', s=30, alpha=0.6)
+            ax2.axhline(y=0, color='red', linestyle='--', linewidth=2)
+            ax2.set_title('Résidus Train')
+            ax2.grid(True, alpha=0.3)
+
+            residuals_all = self.y - y_all_pred
+            ax3.hist(residuals_all, bins=20, color='purple', alpha=0.7, edgecolor='black')
+            ax3.axvline(x=0, color='red', linestyle='--', linewidth=2)
+            ax3.set_title('Distribution résidus')
+            ax3.grid(True, alpha=0.3, axis='y')
+
+            ax4.axis('off')
+            metrics_text = (
+                f"MSE Train: {mse_train:.4f}\n"
+                f"MSE Test:  {mse_test:.4f}\n"
+                f"R2 Train :  {r2_train:.4f}\n"
+                f"R2 Test  :  {r2_test:.4f}\n"
+                f"Slope    :  {model.coef_[0]:.4f}\n"
+                f"Intercept:  {model.intercept_:.4f}\n"
+            )
+            ax4.text(0.05, 0.5, metrics_text, transform=ax4.transAxes,
+                     fontfamily='monospace', fontsize=10, va='center',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+            self.fig_reg.tight_layout()
+            self.canvas_reg.draw_idle()
+        except Exception:
+            # keep silent to avoid crashing main UI
             pass
 
     def _send_ai_metric(self, rows: int, chunk_size: int):
@@ -586,14 +746,14 @@ class CVOptimizationGUI:
         self.stop_btn.config(state=tk.NORMAL)
         self.status_label.config(text='En cours...', fg='#f57f17')
         self.ui_shell.set_status("Running")
-        for k in ("load", "prep", "transit", "grid", "overall"):
+        for k in ("load", "transit_load", "prep", "transit_mid", "grid", "transit_grid", "overall"):
             self.ui_shell.set_stage_progress(k, 0.0)
         self.ui_shell.set_overall_progress(0.0)
         self.ui_shell.set_best_score("--")
         self.ui_shell.set_ai_recommendation("Waiting...")
         self._ui_tasks("Load → Prep → Grid → Reports")
         self._reset_thread_bars()
-        for key in ("load", "prep", "transit", "grid", "reports"):
+        for key in ("load", "transit_load", "prep", "transit_mid", "grid", "transit_grid", "reports"):
             self.stage_start[key] = time.time()
             self.stage_eta[key] = "ETA: --"
             self._ui_eta(key, "ETA: --")
@@ -853,15 +1013,38 @@ class CVOptimizationGUI:
                 return
             if not self.running:
                 return
+
+            # Transit entre load et prep
+            self.log_live('Transit: Load → Prep\n', 'info')
+            self._ui_stage("transit_load", 50.0)
+            self._ui_overall(10.0)
+            try:
+                self.ai_server.send_metrics(
+                    AIMetrics(
+                        timestamp=time.time(),
+                        num_workers=int(self.current_workers),
+                        chunk_size=int(self.current_chunk_size),
+                        rows_processed=0,
+                        ram_percent=float(psutil.virtual_memory().percent),
+                        cpu_percent=float(psutil.cpu_percent(interval=0.0)),
+                        throughput=0.0,
+                    )
+                )
+            except Exception:
+                pass
+            self._ui_stage("transit_load", 100.0)
+            self._update_stage_eta("transit_load", 1, 1)
+            self._maybe_checkpoint()
+            self._ui_stage("transit_load", 0.0)
             
             if not self.prepare_data():
                 return
             if not self.running:
                 return
             
-            # Transit phase (UI + AI heartbeat)
-            self.log_live('ETAPE 2.5: Transit\n', 'info')
-            self._ui_stage("transit", 50.0)
+            # Transit phase (UI + AI heartbeat) Prep → Grid
+            self.log_live('ETAPE 2.5: Transit Prep → Grid\n', 'info')
+            self._ui_stage("transit_mid", 50.0)
             self._ui_overall(50.0)
             try:
                 self.ai_server.send_metrics(
@@ -877,11 +1060,11 @@ class CVOptimizationGUI:
                 )
             except Exception:
                 pass
-            self._ui_stage("transit", 100.0)
-            self._update_stage_eta("transit", 1, 1)
+            self._ui_stage("transit_mid", 100.0)
+            self._update_stage_eta("transit_mid", 1, 1)
             self._maybe_checkpoint()
             # hide transit bar after completion
-            self._ui_stage("transit", 0.0)
+            self._ui_stage("transit_mid", 0.0)
 
             self.log_live('ETAPE 3: Grid Search\n\n', 'info')
             
@@ -973,7 +1156,14 @@ class CVOptimizationGUI:
                     mean_f1 = np.mean(f1_runs) if f1_runs else 0
                     params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
                     self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
+                    # show live params under the F1 chart
+                    self._set_live_params(name, params)
                     all_results.append({'params': params, 'f1': mean_f1})
+                    # live graph update
+                    try:
+                        self._update_live_graph(name, [r['f1'] for r in all_results])
+                    except Exception:
+                        pass
                     
                     if mean_f1 > best_score:
                         best_score = mean_f1
@@ -988,7 +1178,7 @@ class CVOptimizationGUI:
                             self.current_workers = new_workers
                             self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
                         new_chunk = int(self.current_chunk_size * rec.chunk_mult)
-                        self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
+                        self.current_chunk_size = max(MIN_CHUNK_SIZE, min(1_000_000, new_chunk))
                         self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
                         self._ui_ai_rec(rec.reason)
                     # checkpoint after each combo
@@ -1028,6 +1218,14 @@ class CVOptimizationGUI:
             self.generate_reports()
             self.log_live('\n' + '='*60 + '\n', 'info')
             self.log_live('GRID SEARCH TERMINEE\n', 'info')
+
+            # Transit Grid → Reports visualization
+            self._ui_stage("transit_grid", 50.0)
+            self._ui_overall(90.0)
+            self._ui_stage("transit_grid", 100.0)
+            self._update_stage_eta("transit_grid", 1, 1)
+            self._maybe_checkpoint()
+            self._ui_stage("transit_grid", 0.0)
             self.root.after(0, lambda: self.ui_shell.set_status("Completed"))
             self.add_alert('GRID SEARCH COMPLETE')
             self._ui_stage("grid", 100.0)
@@ -1078,70 +1276,14 @@ class CVOptimizationGUI:
 
     def show_graphs(self):
         """Affiche les graphiques scrollables"""
-        if not self.results:
-            messagebox.showinfo('Info', 'Pas de resultats')
-            return
-        
-        graph_window = tk.Toplevel(self.root)
-        graph_window.title('Graphiques - Hyperparamètres vs F1 Scores')
-        graph_window.geometry('1400x900')
-        
-        main_frame = tk.Frame(graph_window)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        canvas = tk.Canvas(main_frame, bg='white')
-        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg='white')
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        for model_name, results_data in self.results.items():
-            all_results = results_data['all_results']
-            
-            if not all_results:
-                continue
-            
-            fig = Figure(figsize=(13, 5), dpi=100)
-            ax = fig.add_subplot(111)
-            
-            x_labels = [str(i+1) for i in range(len(all_results))]
-            y_scores = [r['f1'] for r in all_results]
-            
-            ax.plot(x_labels, y_scores, 'o-', linewidth=2.5, markersize=8, color='#3498db')
-            ax.fill_between(range(len(y_scores)), y_scores, alpha=0.2, color='#3498db')
-            ax.set_xlabel('Combinaison Paramètres (#)', fontsize=11)
-            ax.set_ylabel('F1 Score', fontsize=11)
-            ax.set_title(f'{model_name} - Hyperparamètres vs F1 Score', fontsize=13, fontweight='bold')
-            ax.set_ylim([0, 1])
-            ax.grid(True, alpha=0.3)
-            
-            best_idx = np.argmax(y_scores)
-            best_params = all_results[best_idx]['params']
-            params_str = '\n'.join([f"{k}={v}" for k, v in list(best_params.items())[:3]])
-            
-            ax.text(0.02, 0.98, f'BEST (#{best_idx+1}):\n{params_str}...',
-                   transform=ax.transAxes, fontsize=10,
-                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='#ffffcc', alpha=0.9))
-            
-            fig.tight_layout()
-            
-            canvas_frame = tk.Frame(scrollable_frame, bg='white')
-            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
-            
-            canvas_plot = FigureCanvasTkAgg(fig, master=canvas_frame)
-            canvas_plot.draw()
-            canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        canvas.yview_moveto(0)
+        # Just raise the live window (already drawing incremental curves)
+        try:
+            if self.graph_window and self.graph_window.winfo_exists():
+                self.graph_window.deiconify()
+                self.graph_window.lift()
+                return
+        except Exception:
+            pass
 
 
 def main():
