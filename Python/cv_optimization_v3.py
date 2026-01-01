@@ -585,6 +585,9 @@ class CVOptimizationGUI:
             chunk_size = max(50_000, self.current_chunk_size)
             t_last = time.time()
             next_metrics_time = t_last
+            file_size = os.path.getsize(fichier)
+            est_total_rows = None
+            avg_bytes_per_row = None
             
             for chunk in pd.read_csv(fichier, low_memory=False, chunksize=chunk_size, encoding='utf-8'):
                 if not self.running:
@@ -592,6 +595,20 @@ class CVOptimizationGUI:
                 chunks.append(chunk)
                 total_rows += len(chunk)
                 self.log_live(f'+{len(chunk):,} (total {total_rows:,})\n', 'info')
+                # estimate total rows to drive progress/ETA
+                if avg_bytes_per_row is None:
+                    try:
+                        avg_bytes_per_row = max(float(chunk.memory_usage(deep=True).sum()) / max(len(chunk), 1), 1.0)
+                        est_total_rows = max(int(file_size / avg_bytes_per_row), len(chunk))
+                    except Exception:
+                        est_total_rows = None
+                # UI progress during load
+                if est_total_rows:
+                    pct = min(99.0, 100.0 * total_rows / max(est_total_rows, 1))
+                    self._ui_stage("load", pct)
+                    self._ui_overall(pct * 0.2)  # early weight so user sees motion
+                    self._ui_thread(0, pct, f"Load chunk {len(chunks)} ({total_rows:,}/{est_total_rows:,})", total_rows, est_total_rows)
+                    self._update_stage_eta("load", total_rows, est_total_rows)
                 
                 # metrics to AI server (adaptive cadence)
                 now = time.time()
