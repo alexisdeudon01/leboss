@@ -112,11 +112,11 @@ class MLEvaluationRunner:
             self.ui.add_stage("graphs", "Graphiques")
         if self.shell:
             for key, label in [
+                ("overall", "Overall"),
                 ("load", "Chargement"),
                 ("train", "Train/Eval"),
                 ("reports", "Rapports"),
                 ("graphs", "Graphiques"),
-                ("overall", "Overall"),
             ]:
                 self.shell.add_stage(key, label)
             self.shell.set_status("Idle")

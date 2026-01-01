@@ -19,8 +19,13 @@ class ConsolidationStyleShell:
         title: str = "Pipeline",
         stages: Iterable[tuple[str, str]] = (),
         thread_slots: int = 6,
+        parent: tk.Misc | None = None,
+        use_parent_main: bool = False,
     ) -> None:
-        self.root = tk.Toplevel()
+        if use_parent_main and parent is not None:
+            self.root = parent
+        else:
+            self.root = tk.Toplevel(parent) if parent is not None else tk.Tk()
         self.root.title(title)
         try:
             self.root.geometry("1500x950")
@@ -104,6 +109,7 @@ class ConsolidationStyleShell:
             self.stage_vars[key] = var
             self.stage_eta_vars[key] = eta_var
             r += 1
+        self._bars_frame = bars_frame
 
         # Thread progress
         threads_frame = tk.LabelFrame(self.root, text="Thread progress (never empty)", bg="#f8fafc")
@@ -160,6 +166,18 @@ class ConsolidationStyleShell:
     def set_stage_eta(self, key: str, eta_text: str) -> None:
         if key in self.stage_eta_vars:
             self.stage_eta_vars[key].set(eta_text)
+
+    def add_stage(self, key: str, label: str) -> None:
+        if key in self.stage_vars:
+            return
+        r = len(self.stage_vars) + 1
+        tk.Label(self._bars_frame, text=f"{label}:", bg="#f8fafc").grid(row=r, column=0, sticky="w", padx=4, pady=2)
+        var = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(self._bars_frame, variable=var, maximum=100.0).grid(row=r, column=1, sticky="ew", padx=4, pady=2)
+        eta_var = tk.StringVar(value="ETA: --")
+        tk.Label(self._bars_frame, textvariable=eta_var, bg="#f8fafc", fg="#6b7280").grid(row=r, column=2, sticky="w", padx=4)
+        self.stage_vars[key] = var
+        self.stage_eta_vars[key] = eta_var
 
     def update_thread(self, tid: int, value: float, msg: str | None = None) -> None:
         if tid in self.thread_vars:
