@@ -52,7 +52,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from ai_server_with_gui import AIOptimizationServer, Metrics as AIMetrics
+try:
+    from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
+except ImportError:
+    from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 # ============================================================
 # CONFIG
@@ -91,7 +94,7 @@ SMALL_FONT_BOLD = ("Arial", 9, "bold")
 TARGET_FLOAT_DTYPE = np.float32
 NPZ_FLOAT_DTYPE = np.float64  # safer for very large magnitudes during NPZ build
 
-# ============================================================
+# ======================================================= =====
 # Helpers
 # ============================================================
 
@@ -115,6 +118,192 @@ def _human_bytes(n: float) -> str:
 # ============================================================
 # UI Canvas Feed
 # ============================================================
+
+# ============================================================
+# Multiprocessing worker (top-level picklable)
+# ============================================================
+def mp_count_csv_rows_fast(path: str, max_lines: int = 2_000_000) -> int:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            n = 0
+            for n, _ in enumerate(f, 1):
+                if n >= max_lines:
+                    return max_lines
+        return max(0, n - 1)
+    except Exception:
+        return 0
+
+def mp_optimize_dtypes(df: "pd.DataFrame") -> "pd.DataFrame":
+    try:
+        int_cols = df.select_dtypes(include=["int64", "int32"]).columns
+        float_cols = df.select_dtypes(include=["float64"]).columns
+        obj_cols = df.select_dtypes(include=["object"]).columns
+
+        if len(int_cols) > 0:
+            df[int_cols] = df[int_cols].apply(pd.to_numeric, downcast="integer")
+        if len(float_cols) > 0:
+            df[float_cols] = df[float_cols].apply(pd.to_numeric, downcast="float").astype(TARGET_FLOAT_DTYPE)
+
+        for col in obj_cols:
+            try:
+                nunq = int(df[col].nunique(dropna=False))
+                if nunq / max(len(df[col]), 1) < 0.5 or nunq < 50:
+                    df[col] = df[col].astype("category")
+            except Exception:
+                pass
+        return df
+    except Exception:
+        return df
+
+def mp_sanitize_chunk(df: "pd.DataFrame") -> "pd.DataFrame":
+    try:
+        num_cols = df.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            return df
+        df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
+        df[num_cols] = df[num_cols].clip(-1e6, 1e6)
+        return df
+    except Exception:
+        return df
+
+def mp_ensure_label_is_standard(df: "pd.DataFrame") -> "pd.DataFrame":
+    try:
+        for c in df.columns:
+            if str(c).strip().lower() == "label":
+                if c != "Label":
+                    df = df.rename(columns={c: "Label"})
+                return df
+        return df
+    except Exception:
+        return df
+
+def mp_split_train_test_streaming(df: "pd.DataFrame", train_ratio: float, counters: dict[str, tuple[int, int]]):
+    if "Label" not in df.columns:
+        mask = np.random.RandomState(42).rand(len(df)) < train_ratio
+        return df[mask].copy(), df[~mask].copy()
+
+    train_idx = []
+    test_idx = []
+    for i, lab in enumerate(df["Label"].astype(str).tolist()):
+        tr, te = counters.get(lab, (0, 0))
+        total = tr + te
+        desired_tr = int(round((total + 1) * train_ratio))
+        if tr < desired_tr:
+            train_idx.append(i)
+            counters[lab] = (tr + 1, te)
+        else:
+            test_idx.append(i)
+            counters[lab] = (tr, te + 1)
+
+    return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
+
+def mp_write_csv_append(path: str, df: "pd.DataFrame") -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_header = (not p.exists()) or p.stat().st_size == 0
+    df.to_csv(p, mode="a", header=write_header, index=False, encoding="utf-8")
+
+def mp_estimate_bytes_per_row(filepath: str) -> float:
+    try:
+        sample = pd.read_csv(filepath, nrows=2000, low_memory=False, memory_map=True)
+        sample = mp_optimize_dtypes(sample)
+        b = float(sample.memory_usage(deep=True).sum())
+        return b / max(len(sample), 1)
+    except Exception:
+        return 512.0
+
+def mp_estimate_chunk_size(filepath: str, *, workers_hint: int, min_chunk_size: int, max_chunk_size: int, chunk_multiplier: float, max_ram_percent: float) -> int:
+    vm = psutil.virtual_memory()
+    headroom = max((max_ram_percent / 100 * vm.total) - vm.used, vm.available * 0.5)
+    budget = max(headroom * 0.55, 64 * 1024 * 1024)
+
+    per_row = mp_estimate_bytes_per_row(filepath)
+    parallel_penalty = 1.0 + 0.12 * max(workers_hint - 1, 0)
+    est = int((budget / max(per_row, 1.0)) / parallel_penalty)
+
+    est = int(est * float(chunk_multiplier))
+
+    if vm.percent > 70:
+        est = int(est * 0.50)
+    elif vm.percent > 60:
+        est = int(est * 0.65)
+
+    chunk = max(int(min_chunk_size), min(int(max_chunk_size), int(est)))
+    return int(chunk)
+
+def mp_process_file_to_parts(
+    *,
+    filepath: str,
+    union_cols: list[str],
+    out_dir: str,
+    sample_rows: int | None,
+    workers_hint: int,
+    chunk_multiplier: float,
+    min_chunk_size: int,
+    max_chunk_size: int,
+    max_ram_percent: float,
+    train_ratio: float,
+) -> tuple[str, int, int]:
+    """Process one CSV into train/test part files (multiprocessing-safe)."""
+    p = Path(filepath)
+    file_key = _sha1(str(p.resolve()))
+    outp = Path(out_dir)
+    train_part = outp / f"train__{file_key}.csv"
+    test_part = outp / f"test__{file_key}.csv"
+
+    # resume
+    if train_part.exists() and test_part.exists() and train_part.stat().st_size > 0:
+        tr = mp_count_csv_rows_fast(str(train_part))
+        te = mp_count_csv_rows_fast(str(test_part))
+        return filepath, tr, te
+
+    counters: dict[str, tuple[int, int]] = {}
+    train_written = 0
+    test_written = 0
+
+    chunk_size = mp_estimate_chunk_size(
+        filepath,
+        workers_hint=workers_hint,
+        min_chunk_size=min_chunk_size,
+        max_chunk_size=max_chunk_size,
+        chunk_multiplier=chunk_multiplier,
+        max_ram_percent=max_ram_percent,
+    )
+
+    # small file: no chunking
+    if sample_rows is not None:
+        df = pd.read_csv(filepath, nrows=int(sample_rows), low_memory=False, memory_map=True)
+        df = mp_optimize_dtypes(mp_ensure_label_is_standard(df))
+        df = mp_sanitize_chunk(df)
+        df = df.reindex(columns=union_cols)
+        if "Label" in df.columns:
+            df = df.dropna(subset=["Label"])
+        tr_df, te_df = mp_split_train_test_streaming(df, train_ratio, counters)
+        if len(tr_df) > 0:
+            mp_write_csv_append(str(train_part), tr_df)
+        if len(te_df) > 0:
+            mp_write_csv_append(str(test_part), te_df)
+        return filepath, int(len(tr_df)), int(len(te_df))
+
+    reader = pd.read_csv(filepath, chunksize=chunk_size, low_memory=False, memory_map=True)
+    for chunk in reader:
+        chunk = mp_optimize_dtypes(mp_ensure_label_is_standard(chunk))
+        chunk = mp_sanitize_chunk(chunk)
+        chunk = chunk.reindex(columns=union_cols)
+        if "Label" in chunk.columns:
+            chunk = chunk.dropna(subset=["Label"])
+
+        tr_df, te_df = mp_split_train_test_streaming(chunk, train_ratio, counters)
+        if len(tr_df) > 0:
+            mp_write_csv_append(str(train_part), tr_df)
+        if len(te_df) > 0:
+            mp_write_csv_append(str(test_part), te_df)
+
+        train_written += len(tr_df)
+        test_written += len(te_df)
+
+    return filepath, int(train_written), int(test_written)
+
 
 class CanvasFeed:
     """Scrollable feed based on Canvas -> Frame -> Labels (fast enough for logs)."""
@@ -466,11 +655,14 @@ class OptimizedDataProcessor:
         try:
             if not numeric_cols:
                 return df
-            df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
+            num_block = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+            num_block = num_block.replace([np.inf, -np.inf], np.nan)
             if clip_val is not None:
-                df[numeric_cols] = df[numeric_cols].clip(-clip_val, clip_val)
-            means = df[numeric_cols].mean(numeric_only=True)
-            df[numeric_cols] = df[numeric_cols].fillna(means).astype(dtype, copy=False)
+                num_block = num_block.clip(-clip_val, clip_val)
+            means = num_block.mean(numeric_only=True)
+            num_block = num_block.fillna(means)
+            num_block = num_block.fillna(0.0)
+            df[numeric_cols] = num_block.astype(dtype, copy=False)
             return df
         except Exception:
             return df
@@ -811,7 +1003,7 @@ class ConsolidationGUIEnhanced:
             max_chunk_size=MAX_CHUNK_SIZE,
             min_chunk_size=MIN_CHUNK_SIZE,
             max_ram_percent=MAX_RAM_PERCENT,
-            show_gui=True,  # ✅ NOW WORKS!
+            with_gui=False,
         )
 
         self.ai_server_thread = threading.Thread(
@@ -824,6 +1016,10 @@ class ConsolidationGUIEnhanced:
 
         self._ai_metrics_counter = 0
         self._ai_last_rows_seen = 0
+        self.session_log: list[dict[str, Any]] = []  # {t, action, workers, chunk}
+        self._last_tp_t = time.time()
+        self._last_tp_rows = 0
+        self._tp_5s = 0.0
         # ===== END AI =====
 
         self.ckpt_mgr = CheckpointManager(CHECKPOINT_FILE)
@@ -900,6 +1096,11 @@ class ConsolidationGUIEnhanced:
         # Controls
         control_frame = ttk.LabelFrame(top, text="Controls", padding=8)
         control_frame.pack(side="left", fill="x")
+
+        # Sessions (AI actions)
+        session_frame = ttk.Frame(top)
+        session_frame.pack(side="right", padx=(8, 0))
+        ttk.Button(session_frame, text="Session", command=self.open_session_picker).pack(anchor="e")
 
         self.start_button = ttk.Button(control_frame, text="▶ Start / Resume", command=self.start_consolidation)
         self.start_button.grid(row=0, column=0, padx=6, pady=4, sticky="ew")
@@ -1016,6 +1217,45 @@ class ConsolidationGUIEnhanced:
 
         if CHECKPOINT_FILE.exists():
             self.add_alert(f"Checkpoint found: stage={self.ckpt.stage} | completed_files={len(self.ckpt.completed_files)} | last={self.ckpt.last_update_ts}", "INFO")
+
+
+
+
+    def open_session_picker(self) -> None:
+        """List of AI decisions (time + action), newest first. Selecting applies (workers, chunk)."""
+        if not self.session_log:
+            messagebox.showinfo("Session", "No AI session yet.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Sessions")
+        win.geometry("720x140")
+        ttk.Label(win, text="Choose a session (newest first):").pack(anchor="w", padx=10, pady=(10, 4))
+
+        items = sorted(self.session_log, key=lambda s: s["t"], reverse=True)
+        values = [f"{datetime.fromtimestamp(s['t']).strftime('%H:%M:%S')} — {s['action']}" for s in items]
+        var = tk.StringVar(value=values[0] if values else "")
+        combo = ttk.Combobox(win, textvariable=var, values=values, state="readonly", width=84)
+        combo.pack(padx=10, pady=4, fill="x")
+
+        def _load():
+            idx = values.index(var.get()) if var.get() in values else None
+            if idx is None:
+                return
+            sess = items[idx]
+            ok = messagebox.askyesno("Confirm", f"Load this session?\n{var.get()}")
+            if not ok:
+                return
+            try:
+                self.processor.current_worker_cap = int(sess["workers"])
+                self.ensure_thread_bars(int(sess["workers"]))
+                self.processor.current_chunk_size = int(sess["chunk"])
+                self.log(f"[SESSION] loaded workers={sess['workers']} chunk={sess['chunk']}", "INFO")
+            except Exception as e:
+                self.log(f"[SESSION] failed to load: {e}", "WARN")
+            win.destroy()
+
+        ttk.Button(win, text="Load", command=_load).pack(side="right", padx=10, pady=10)
 
     def select_toniot(self) -> None:
         filepath = filedialog.askopenfilename(title="Select TON_IoT CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
@@ -1159,12 +1399,19 @@ class ConsolidationGUIEnhanced:
     def start_monitoring_loop(self) -> None:
         try:
             ram, cpu = self.monitor.record_metric()
-            _ = self.monitor.update_throughput()
+            # Throughput over a 5s window (as requested)
+            now = time.time()
+            if (now - self._last_tp_t) >= 5.0:
+                dt = max(now - self._last_tp_t, 1e-6)
+                dr = int(self.monitor.total_rows_seen - self._last_tp_rows)
+                self._tp_5s = float(dr) / float(dt)
+                self._last_tp_rows = int(self.monitor.total_rows_seen)
+                self._last_tp_t = now
             stats = self.monitor.get_stats()
 
             self.ram_var.set(f"{ram:.1f}% (peak {stats['ram_peak']:.1f}%)")
             self.cpu_var.set(f"{cpu:.1f}% (peak {stats['cpu_peak']:.1f}%)")
-            throughput = stats.get("rows_per_sec", 0.0)
+            throughput = float(getattr(self, "_tp_5s", stats.get("rows_per_sec", 0.0)))
             self.rps_var.set(f"Rows/s (5s): {throughput:,.0f}")
             self.rows_var.set(f"Rows seen: {stats['rows_seen']:,}")
             self.files_var.set(f"Files done: {stats['files_done']:,}")
@@ -1188,10 +1435,17 @@ class ConsolidationGUIEnhanced:
                 # Get recommendation (non-blocking)
                 rec = self.ai_server.get_recommendation(timeout=0.05)
                 if rec:
-                    self.log(
-                        f"[AI] Δworkers={rec.d_workers:+d} chunk×={rec.chunk_mult:.2f} | {rec.reason}",
-                        "INFO",
-                    )
+                    action_str = f"Δworkers={rec.d_workers:+d} chunk×={rec.chunk_mult:.2f} | {rec.reason}"
+                    self.log(f"[AI] {action_str}", "INFO")
+                    self.session_log.append({
+                        "t": float(rec.timestamp),
+                        "action": action_str,
+                        "workers": int(getattr(self.processor, "current_worker_cap", 1)),
+                        "chunk": int(getattr(self.processor, "current_chunk_size", MIN_CHUNK_SIZE)),
+                    })
+                    if len(self.session_log) > 300:
+                        self.session_log = self.session_log[-300:]
+
                     
                     try:
                         new_workers = max(1, min(MAX_THREADS, int(self.processor.current_worker_cap) + rec.d_workers))
@@ -1347,7 +1601,7 @@ class ConsolidationGUIEnhanced:
         total = len(cic_files)
         completed = done_already
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
         active = 0
         futures: dict[Any, tuple[str, int]] = {}
@@ -1355,7 +1609,9 @@ class ConsolidationGUIEnhanced:
         start = time.time()
         idx_iter = 0
 
-        with ThreadPoolExecutor(max_workers=self.processor.max_threads) as ex:
+        import multiprocessing as mp
+        mp_ctx = mp.get_context('spawn')
+        with ProcessPoolExecutor(max_workers=self.processor.max_threads, mp_context=mp_ctx) as ex:
             # submit loop
             while idx_iter < len(cic_files):
                 if self.stop_event.is_set():
@@ -1382,14 +1638,17 @@ class ConsolidationGUIEnhanced:
 
                 tid = (len(futures) % max(1, int(self.processor.current_worker_cap)))
                 fut = ex.submit(
-                    self.processor.process_file_to_parts,
-                    filepath=p,
-                    union_cols=union_cols,
-                    out_dir=PARTS_DIR,
+                    mp_process_file_to_parts,
+                    filepath=str(p),
+                    union_cols=list(union_cols),
+                    out_dir=str(PARTS_DIR),
                     sample_rows=sample_rows,
-                    callback=self._progress_callback(stage="CIC", stage_var=self.progress_cic, total_files=total),
-                    thread_id=tid,
-                    stop_flag=self.stop_event,
+                    workers_hint=max(1, int(self.processor.current_worker_cap)),
+                    chunk_multiplier=float(getattr(self.processor, "chunk_multiplier", 1.0)),
+                    min_chunk_size=int(getattr(self.processor, "min_chunk_size", MIN_CHUNK_SIZE)),
+                    max_chunk_size=int(getattr(self.processor, "max_chunk_size", MAX_CHUNK_SIZE)),
+                    max_ram_percent=float(getattr(self.processor, "max_ram_percent", MAX_RAM_PERCENT)),
+                    train_ratio=float(TRAIN_RATIO),
                 )
                 futures[fut] = (p, tid)
                 active += 1
@@ -1398,12 +1657,17 @@ class ConsolidationGUIEnhanced:
             for fut in as_completed(list(futures.keys())):
                 p, tid = futures.get(fut, ("unknown", 0))
                 active = max(0, active - 1)
-
                 try:
                     file_path, tr_rows, te_rows = fut.result()
                 except Exception:
                     self.log(f"[CIC] crash future {Path(p).name}:\n{traceback.format_exc()}", "ERROR")
                     continue
+
+                # multiprocessing: we track rows on completion (coarser but real)
+                try:
+                    self.monitor.track_rows(int(tr_rows) + int(te_rows))
+                except Exception:
+                    pass
 
                 completed += 1
                 self.monitor.track_file_done()
@@ -1712,3 +1976,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
