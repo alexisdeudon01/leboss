@@ -679,12 +679,19 @@ class CVOptimizationGUI:
                 numeric_cols.remove('Label')
             
             self.df = self.df.dropna(subset=['Label'])
+            # ensure labels are strings before any split
+            self.df['Label'] = self.df['Label'].astype(str)
             
             n_samples = int(len(self.df) * STRATIFIED_SAMPLE_RATIO)
             stratifier = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
-            for train_idx, _ in stratifier.split(self.df, self.df['Label']):
-                self.df = self.df.iloc[train_idx[:n_samples]]
-                break
+            try:
+                y_labels = self.df['Label'].to_numpy()
+                for train_idx, _ in stratifier.split(self.df, y_labels):
+                    self.df = self.df.iloc[train_idx[:n_samples]]
+                    break
+            except Exception as e:
+                self.log_live(f'[WARN] Stratified split failed: {e} -> simple sample\n', 'info')
+                self.df = self.df.iloc[:n_samples].copy()
             
             self.log_live(f'Dataset: {len(self.df):,} lignes\n', 'info')
             
