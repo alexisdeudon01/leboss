@@ -173,6 +173,19 @@ class ConsolidationStyleShell:
         )
         self.log_text.pack(fill="both", expand=True)
 
+    # Control bindings
+    def bind_start(self, callback) -> None:
+        try:
+            self.start_btn.config(command=callback)
+        except Exception:
+            pass
+
+    def bind_stop(self, callback) -> None:
+        try:
+            self.stop_btn.config(command=callback)
+        except Exception:
+            pass
+
     # Status/metrics
     def set_status(self, text: str) -> None:
         self.status_var.set(f"Status: {text}")

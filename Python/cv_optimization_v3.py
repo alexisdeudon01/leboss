@@ -74,6 +74,7 @@ NUM_CORES = multiprocessing.cpu_count()
 K_FOLD = 5
 STRATIFIED_SAMPLE_RATIO = 0.5
 RAM_THRESHOLD = 90.0
+MIN_CHUNK_SIZE = 10_000
 
 # GRID SEARCH CONFIGURATION
 PARAM_GRIDS = {
@@ -117,7 +118,7 @@ class MemoryManager:
             return 8
 
     @staticmethod
-    def get_optimal_chunk_size(total_size=None, min_chunk=100000, max_chunk=1000000):
+    def get_optimal_chunk_size(total_size=None, min_chunk=MIN_CHUNK_SIZE, max_chunk=1000000):
         """Calcule chunk size optimal basé sur RAM libre"""
         ram_free = MemoryManager.get_available_ram_gb()
         ram_usage = MemoryManager.get_ram_usage()
@@ -154,8 +155,11 @@ class CVOptimizationGUI:
             stages=[
                 ("overall", "Overall"),
                 ("load", "Load"),
+                ("transit_load", "Transit L→P"),
                 ("prep", "Prep"),
+                ("transit_mid", "Transit P→G"),
                 ("grid", "Grid"),
+                ("transit_grid", "Transit G→R"),
                 ("graphs", "Graphs"),
             ],
             thread_slots=4,
@@ -221,20 +225,29 @@ class CVOptimizationGUI:
             self.graph_window.geometry("800x600")
         except Exception:
             pass
-        tk.Label(self.graph_window, text="Graphs window").pack(fill="both", expand=True, pady=20)
+        # Live graph (F1 progression per modèle)
+        self.fig_live = Figure(figsize=(7, 4), dpi=100)
+        self.ax_live = self.fig_live.add_subplot(111)
+        self.ax_live.set_title("F1 en temps réel")
+        self.ax_live.set_xlabel("Combinaison #")
+        self.ax_live.set_ylabel("F1 pondéré")
+        self.canvas_live = FigureCanvasTkAgg(self.fig_live, master=self.graph_window)
+        self.canvas_live.get_tk_widget().pack(fill="both", expand=True)
+        self.live_curves: dict[str, list[float]] = {}
 
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
             max_workers=1,
             max_chunk_size=1_000_000,
-            min_chunk_size=50_000,
+            min_chunk_size=MIN_CHUNK_SIZE,
             max_ram_percent=90.0,
             with_gui=False,
         )
         self.ai_server_thread = threading.Thread(target=self.ai_server.run, daemon=True, name="AIOptimizationServer")
         self.ai_server_thread.start()
         self.rows_seen = 0
-        self.current_chunk_size = MemoryManager.get_optimal_chunk_size()
+        self.current_chunk_size = MemoryManager.get_optimal_chunk_size(min_chunk=MIN_CHUNK_SIZE)
+        self.last_ckpt_ts = time.time()
 
     # -------------------- UI safe setters (main thread) --------------------
     def _ui_stage(self, key: str, val: float):
@@ -264,6 +277,25 @@ class CVOptimizationGUI:
     def _ui_tasks(self, text: str):
         self.root.after(0, lambda: self.ui_shell.set_tasks(text))
 
+    def _update_live_graph(self, model: str, f1_values: list[float]):
+        """Update live graph window with latest F1 progression."""
+        try:
+            self.live_curves[model] = list(f1_values)
+            self.ax_live.clear()
+            for name, vals in self.live_curves.items():
+                xs = list(range(1, len(vals) + 1))
+                if not xs:
+                    continue
+                self.ax_live.plot(xs, vals, marker="o", label=name)
+            self.ax_live.set_title("F1 en temps réel")
+            self.ax_live.set_xlabel("Combinaison #")
+            self.ax_live.set_ylabel("F1 pondéré")
+            self.ax_live.legend(loc="lower right", fontsize=8)
+            self.ax_live.grid(alpha=0.3)
+            self.canvas_live.draw_idle()
+        except Exception:
+            pass
+
     def _send_ai_metric(self, rows: int, chunk_size: int):
         try:
             ram = psutil.virtual_memory().percent
@@ -291,7 +323,7 @@ class CVOptimizationGUI:
                     self.current_workers = new_workers
                     self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
                 new_chunk = int(self.current_chunk_size * rec.chunk_mult)
-                self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
+                self.current_chunk_size = max(MIN_CHUNK_SIZE, min(1_000_000, new_chunk))
                 self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
                 self.ui_shell.set_ai_recommendation(rec.reason)
                 # surface throughput + server instruction
@@ -325,9 +357,18 @@ class CVOptimizationGUI:
             self.ckpt["current_chunk_size"] = self.current_chunk_size
             self.ckpt["completed_ops"] = self.completed_operations
             self.checkpoint_path.write_text(json.dumps(self.ckpt, indent=2), encoding="utf-8")
+            self.last_ckpt_ts = time.time()
         except Exception:
             if force:
                 raise
+
+    def _maybe_checkpoint(self, force: bool = False):
+        """Checkpoint every 10 minutes or when forced."""
+        if force or (time.time() - getattr(self, "last_ckpt_ts", 0) >= 600):
+            try:
+                self._write_checkpoint(force=False)
+            except Exception:
+                pass
 
     def setup_ui(self):
         """Setup UI"""
@@ -448,13 +489,18 @@ class CVOptimizationGUI:
             except Exception:
                 pass
 
-    def add_alert(self, msg):
-        """Thread-safe alert entry."""
+    def add_alert(self, msg, level="INFO"):
+        """Thread-safe alert entry + audible bell on warnings/errors."""
         def _append():
             try:
                 self.alerts_text.insert(tk.END, f'• {msg}\n')
                 self.alerts_text.see(tk.END)
-                self.ui_shell.add_alert(msg, "INFO")
+                self.ui_shell.add_alert(msg, level)
+                if level.upper() in {"WARN", "ERROR"} or "error" in msg.lower():
+                    try:
+                        self.root.bell()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if threading.current_thread() is threading.main_thread():
@@ -471,6 +517,8 @@ class CVOptimizationGUI:
             cpu = psutil.cpu_percent(interval=0.1)
             if ram >= 90.0:
                 self.add_alert(f"RAM >=90% ({ram:.1f}%)", "WARN")
+            if cpu >= 95.0:
+                self.add_alert(f"CPU >=95% ({cpu:.1f}%)", "WARN")
             
             self.ram_label.config(text=f'{ram:.1f}%')
             self.ram_progress['value'] = ram
@@ -510,6 +558,11 @@ class CVOptimizationGUI:
             self.root.after(500, self.update_stats)
         except:
             self.root.after(500, self.update_stats)
+        finally:
+            try:
+                self._maybe_checkpoint()
+            except Exception:
+                pass
 
     def start_optimization(self):
         if self.running:
@@ -533,14 +586,14 @@ class CVOptimizationGUI:
         self.stop_btn.config(state=tk.NORMAL)
         self.status_label.config(text='En cours...', fg='#f57f17')
         self.ui_shell.set_status("Running")
-        for k in ("load", "prep", "grid", "overall"):
+        for k in ("load", "prep", "transit", "grid", "overall"):
             self.ui_shell.set_stage_progress(k, 0.0)
         self.ui_shell.set_overall_progress(0.0)
         self.ui_shell.set_best_score("--")
         self.ui_shell.set_ai_recommendation("Waiting...")
         self._ui_tasks("Load → Prep → Grid → Reports")
         self._reset_thread_bars()
-        for key in ("load", "prep", "grid", "reports"):
+        for key in ("load", "prep", "transit", "grid", "reports"):
             self.stage_start[key] = time.time()
             self.stage_eta[key] = "ETA: --"
             self._ui_eta(key, "ETA: --")
@@ -590,7 +643,7 @@ class CVOptimizationGUI:
             
             chunks = []
             total_rows = 0
-            chunk_size = max(50_000, self.current_chunk_size)
+            chunk_size = max(MIN_CHUNK_SIZE, self.current_chunk_size)
             t_last = time.time()
             next_metrics_time = t_last
             file_size = os.path.getsize(fichier)
@@ -641,7 +694,7 @@ class CVOptimizationGUI:
                         rec = self.ai_server.get_recommendation(timeout=0.02)
                         if rec:
                             new_chunk = int(chunk_size * rec.chunk_mult)
-                            chunk_size = max(20_000, min(1_000_000, new_chunk))
+                            chunk_size = max(MIN_CHUNK_SIZE, min(1_000_000, new_chunk))
                             self.current_chunk_size = chunk_size
                             new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
                             if new_workers != self.current_workers:
@@ -664,9 +717,15 @@ class CVOptimizationGUI:
             self.files_done += 1
             self._ui_stage("load", 100.0)
             self._update_stage_eta("load", 1, 1)
+            self._maybe_checkpoint()
             return True
         except Exception as e:
             self.log_live(f'Erreur: {e}\n', 'info')
+            self.add_alert(f'Load failed: {e}', "ERROR")
+            try:
+                self.root.bell()
+            except Exception:
+                pass
             return False
 
     def prepare_data(self):
@@ -708,6 +767,10 @@ class CVOptimizationGUI:
             
             # Extract features X
             X = self.df[numeric_cols].copy()
+            try:
+                X = X.apply(pd.to_numeric, errors="coerce")
+            except Exception as e:
+                self.log_live(f'WARN: to_numeric failed {e}\n', 'info')
             
             # ✅ FILL NaN with column mean (REQUIRED)
             self.log_live('Filling NaN values with column mean...\n', 'info')
@@ -759,12 +822,17 @@ class CVOptimizationGUI:
             self.rows_seen += len(self.X_scaled)
             self._ui_stage("prep", 100.0)
             self._update_stage_eta("prep", 1, 1)
+            self._maybe_checkpoint()
             del self.df, X
             gc.collect()
             return True
         except Exception as e:
             self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
             self.add_alert(f'Prep failed: {e}')
+            try:
+                self.root.bell()
+            except Exception:
+                pass
             return False
 
     def generate_param_combinations(self, model_name):
@@ -791,6 +859,30 @@ class CVOptimizationGUI:
             if not self.running:
                 return
             
+            # Transit phase (UI + AI heartbeat)
+            self.log_live('ETAPE 2.5: Transit\n', 'info')
+            self._ui_stage("transit", 50.0)
+            self._ui_overall(50.0)
+            try:
+                self.ai_server.send_metrics(
+                    AIMetrics(
+                        timestamp=time.time(),
+                        num_workers=int(self.current_workers),
+                        chunk_size=int(self.current_chunk_size),
+                        rows_processed=0,
+                        ram_percent=float(psutil.virtual_memory().percent),
+                        cpu_percent=float(psutil.cpu_percent(interval=0.0)),
+                        throughput=0.0,
+                    )
+                )
+            except Exception:
+                pass
+            self._ui_stage("transit", 100.0)
+            self._update_stage_eta("transit", 1, 1)
+            self._maybe_checkpoint()
+            # hide transit bar after completion
+            self._ui_stage("transit", 0.0)
+
             self.log_live('ETAPE 3: Grid Search\n\n', 'info')
             
             model_configs = {
@@ -906,7 +998,7 @@ class CVOptimizationGUI:
                     self.ckpt["current_workers"] = self.current_workers
                     self.ckpt["current_chunk_size"] = self.current_chunk_size
                     self.ckpt["completed_ops"] = self.completed_operations
-                    self._write_checkpoint(force=False)
+                    self._maybe_checkpoint()
                 
                 # persist results for this model
                 self.results[name] = {
@@ -945,6 +1037,11 @@ class CVOptimizationGUI:
         except Exception as e:
             self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
             self.root.after(0, lambda: self.ui_shell.set_status("Erreur"))
+            self.add_alert(f'Run crashed: {e}', "ERROR")
+            try:
+                self.root.bell()
+            except Exception:
+                pass
         
         finally:
             self._write_checkpoint(force=True)
