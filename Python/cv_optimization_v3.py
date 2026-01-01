@@ -29,7 +29,8 @@ import numpy as np
 import pandas as pd
 from consolidation_style_shell import ConsolidationStyleShell
 from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
-
+from cv_graphics_window_v2_revised import CVGraphicsWindowV2
+from cv_graphics_window_v2_revised import CVGraphicsWindowV2
 NPZ_FLOAT_DTYPE = np.float64
 
 def _normalize_label_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -212,14 +213,9 @@ class CVOptimizationGUI:
         self.graphs_btn = self.ui_shell.reset_btn  # placeholder, not used
         self.thread_slots = len(self.ui_shell.thread_vars)
 
-        # single graphs window (no extra placeholders)
-        self.graph_window = tk.Toplevel(self.root)
-        self.graph_window.title("Graphs")
-        try:
-            self.graph_window.geometry("800x600")
-        except Exception:
-            pass
-        tk.Label(self.graph_window, text="Graphs window").pack(fill="both", expand=True, pady=20)
+        # graph window will be created on demand with CVGraphicsWindowV2
+        self.graph_window = None
+        self.graph_ui = None
 
         # AI optimization server (headless)
         self.ai_server = AIOptimizationServer(
@@ -416,12 +412,8 @@ class CVOptimizationGUI:
                                   padx=15, pady=8, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        self.graphs_btn = tk.Button(btn_frame, text='Voir Graphiques',
-                                    command=self.show_graphs,
-                                    bg='#3498db', fg='white',
-                                    font=('Arial', 11, 'bold'),
-                                    padx=15, pady=8, state=tk.DISABLED)
-        self.graphs_btn.pack(side=tk.LEFT, padx=5)
+        # Pas de bouton "Voir Graphiques" (fenêtre graphes lancée autrement si besoin)
+        self.graphs_btn = None
         
         self.status_label = tk.Label(footer, text='Prêt',
                                      font=('Arial', 10, 'bold'),
@@ -446,13 +438,13 @@ class CVOptimizationGUI:
             except Exception:
                 pass
 
-    def add_alert(self, msg):
+    def add_alert(self, msg, level: str = "INFO"):
         """Thread-safe alert entry."""
         def _append():
             try:
                 self.alerts_text.insert(tk.END, f'• {msg}\n')
                 self.alerts_text.see(tk.END)
-                self.ui_shell.add_alert(msg, "INFO")
+                self.ui_shell.add_alert(msg, level.upper() if isinstance(level, str) else "INFO")
             except Exception:
                 pass
         if threading.current_thread() is threading.main_thread():
@@ -555,6 +547,11 @@ class CVOptimizationGUI:
         self.log_live('Hyperparamètres variables par algo\n\n', 'info')
         
         self.start_time = time.time()
+        # open graph window immediately (even if results empty)
+        try:
+            self.show_graphs()
+        except Exception:
+            pass
         # Launch optimization in background to keep UI responsive
         self.worker_thread = threading.Thread(target=self.run_optimization, daemon=True, name="CVOptiWorker")
         self.worker_thread.start()
@@ -662,48 +659,157 @@ class CVOptimizationGUI:
             return False
 
     def prepare_data(self):
+        """ETAPE 2: Preparation des donnees (FIXED)"""
         try:
             self.log_live('ETAPE 2: Preparation\n', 'info')
             
+            # Step 1: Normalize Label column name
+            if 'Label' not in self.df.columns:
+                for col in self.df.columns:
+                    if str(col).strip().lower() == 'label':
+                        self.df = self.df.rename(columns={col: 'Label'})
+                        self.log_live(f'Renamed column {col} -> Label\n', 'info')
+                        break
+            
+            # Step 2: Select numeric columns
             numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
             if 'Label' in numeric_cols:
                 numeric_cols.remove('Label')
             
-            self.df = self.df.dropna(subset=['Label'])
+            if not numeric_cols:
+                self.log_live('ERROR: No numeric columns found!\n', 'error')
+                self.add_alert('No numeric columns found', 'error')
+                return False
             
+            self.log_live(f'Dataset: {len(self.df):,} rows | {len(numeric_cols)} numeric features\n', 'info')
+            
+            # Step 3: Drop rows without Label
+            if 'Label' in self.df.columns:
+                original_rows = len(self.df)
+                self.df = self.df.dropna(subset=['Label'])
+                self.df['Label'] = self.df['Label'].astype(str)
+                dropped = original_rows - len(self.df)
+                if dropped > 0:
+                    self.log_live(f'Dropped {dropped:,} rows without Label\n', 'info')
+                self.log_live(f'Labels: {self.df["Label"].nunique()} unique classes\n', 'info')
+            else:
+                self.log_live('ERROR: Label column not found!\n', 'error')
+                self.add_alert('Label column not found', 'error')
+                return False
+            
+            # Step 4: Stratified sampling (only if >=2 classes), else simple head sample
             n_samples = int(len(self.df) * STRATIFIED_SAMPLE_RATIO)
-            stratifier = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
-            for train_idx, _ in stratifier.split(self.df, self.df['Label']):
-                self.df = self.df.iloc[train_idx[:n_samples]]
-                break
+            unique_classes = self.df["Label"].unique()
+            if len(unique_classes) >= 2 and len(self.df) > n_samples:
+                self.log_live(f'Sampling (stratified): {n_samples:,} / {len(self.df):,} rows\n', 'info')
+                stratifier = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+                try:
+                    for train_idx, _ in stratifier.split(self.df, self.df['Label']):
+                        self.df = self.df.iloc[train_idx[:n_samples]]
+                        break
+                except Exception as e:
+                    self.log_live(f'[WARN] Stratified sample failed: {e}; fallback to simple sample\n', 'info')
+                    self.df = self.df.iloc[:n_samples].copy()
+            elif len(self.df) > n_samples:
+                self.log_live(f'Sampling (simple): {n_samples:,} / {len(self.df):,} rows\n', 'info')
+                self.df = self.df.iloc[:n_samples].copy()
             
-            self.log_live(f'Dataset: {len(self.df):,} lignes\n', 'info')
+            self.log_live(f'After sampling: {len(self.df):,} rows\n', 'info')
             
-            X = self.df[numeric_cols].astype(NPZ_FLOAT_DTYPE).copy()
-            X = X.fillna(X.mean())
+            # ✅ CRITICAL STEP: Clean infinity and extreme values FIRST
+            self.log_live('Cleaning infinity and extreme values...\n', 'info')
+            for col in numeric_cols:
+                try:
+                    # Replace infinity with NaN (must be BEFORE dtype conversion)
+                    self.df[col] = self.df[col].replace([np.inf, -np.inf], np.nan)
+                    # Clip extreme values to ±1e6
+                    self.df[col] = self.df[col].clip(-1e6, 1e6)
+                except Exception as e:
+                    self.log_live(f'WARN: Error cleaning column {col}: {e}\n', 'warn')
             
+            # Step 5: Extract features X
+            X = self.df[numeric_cols].copy()
+            
+            # ✅ FILL NaN with column mean (REQUIRED)
+            self.log_live('Filling NaN values with column mean...\n', 'info')
+            for col in X.columns:
+                col_mean = X[col].mean()
+                if pd.isna(col_mean):
+                    # If entire column is NaN, use 0
+                    X[col] = X[col].fillna(0.0)
+                else:
+                    X[col] = X[col].fillna(col_mean)
+            
+            # Step 6: Convert to float64 then float32 (safe conversion)
+            self.log_live('Converting data types...\n', 'info')
+            try:
+                X = X.astype(np.float64)
+                X = X.astype(NPZ_FLOAT_DTYPE)  # float32
+            except Exception as e:
+                self.log_live(f'ERROR converting types: {e}\n', 'error')
+                self.add_alert(f'Type conversion failed: {e}', 'error')
+                return False
+            
+            # ✅ VALIDATE: Check no infinity/NaN remain
+            n_inf = np.isinf(X.values).sum()
+            n_nan = np.isnan(X.values).sum()
+            
+            if n_inf > 0 or n_nan > 0:
+                self.log_live(f'WARN: Found {n_inf} inf and {n_nan} NaN after cleaning!\n', 'warn')
+                # Final force fill
+                X = X.fillna(0.0)
+                X = X.replace([np.inf, -np.inf], 1e6)
+                self.log_live(f'Force-filled NaN/inf\n', 'info')
+            
+            self.log_live(f'Features validated (no inf/nan) ✓\n', 'info')
+            
+            # Step 7: Encode Label
             self.label_encoder = LabelEncoder()
-            self.y = self.label_encoder.fit_transform(self.df['Label'])
+            try:
+                self.y = self.label_encoder.fit_transform(self.df['Label'].astype(str))
+            except Exception as e:
+                self.log_live(f'ERROR encoding labels: {e}\n', 'error')
+                self.add_alert(f'Label encoding failed: {e}', 'error')
+                return False
             
+            self.log_live(f'Labels encoded: {len(self.label_encoder.classes_)} classes\n', 'info')
+            
+            # Step 8: Standardize features
             scaler = StandardScaler()
-            self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
+            try:
+                self.X_scaled = scaler.fit_transform(X).astype(NPZ_FLOAT_DTYPE)
+            except Exception as e:
+                self.log_live(f'ERROR standardizing: {e}\n', 'error')
+                self.add_alert(f'Scaling failed: {e}', 'error')
+                return False
             
-            self.log_live(f'Data normalisee: X={self.X_scaled.shape}\n', 'info')
+            self.log_live(f'Data standardized: X shape {self.X_scaled.shape}\n', 'info')
             
-            np.savez_compressed('preprocessed_dataset.npz',
-                               X=self.X_scaled,
-                               y=self.y,
-                               classes=self.label_encoder.classes_)
+            # Step 9: Save NPZ
+            try:
+                np.savez_compressed(
+                    'preprocessed_dataset.npz',
+                    X=self.X_scaled,
+                    y=self.y,
+                    classes=self.label_encoder.classes_
+                )
+                self.log_live(f'NPZ saved successfully\n\n', 'info')
+            except Exception as e:
+                self.log_live(f'WARN: NPZ save failed: {e}\n', 'warn')
             
-            self.log_live(f'NPZ sauvegarde\n\n', 'info')
             self.rows_seen += len(self.X_scaled)
             self._ui_stage("prep", 100.0)
             self._update_stage_eta("prep", 1, 1)
+            
+            # Cleanup
             del self.df, X
             gc.collect()
+            
             return True
+            
         except Exception as e:
-            self.log_live(f'Erreur: {e}\n', 'info')
+            self.log_live(f'ERREUR PREP: {e}\n{traceback.format_exc()}\n', 'error')
+            self.add_alert(f'Prep failed: {e}', 'error')
             return False
 
     def generate_param_combinations(self, model_name):
@@ -876,7 +982,6 @@ class CVOptimizationGUI:
             self.add_alert('GRID SEARCH COMPLETE')
             self._ui_stage("grid", 100.0)
             self._ui_overall(100.0)
-            self.root.after(0, lambda: self.graphs_btn.config(state=tk.NORMAL))
 
         except Exception as e:
             self.log_live(f'Erreur: {e}\n{traceback.format_exc()}\n', 'info')
@@ -916,71 +1021,26 @@ class CVOptimizationGUI:
             self.log_live(f'Erreur rapports: {e}\n', 'info')
 
     def show_graphs(self):
-        """Affiche les graphiques scrollables"""
-        if not self.results:
-            messagebox.showinfo('Info', 'Pas de resultats')
-            return
-        
-        graph_window = tk.Toplevel(self.root)
-        graph_window.title('Graphiques - Hyperparamètres vs F1 Scores')
-        graph_window.geometry('1400x900')
-        
-        main_frame = tk.Frame(graph_window)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        canvas = tk.Canvas(main_frame, bg='white')
-        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg='white')
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        for model_name, results_data in self.results.items():
-            all_results = results_data['all_results']
-            
-            if not all_results:
-                continue
-            
-            fig = Figure(figsize=(13, 5), dpi=100)
-            ax = fig.add_subplot(111)
-            
-            x_labels = [str(i+1) for i in range(len(all_results))]
-            y_scores = [r['f1'] for r in all_results]
-            
-            ax.plot(x_labels, y_scores, 'o-', linewidth=2.5, markersize=8, color='#3498db')
-            ax.fill_between(range(len(y_scores)), y_scores, alpha=0.2, color='#3498db')
-            ax.set_xlabel('Combinaison Paramètres (#)', fontsize=11)
-            ax.set_ylabel('F1 Score', fontsize=11)
-            ax.set_title(f'{model_name} - Hyperparamètres vs F1 Score', fontsize=13, fontweight='bold')
-            ax.set_ylim([0, 1])
-            ax.grid(True, alpha=0.3)
-            
-            best_idx = np.argmax(y_scores)
-            best_params = all_results[best_idx]['params']
-            params_str = '\n'.join([f"{k}={v}" for k, v in list(best_params.items())[:3]])
-            
-            ax.text(0.02, 0.98, f'BEST (#{best_idx+1}):\n{params_str}...',
-                   transform=ax.transAxes, fontsize=10,
-                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='#ffffcc', alpha=0.9))
-            
-            fig.tight_layout()
-            
-            canvas_frame = tk.Frame(scrollable_frame, bg='white')
-            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
-            
-            canvas_plot = FigureCanvasTkAgg(fig, master=canvas_frame)
-            canvas_plot.draw()
-            canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        canvas.yview_moveto(0)
+        """Affiche les graphiques avancés - Version 2"""
+        # Reuse existing graph window if still alive
+        try:
+            if self.graph_ui and getattr(self.graph_ui, "window", None) and self.graph_ui.window.winfo_exists():
+                self.graph_ui.window.lift()
+                self.graph_ui.window.focus_force()
+                return
+        except Exception:
+            pass
+
+        # Utiliser la nouvelle fenêtre graphique (ouvre même si résultats vides)
+        try:
+            self.graph_ui = CVGraphicsWindowV2(
+                parent=self.root,
+                results=self.results,
+                optimal_configs=self.optimal_configs
+            )
+            self.graph_window = getattr(self.graph_ui, "window", None)
+        except Exception as e:
+            messagebox.showerror('Erreur', f'Impossible d\'afficher les graphiques:\n{e}')
 
 
 def main():
