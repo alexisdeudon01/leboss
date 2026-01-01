@@ -723,6 +723,10 @@ class CVOptimizationGUI:
                 self.df = self.df.iloc[:n_samples].copy()
             
             self.log_live(f'After sampling: {len(self.df):,} rows\n', 'info')
+            try:
+                self._send_ai_metric(rows=len(self.df), chunk_size=max(1, self.current_chunk_size))
+            except Exception:
+                pass
             
             # ✅ CRITICAL STEP: Clean infinity and extreme values FIRST
             self.log_live('Cleaning infinity and extreme values...\n', 'info')
@@ -768,6 +772,10 @@ class CVOptimizationGUI:
                 X = X.fillna(0.0)
                 X = X.replace([np.inf, -np.inf], 1e6)
                 self.log_live(f'Force-filled NaN/inf\n', 'info')
+            try:
+                self._send_ai_metric(rows=len(X), chunk_size=max(1, self.current_chunk_size))
+            except Exception:
+                pass
             
             self.log_live(f'Features validated (no inf/nan) ✓\n', 'info')
             
