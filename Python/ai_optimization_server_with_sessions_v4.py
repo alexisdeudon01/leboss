@@ -251,6 +251,10 @@ class AIOptimizationServer:
         self.max_chunk_size = int(max_chunk_size)
         self.min_chunk_size = int(min_chunk_size)
         self.max_ram_percent = float(max_ram_percent)
+        # adaptive throughput window (sec)
+        self.tp_window_sec = 5.0
+        self.tp_window_min = 3.0
+        self.tp_window_max = 12.0
 
         self.metrics_queue: "queue.Queue[Metrics]" = queue.Queue(maxsize=20)
         self.recommendation_queue: "queue.Queue[Recommendation]" = queue.Queue(maxsize=5)
@@ -321,14 +325,32 @@ class AIOptimizationServer:
             try:
                 now_t = float(metrics.timestamp)
                 self._rows_window.append((now_t, int(metrics.rows_processed)))
-                while self._rows_window and (now_t - self._rows_window[0][0]) > 10.0:
+                # adaptive window prune
+                while self._rows_window and (now_t - self._rows_window[0][0]) > self.tp_window_sec:
                     self._rows_window.popleft()
-                score10 = float(sum(r for _t, r in self._rows_window))
+                score_window = float(sum(r for _t, r in self._rows_window))
+
+                # Adaptive window tuning based on throughput stability
+                inst_tp = metrics.throughput if metrics.throughput > 0 else (metrics.rows_processed / max(0.5, self.tp_window_sec))
+                if not hasattr(self, "_tp_samples"):
+                    self._tp_samples = deque(maxlen=8)
+                self._tp_samples.append(float(inst_tp))
+                if len(self._tp_samples) >= 4:
+                    mean_tp = float(np.mean(self._tp_samples))
+                    std_tp = float(np.std(self._tp_samples))
+                    cv = std_tp / mean_tp if mean_tp > 0 else 0.0
+                    if cv < 0.15 and self.tp_window_sec > self.tp_window_min:
+                        self.tp_window_sec = max(self.tp_window_min, self.tp_window_sec - 0.5)
+                    elif cv > 0.35 and self.tp_window_sec < self.tp_window_max:
+                        self.tp_window_sec = min(self.tp_window_max, self.tp_window_sec + 0.5)
+
+                score10 = score_window  # keep name for compatibility
+                score_norm = min(score_window / max(self.tp_window_sec * 50_000.0, 1.0), 1.0)
 
                 x = np.array([
                     min(metrics.ram_percent / 100.0, 1.0),
                     min(metrics.cpu_percent / 100.0, 1.0),
-                    min(score10 / 500_000.0, 1.0),
+                    score_norm,
                     metrics.num_workers / float(max(self.max_workers, 1)),
                     metrics.chunk_size / float(max(self.max_chunk_size, 1)),
                 ], dtype=np.float64)

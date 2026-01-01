@@ -39,6 +39,8 @@ from sklearn.metrics import f1_score, recall_score, precision_score, confusion_m
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import KFold
 import json
+from consolidation_style_shell import ConsolidationStyleShell
+from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 try:
     from progress_gui import GenericProgressGUI
@@ -46,6 +48,8 @@ try:
 except ImportError:
     HAS_GUI = False
     GenericProgressGUI = None
+
+from pipeline_ui_template import PipelineWindowTemplate
 
 NUM_CORES = multiprocessing.cpu_count()
 
@@ -81,25 +85,48 @@ class MemoryManager:
 
 # ============= ML EVALUATION RUNNER =============
 class MLEvaluationRunner:
-    def __init__(self, ui=None):
+    def __init__(self, ui=None, shell=None):
         self.ui = ui
+        self.shell = shell
         self.results = {}
         self.X_train = None
         self.y_train = None
         self.X_test = None
         self.y_test = None
         self.classes = None
+        self.current_workers = max(1, min(NUM_CORES, 4))
+        self.ai_server = AIOptimizationServer(
+            max_workers=4,
+            max_chunk_size=1_000_000,
+            min_chunk_size=50_000,
+            max_ram_percent=90.0,
+            with_gui=False,
+        )
+        self.ai_thread = threading.Thread(target=self.ai_server.run, daemon=True, name="AIOptimizationServer")
+        self.ai_thread.start()
         
         if self.ui:
             self.ui.add_stage("load", "Chargement train/test")
             self.ui.add_stage("train", "Entraînement + évaluation holdout")
             self.ui.add_stage("reports", "Rapports")
             self.ui.add_stage("graphs", "Graphiques")
+        if self.shell:
+            for key, label in [
+                ("overall", "Overall"),
+                ("load", "Chargement"),
+                ("train", "Train/Eval"),
+                ("reports", "Rapports"),
+                ("graphs", "Graphiques"),
+            ]:
+                self.shell.add_stage(key, label)
+            self.shell.set_status("Idle")
 
     def log(self, msg, level="INFO"):
         """Log compatible GUI + console"""
         if self.ui:
             self.ui.log(msg, level=level)
+        if self.shell:
+            self.shell.log(msg, level=level)
         else:
             ts = time.strftime("%H:%M:%S")
             print(f"[{ts}] [{level}] {msg}")
@@ -107,8 +134,29 @@ class MLEvaluationRunner:
     def log_alert(self, msg, level="error"):
         if self.ui:
             self.ui.log_alert(msg, level=level)
+        if self.shell:
+            self.shell.add_alert(msg, level)
         else:
             print(f"[ALERT] {msg}")
+
+    def _send_metrics(self, rows: int, chunk_size: int = 100_000, throughput: float | None = None):
+        try:
+            ram = psutil.virtual_memory().percent
+            cpu = psutil.cpu_percent(interval=0.0)
+            tp = throughput if throughput is not None else rows
+            self.ai_server.send_metrics(
+                AIMetrics(
+                    timestamp=time.time(),
+                    num_workers=int(self.current_workers),
+                    chunk_size=int(chunk_size),
+                    rows_processed=int(rows),
+                    ram_percent=float(ram),
+                    cpu_percent=float(cpu),
+                    throughput=float(tp),
+                )
+            )
+        except Exception:
+            pass
 
     def load_data(self):
         """Charge train et test avec gestion RAM"""
@@ -120,6 +168,9 @@ class MLEvaluationRunner:
             return False
         
         try:
+            if self.shell:
+                self.shell.set_status("Chargement")
+                self.shell.set_stage_progress("load", 0.0)
             t0 = time.time()
             
             # Nettoyer avant charge
@@ -133,6 +184,10 @@ class MLEvaluationRunner:
             self.log(f"Train NPZ chargé ({len(self.y_train):,} échantillons) en {time.time()-t0:.1f}s", level="OK")
             self.log(f"Classes: {list(self.classes)}", level="OK")
             self.log(f"RAM: {MemoryManager.get_ram_usage():.1f}%", level="DETAIL")
+            self._send_metrics(rows=len(self.y_train), chunk_size=min(len(self.y_train), 200_000))
+            rec = self.ai_server.get_recommendation(timeout=0.02)
+            if rec:
+                self.current_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
 
             # Charger test holdout
             if not os.path.exists("fusion_test_smart4.csv"):
@@ -167,12 +222,20 @@ class MLEvaluationRunner:
             lbl.classes_ = self.classes
             y_test_raw = df_test["Label"].astype(str).values
             self.y_test = lbl.transform(y_test_raw)
-            
+
             self.log(f"Test normalisé: X={self.X_test.shape}, y={len(self.y_test):,}", level="OK")
+            self._send_metrics(rows=len(self.y_test), chunk_size=min(len(self.y_test), 200_000))
+            rec = self.ai_server.get_recommendation(timeout=0.02)
+            if rec:
+                self.current_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
             
             if self.ui:
                 self.ui.update_stage("load", 1, 1, "Train/Test chargés")
                 self.ui.update_global(1, 4, f"Train {len(self.X_train):,} | Test {len(self.X_test):,}")
+            if self.shell:
+                self.shell.set_stage_progress("load", 100.0)
+                self.shell.set_overall_progress(25.0)
+                self.shell.set_stage_progress("overall", 25.0)
             
             # Nettoyer
             del df_test, X_test_raw
@@ -186,11 +249,14 @@ class MLEvaluationRunner:
     def train_eval(self):
         """K-Fold evaluation avec gestion RAM"""
         try:
+            if self.shell:
+                self.shell.set_status("Train/Eval")
+                self.shell.set_stage_progress("train", 0.0)
             models = [
-                ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)),
+                ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42, n_jobs=self.current_workers)),
                 ("Naive Bayes", GaussianNB()),
                 ("Decision Tree", DecisionTreeClassifier(random_state=42, max_depth=20, min_samples_split=10)),
-                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)),
+                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=self.current_workers)),
             ]
             
             kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -198,6 +264,12 @@ class MLEvaluationRunner:
             
             for i, (name, model) in enumerate(models, 1):
                 self.log(f"\n[MODEL {i}/{total}] {name}", level="OK")
+                if self.shell:
+                    progress = i / max(total, 1) * 100.0
+                    self.shell.set_stage_progress("train", progress)
+                    overall = 25.0 + 50.0 * (progress / 100.0)
+                    self.shell.set_overall_progress(overall)
+                    self.shell.set_stage_progress("overall", overall)
                 
                 f1_runs = []
                 recall_runs = []
@@ -241,6 +313,13 @@ class MLEvaluationRunner:
                     if self.ui:
                         self.ui.update_file_progress(f"{name}", int(fold / 5 * 100),
                                                     f"Fold {fold}/5 F1={f1:.4f}")
+                    self._send_metrics(rows=len(y_train_combined) + len(y_val), chunk_size=min(len(y_train_combined), 200_000))
+                    rec = self.ai_server.get_recommendation(timeout=0.02)
+                    if rec:
+                        new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                        if new_workers != self.current_workers:
+                            self.current_workers = new_workers
+                            self.log(f"[AI] workers->{new_workers} (reason: {rec.reason})", level="info")
                 
                 # Résultats finaux
                 mean_f1 = np.mean(f1_runs)
@@ -259,6 +338,11 @@ class MLEvaluationRunner:
                 if self.ui:
                     self.ui.update_stage("train", i, total, f"{name} F1={mean_f1:.4f}")
                     self.ui.update_global(1 + i / total, 4, f"Modèle {i}/{total}")
+            
+            if self.shell:
+                self.shell.set_stage_progress("train", 100.0)
+                self.shell.set_overall_progress(75.0)
+                self.shell.set_stage_progress("overall", 75.0)
             
             return True
         except Exception as e:
@@ -291,6 +375,10 @@ class MLEvaluationRunner:
             if self.ui:
                 self.ui.update_stage("reports", 1, 1, "Rapports OK")
                 self.ui.update_global(3, 4, "Rapports")
+            if self.shell:
+                self.shell.set_stage_progress("reports", 100.0)
+                self.shell.set_overall_progress(90.0)
+                self.shell.set_stage_progress("overall", 90.0)
             
             return True
         except Exception as e:
@@ -338,6 +426,11 @@ class MLEvaluationRunner:
             if self.ui:
                 self.ui.update_stage("graphs", 1, 1, "Graphiques OK")
                 self.ui.update_global(4, 4, "Terminé")
+            if self.shell:
+                self.shell.set_stage_progress("graphs", 100.0)
+                self.shell.set_overall_progress(100.0)
+                self.shell.set_stage_progress("overall", 100.0)
+                self.shell.set_status("Completed")
             
             return True
         except Exception as e:
@@ -356,56 +449,100 @@ def main():
         ui = GenericProgressGUI(title="ML Evaluation V3 - ADAPTÉ", 
                                header_info=f"Cores: {NUM_CORES}, RAM: {MemoryManager.get_available_ram_gb():.1f}GB", 
                                max_workers=4)
-        runner = MLEvaluationRunner(ui=ui)
+        shell = ConsolidationStyleShell(
+            title="ML Evaluation V3",
+            stages=[
+                ("overall", "Overall"),
+                ("load", "Load"),
+                ("train", "Train/Eval"),
+                ("reports", "Reports"),
+                ("graphs", "Graphs"),
+            ],
+            thread_slots=4,
+        )
+        runner = MLEvaluationRunner(ui=ui, shell=shell)
 
         def job():
             try:
+                shell.set_status("Running")
+                shell.set_overall_progress(0.0)
                 ui.update_global(0, 4, "Initialisation")
                 
                 if not runner.load_data():
                     ui.log_alert("Échec chargement données", level="error")
+                    shell.add_alert("Échec chargement données", level="ERROR")
                     return
                 
                 if not runner.train_eval():
                     ui.log_alert("Échec entraînement", level="error")
+                    shell.add_alert("Échec entraînement", level="ERROR")
                     return
                 
                 if not runner.save_reports():
                     ui.log_alert("Échec rapports", level="error")
+                    shell.add_alert("Échec rapports", level="ERROR")
                     return
                 
                 if not runner.save_graphs():
                     ui.log_alert("Échec graphiques", level="error")
+                    shell.add_alert("Échec graphiques", level="ERROR")
                     return
                 
                 ui.log_alert("Evaluation terminée avec succès!", level="success")
+                shell.add_alert("Evaluation terminée avec succès!", level="OK")
+                shell.set_status("Completed")
             except Exception as e:
                 ui.log_alert(f"Erreur: {e}", level="error")
+                shell.add_alert(f"Erreur: {e}", level="ERROR")
 
+        shell.bind_start(lambda: threading.Thread(target=job, daemon=True).start())
+        shell.bind_stop(lambda: shell.add_alert("Arrêt non implémenté", level="WARN"))
         threading.Thread(target=job, daemon=True).start()
         ui.start()
         return True
     else:
         print("[INFO] Mode console (progress_gui non disponible)\n")
-        runner = MLEvaluationRunner(ui=None)
+        shell = ConsolidationStyleShell(
+            title="ML Evaluation V3",
+            stages=[
+                ("overall", "Overall"),
+                ("load", "Load"),
+                ("train", "Train/Eval"),
+                ("reports", "Reports"),
+                ("graphs", "Graphs"),
+            ],
+            thread_slots=4,
+        )
+        runner = MLEvaluationRunner(ui=None, shell=shell)
         
-        if not runner.load_data():
-            print("[ERROR] Chargement données échouée")
-            return False
-        
-        if not runner.train_eval():
-            print("[ERROR] Entraînement échoué")
-            return False
-        
-        if not runner.save_reports():
-            print("[ERROR] Rapports échoué")
-            return False
-        
-        if not runner.save_graphs():
-            print("[ERROR] Graphiques échoué")
-            return False
-        
-        print("\n✅ Evaluation complétée avec succès!")
+        def console_job():
+            shell.set_status("Running")
+            if not runner.load_data():
+                print("[ERROR] Chargement données échouée")
+                shell.add_alert("Chargement données échouée", level="ERROR")
+                return
+            
+            if not runner.train_eval():
+                print("[ERROR] Entraînement échoué")
+                shell.add_alert("Entraînement échoué", level="ERROR")
+                return
+            
+            if not runner.save_reports():
+                print("[ERROR] Rapports échoué")
+                shell.add_alert("Rapports échoué", level="ERROR")
+                return
+            
+            if not runner.save_graphs():
+                print("[ERROR] Graphiques échoué")
+                shell.add_alert("Graphiques échoué", level="ERROR")
+                return
+            
+            print("\n✅ Evaluation complétée avec succès!")
+            shell.add_alert("Evaluation complétée avec succès!", level="OK")
+            shell.set_status("Completed")
+
+        shell.bind_start(lambda: threading.Thread(target=console_job, daemon=True).start())
+        threading.Thread(target=console_job, daemon=True).start()
         return True
 
 
