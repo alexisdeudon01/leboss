@@ -19,6 +19,7 @@ import time
 import gc
 import json
 import traceback
+import re
 import psutil
 import threading
 import multiprocessing
@@ -893,13 +894,153 @@ class CVOptimizationGUI:
             df_s = df_s.dropna(subset=['Label']).copy()
             df_s['Label'] = df_s['Label'].astype(str)
 
+
+            # ---- Label distribution (FULL DATASET) + benign/attack aggregate ----
+            full_label_counts = None
+            full_total_rows = None
+            benign_labels_detected = []
+
+            try:
+                label_col = 'Label'
+                if 'Label' not in df_s.columns:
+                    # find case-insensitive label col
+                    for c in df_s.columns:
+                        if str(c).lower() == 'label':
+                            label_col = c
+                            break
+
+                self.root.after(0, lambda: self.pref_status_var.set("Scan labels (dataset complet)…"))
+
+                counts: dict[str, int] = {}
+                total_rows = 0
+                last_ui = time.time()
+
+                # read only label column in chunks to get exact counts without loading everything
+                for chunk in pd.read_csv(
+                    fichier,
+                    usecols=[label_col],
+                    chunksize=max(200_000, int(self.current_chunk_size // 5) or 200_000),
+                    low_memory=False,
+                    encoding='utf-8',
+                ):
+                    if getattr(self, "pref_cancelled", False):
+                        return
+                    s = chunk[label_col].astype(str)
+                    vc_full = s.value_counts(dropna=False)
+                    for k, v in vc_full.items():
+                        ks = str(k)
+                        counts[ks] = counts.get(ks, 0) + int(v)
+                    total_rows += int(len(chunk))
+
+                    # lightweight progress updates
+                    now = time.time()
+                    if now - last_ui >= 0.6:
+                        if est_total_rows:
+                            pct = min(99.0, 100.0 * (total_rows / max(int(est_total_rows), 1)))
+                            self.root.after(0, lambda p=pct, tr=total_rows: self.pref_status_var.set(f"Scan labels: {p:.1f}% ({tr:,} lignes lues)"))
+                        else:
+                            self.root.after(0, lambda tr=total_rows: self.pref_status_var.set(f"Scan labels: {tr:,} lignes lues"))
+                        last_ui = now
+
+                full_label_counts = counts
+                full_total_rows = total_rows
+
+                # Detect BENIGN label(s) heuristically
+                keys = list(counts.keys())
+                all_int_like = True
+                for k in keys[:50]:
+                    if not re.fullmatch(r"-?\d+", str(k).strip()):
+                        all_int_like = False
+                        break
+
+                if all_int_like and "0" in counts:
+                    benign_labels_detected = ["0"]
+                else:
+                    # common in IDS datasets: BENIGN / NORMAL
+                    for k in keys:
+                        kl = str(k).strip().lower()
+                        if kl == "benign" or kl == "normal" or "benign" in kl or kl.startswith("normal"):
+                            benign_labels_detected.append(str(k))
+
+                benign_count = sum(counts.get(lbl, 0) for lbl in benign_labels_detected) if benign_labels_detected else 0
+                attack_count = int(total_rows - benign_count)
+
+                # Write summary
+                _info("\n=== Répartition Labels (dataset complet) ===\n")
+                _info(f"Total lignes (compté) S={total_rows:,}\n")
+                if benign_labels_detected:
+                    _info(f"Benign labels détectés: {benign_labels_detected}\n")
+                    _info(f"BENIGN: {benign_count:,} ({100.0*benign_count/max(total_rows,1):.2f}%)\n")
+                    _info(f"ATTACK/OTHER: {attack_count:,} ({100.0*attack_count/max(total_rows,1):.2f}%)\n")
+                else:
+                    _info("Benign label non détecté automatiquement (labels non standard).\n")
+
+                # Top / rare labels + % (limit to keep readable)
+                items_sorted = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                top_n = min(5, len(items_sorted))
+                rare_n = min(5, len(items_sorted))
+
+                def _fmt_rows(items):
+                    out = []
+                    for lbl, c in items:
+                        out.append(f"{lbl:<35} {c:>12,}  ({100.0*c/max(total_rows,1):>6.2f}%)")
+                    return "\n".join(out) + ("\n" if out else "")
+
+                _info("\nTop labels (dataset complet):\n")
+                _info(_fmt_rows(items_sorted[:top_n]))
+                # 'Others' bucket for readability
+                try:
+                    top_sum = sum(c for _lbl, c in items_sorted[:top_n])
+                    rest = int(total_rows - top_sum)
+                    if rest > 0:
+                        _info(f"{'OTHER_LABELS':<35} {rest:>12,}  ({100.0*rest/max(total_rows,1):>6.2f}%)\n")
+                except Exception:
+                    pass
+                _info("\nLabels rares (dataset complet):\n")
+                _info(_fmt_rows(sorted(items_sorted, key=lambda kv: (kv[1], kv[0]))[:rare_n]))
+
+                # Export full distribution for later inspection
+                try:
+                    import csv
+                    out_path = Path('label_distribution_full.csv')
+                    with out_path.open('w', newline='', encoding='utf-8') as _csvf:
+                        w = csv.writer(_csvf)
+                        w.writerow(['label', 'count', 'percent'])
+                        for _lbl, _c in items_sorted:
+                            w.writerow([_lbl, int(_c), 100.0*int(_c)/max(total_rows,1)])
+                    _info(f"\nFull distribution saved: {out_path.resolve()}\n")
+                except Exception:
+                    pass
+
+                # Show problematic singletons for stratify on FULL dataset
+                singletons = [lbl for lbl, c in items_sorted if c < 2]
+                if singletons:
+                    _info(f"\n⚠️ Classes avec <2 occurrences (dataset complet): {len(singletons)}\n")
+                    preview = singletons[:30]
+                    _info("Exemples: " + ", ".join(preview) + (" ..." if len(singletons) > 30 else "") + "\n")
+
+            except Exception as _e:
+                _info(f"\n[WARN] Scan labels complet impossible: {_e}\n")
+
             # ---- Label distribution (sample) + problematic classes for stratified split ----
             try:
                 vc = df_s['Label'].value_counts()
                 n_classes = int(len(vc))
                 min_count = int(vc.min()) if n_classes else 0
                 max_count = int(vc.max()) if n_classes else 0
+                _info("\n=== Répartition Labels (échantillon bench) ===\n")
+                _info("⚠️ NB: échantillon = premières lignes du CSV → si le fichier est trié, ça peut être TRÈS biaisé.\n")
                 _info(f"Classes (sample): {n_classes} | min={min_count} | max={max_count}\n")
+                try:
+                    if full_label_counts is not None:
+                        _full_min = int(full_label_counts.min()) if len(full_label_counts) else 0
+                        _full_max = int(full_label_counts.max()) if len(full_label_counts) else 0
+                        _info(f"Classes (dataset complet): {len(full_label_counts)} | min={_full_min} | max={_full_max} | total={int(full_total_rows or 0):,}\n")
+                        if full_benign_count is not None:
+                            _info(f"Binaire (dataset complet) → BENIGN={int(full_benign_count):,} | OTHER/ATTACK={int(full_attack_count):,}\n")
+                except Exception:
+                    pass
+
 
                 # Show a quick preview
                 head_n = min(10, n_classes)

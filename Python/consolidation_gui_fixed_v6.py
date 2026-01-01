@@ -38,6 +38,7 @@ import time
 import queue
 import shutil
 import hashlib
+import re
 import traceback
 import threading
 from dataclasses import dataclass
@@ -178,6 +179,89 @@ def mp_ensure_label_is_standard(df: "pd.DataFrame") -> "pd.DataFrame":
     except Exception:
         return df
 
+
+# ============================================================
+# Binary label mapping: DDOS vs BENIGN (TON-IoT + CIC)
+# ============================================================
+
+BINARY_LABEL_BENIGN = "BENIGN"
+BINARY_LABEL_DDOS = "DDOS"
+
+# Heuristics: CICDDoS2019 contains many DDoS subclasses (Syn, MSSQL, DrDoS_*, etc.)
+# We'll treat any non-benign label as DDOS, with a small safety net for numeric labels.
+_CIC_BENIGN_ALIASES = {"BENIGN", "NORMAL", "0"}
+_CIC_DDOS_ALIASES = {"1"}
+
+# TON-IoT often has 'type' (attack family) + 'label' (0/1). We only keep DDOS or BENIGN.
+_TON_BENIGN_ALIASES = {"benign", "normal", "-", "none", ""}
+
+_DDOS_REGEX = re.compile(r"(ddos|drdos|dos)", re.IGNORECASE)
+
+def _ensure_source_col(df: "pd.DataFrame", source_name: str) -> "pd.DataFrame":
+    try:
+        if "Source" not in df.columns:
+            df["Source"] = source_name
+        else:
+            # don't overwrite if already present, just fill missing
+            df["Source"] = df["Source"].astype(str).replace({"nan": ""})
+            df.loc[df["Source"].eq(""), "Source"] = source_name
+    except Exception:
+        pass
+    return df
+
+def _map_binary_label_cic(df: "pd.DataFrame") -> "pd.DataFrame":
+    if "Label" not in df.columns:
+        return df.iloc[0:0].copy()  # empty (can't train without labels)
+
+    s = df["Label"].astype(str).str.strip()
+    s_up = s.str.upper()
+
+    is_benign = s_up.isin(_CIC_BENIGN_ALIASES)
+    is_ddos = s_up.isin(_CIC_DDOS_ALIASES) | (~is_benign & s.ne("") & s.ne("nan"))
+
+    keep = is_benign | is_ddos
+    out = df.loc[keep].copy()
+    out["Label"] = np.where(is_benign.loc[keep].to_numpy(), BINARY_LABEL_BENIGN, BINARY_LABEL_DDOS)
+    return out
+
+def _map_binary_label_ton(df: "pd.DataFrame") -> "pd.DataFrame":
+    # Prefer 'type' column for TON-IoT (attack family). Fallback: keep only benign if label==0.
+    type_col = None
+    for c in ("type", "Type", "attack_type", "Attack", "attack"):
+        if c in df.columns:
+            type_col = c
+            break
+
+    if type_col is not None:
+        t = df[type_col].astype(str).str.strip().str.lower()
+        is_benign = t.isin(_TON_BENIGN_ALIASES)
+        is_ddos = t.str.contains(_DDOS_REGEX)
+
+        keep = is_benign | is_ddos
+        out = df.loc[keep].copy()
+        out["Label"] = np.where(is_benign.loc[keep].to_numpy(), BINARY_LABEL_BENIGN, BINARY_LABEL_DDOS)
+        return out
+
+    # fallback (no attack family column): keep only benign rows if label is 0 / benign; drop attacks (can't isolate DDOS)
+    if "Label" not in df.columns:
+        return df.iloc[0:0].copy()
+    s = df["Label"].astype(str).str.strip()
+    is_benign = s.eq("0") | s.str.upper().eq("BENIGN")
+    out = df.loc[is_benign].copy()
+    out["Label"] = BINARY_LABEL_BENIGN
+    return out
+
+def apply_binary_ddos_vs_benign(df: "pd.DataFrame", *, source_name: str) -> "pd.DataFrame":
+    """Return df filtered to (DDOS,BENIGN) and with Label standardized."""
+    df = _ensure_source_col(df, source_name)
+    if source_name.upper().startswith("CIC"):
+        return _map_binary_label_cic(df)
+    if source_name.upper().startswith("TON"):
+        return _map_binary_label_ton(df)
+    # default: try CIC rules
+    return _map_binary_label_cic(df)
+
+
 def mp_split_train_test_streaming(df: "pd.DataFrame", train_ratio: float, counters: dict[str, tuple[int, int]]):
     if "Label" not in df.columns:
         mask = np.random.RandomState(42).rand(len(df)) < train_ratio
@@ -277,8 +361,10 @@ def mp_process_file_to_parts(
         df = mp_optimize_dtypes(mp_ensure_label_is_standard(df))
         df = mp_sanitize_chunk(df)
         df = df.reindex(columns=union_cols)
-        if "Label" in df.columns:
-            df = df.dropna(subset=["Label"])
+        # Keep only DDOS vs BENIGN (CIC assumed here)
+        df = apply_binary_ddos_vs_benign(df, source_name="CIC")
+        if len(df) == 0:
+            return filepath, 0, 0
         tr_df, te_df = mp_split_train_test_streaming(df, train_ratio, counters)
         if len(tr_df) > 0:
             mp_write_csv_append(str(train_part), tr_df)
@@ -291,8 +377,10 @@ def mp_process_file_to_parts(
         chunk = mp_optimize_dtypes(mp_ensure_label_is_standard(chunk))
         chunk = mp_sanitize_chunk(chunk)
         chunk = chunk.reindex(columns=union_cols)
-        if "Label" in chunk.columns:
-            chunk = chunk.dropna(subset=["Label"])
+        # Keep only DDOS vs BENIGN (CIC assumed here)
+        chunk = apply_binary_ddos_vs_benign(chunk, source_name="CIC")
+        if len(chunk) == 0:
+            continue
 
         tr_df, te_df = mp_split_train_test_streaming(chunk, train_ratio, counters)
         if len(tr_df) > 0:
@@ -698,6 +786,8 @@ class OptimizedDataProcessor:
             cols_norm.append("Label")
 
         # stable order: keep Label at end if present
+        # We also add a 'Source' column (TON vs CIC) for traceability/debug (won't be used as numeric feature).
+        cols_norm.append("Source")
         cols_norm = sorted(set(cols_norm), key=lambda x: (x == "Label", x.lower()))
         return cols_norm
 
@@ -834,6 +924,7 @@ class OptimizedDataProcessor:
         union_cols: list[str],
         out_dir: Path,
         sample_rows: int | None,
+        source_name: str = "UNK",
         callback=None,
         thread_id: int = 0,
         stop_flag: threading.Event | None = None,
@@ -894,8 +985,10 @@ class OptimizedDataProcessor:
             df = self._optimize_dtypes(self.ensure_label_is_standard(df))
             df = self._sanitize_chunk(df)
             df = df.reindex(columns=union_cols)
-            if "Label" in df.columns:
-                df = df.dropna(subset=["Label"])
+            # Keep only DDOS vs BENIGN (TON assumed here)
+            df = apply_binary_ddos_vs_benign(df, source_name=str(source_name))
+            if len(df) == 0:
+                return filepath, 0, 0
             tr_df, te_df = self._split_train_test_streaming(df, TRAIN_RATIO, counters)
             if len(tr_df) > 0:
                 self._write_csv_append(train_part, tr_df)
@@ -922,8 +1015,11 @@ class OptimizedDataProcessor:
                 chunk = self._optimize_dtypes(self.ensure_label_is_standard(chunk))
                 chunk = self._sanitize_chunk(chunk)
                 chunk = chunk.reindex(columns=union_cols)
-                if "Label" in chunk.columns:
-                    chunk = chunk.dropna(subset=["Label"])
+                # Keep only DDOS vs BENIGN (TON assumed here)
+                chunk = apply_binary_ddos_vs_benign(chunk, source_name=str(source_name))
+                if len(chunk) == 0:
+                    _progress(chunk_i, 0)
+                    continue
 
                 tr_df, te_df = self._split_train_test_streaming(chunk, TRAIN_RATIO, counters)
                 if len(tr_df) > 0:
@@ -1818,6 +1914,7 @@ class ConsolidationGUIEnhanced:
             union_cols=union_cols,
             out_dir=part_dir,
             sample_rows=sample_rows,
+            source_name=stage_name,
             callback=cb,
             thread_id=0,
             stop_flag=self.stop_event,
