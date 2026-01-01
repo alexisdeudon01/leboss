@@ -23,6 +23,7 @@ import multiprocessing
 from joblib import Parallel, delayed
 from datetime import datetime, timedelta
 from itertools import product
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -174,6 +175,12 @@ class CVOptimizationGUI:
         self.completed_operations = 0
         self.total_operations = 0
         self.current_workers = max(1, min(NUM_CORES, 4))
+        self.checkpoint_path = Path(".run_state/cv_checkpoint.json")
+        self.ckpt = {"model_idx": 0, "combo_idx": 0, "best_score": 0.0}
+        self.rows_seen = 0
+        self.files_done = 0
+        self.stage_start = {}
+        self.stage_eta = {}
         
         self.df = None
         self.X_scaled = None
@@ -360,6 +367,18 @@ class CVOptimizationGUI:
         if self.running:
             messagebox.showwarning('Attention', 'Deja en cours')
             return
+        # load checkpoint if exists
+        if self.checkpoint_path.exists():
+            try:
+                self.ckpt = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+                self.completed_operations = self.ckpt.get("completed_ops", 0)
+                self.current_workers = self.ckpt.get("current_workers", self.current_workers)
+                self.current_chunk_size = self.ckpt.get("current_chunk_size", self.current_chunk_size)
+                self.ui_shell.log(f"[CHKPT] Resume at model_idx={self.ckpt.get('model_idx',0)} combo_idx={self.ckpt.get('combo_idx',0)}", "INFO")
+            except Exception:
+                self.ckpt = {"model_idx": 0, "combo_idx": 0, "best_score": 0.0}
+        else:
+            self.ckpt = {"model_idx": 0, "combo_idx": 0, "best_score": 0.0}
         
         self.running = True
         self.start_btn.config(state=tk.DISABLED)
@@ -369,6 +388,8 @@ class CVOptimizationGUI:
         for k in ("load", "prep", "grid", "overall"):
             self.ui_shell.set_stage_progress(k, 0.0)
         self.ui_shell.set_overall_progress(0.0)
+        self.ui_shell.set_best_score("--")
+        self.ui_shell.set_ai_recommendation("Waiting...")
         self.live_text.delete(1.0, tk.END)
         self.alerts_text.delete(1.0, tk.END)
         
@@ -385,6 +406,7 @@ class CVOptimizationGUI:
         self.stop_btn.config(state=tk.DISABLED)
         self.status_label.config(text='Arrete', fg='#e74c3c')
         self.ui_shell.set_status("Stopped")
+        self._write_checkpoint(force=False)
 
     def load_data(self):
         try:
@@ -598,14 +620,15 @@ class CVOptimizationGUI:
                 self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
                 # pull AI recommendation after each combo
                 rec = self.ai_server.get_recommendation(timeout=0.02)
-                if rec:
-                    new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
-                    if new_workers != self.current_workers:
-                        self.current_workers = new_workers
-                        self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
-                    new_chunk = int(self.current_chunk_size * rec.chunk_mult)
-                    self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
-                    self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
+                    if rec:
+                        new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                        if new_workers != self.current_workers:
+                            self.current_workers = new_workers
+                            self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
+                        new_chunk = int(self.current_chunk_size * rec.chunk_mult)
+                        self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
+                        self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
+                        self.ui_shell.set_ai_recommendation(rec.reason)
                 
                 self.results[name] = {
                     'all_results': all_results,
@@ -617,8 +640,17 @@ class CVOptimizationGUI:
                     'params': best_params,
                     'f1_score': float(best_score)
                 }
+                # checkpoint after each model
+                self.ckpt["model_idx"] = i
+                self.ckpt["combo_idx"] = 0
+                self.ckpt["best_score"] = best_score
+                self.ckpt["current_workers"] = self.current_workers
+                self.ckpt["current_chunk_size"] = self.current_chunk_size
+                self.ckpt["completed_ops"] = self.completed_operations
+                self._write_checkpoint(force=True)
                 
-                self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
+        self.log_live(f'  BEST: F1={best_score:.4f}\n', 'info')
+        self.ui_shell.set_best_score(f"{best_score:.4f}")
             
             self.log_live('\nETAPE 4: Rapports\n', 'info')
             self.generate_reports()
@@ -638,6 +670,7 @@ class CVOptimizationGUI:
             self.status_label.config(text='Erreur', fg='#d32f2f')
         
         finally:
+            self._write_checkpoint(force=True)
             self.running = False
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
