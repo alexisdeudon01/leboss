@@ -20,12 +20,13 @@ import traceback
 import psutil
 import threading
 import multiprocessing
+from joblib import Parallel, delayed
 from datetime import datetime, timedelta
 from itertools import product
 
 import numpy as np
 import pandas as pd
-from pipeline_ui_template import PipelineWindowTemplate
+from consolidation_style_shell import ConsolidationStyleShell
 from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 NPZ_FLOAT_DTYPE = np.float64
@@ -144,22 +145,27 @@ class CVOptimizationGUI:
         self.root.geometry('1600x1000')
         self.root.configure(bg='#f0f0f0')
 
-        # Shared pipeline UI shell (detached to avoid layout conflicts)
-        self.ui_shell = PipelineWindowTemplate(
-            title='CV Optimization V3',
-            parent=self.root,
-            detached=True,
+        # secondary window reserved for future graphs
+        self.graph_window = tk.Toplevel(self.root)
+        self.graph_window.title("Graphs (placeholder)")
+        try:
+            self.graph_window.geometry("800x600")
+        except Exception:
+            pass
+        tk.Label(self.graph_window, text="Graphs window (reserved)").pack(fill="both", expand=True, pady=20)
+
+        # Shared consolidation-style shell
+        self.ui_shell = ConsolidationStyleShell(
+            title="CV Optimization V3 - Grid Search",
+            stages=[
+                ("overall", "Overall"),
+                ("load", "Load"),
+                ("prep", "Prep"),
+                ("grid", "Grid"),
+                ("graphs", "Graphs"),
+            ],
+            thread_slots=4,
         )
-        self.ui_shell.bind_start(self.start_optimization)
-        self.ui_shell.bind_stop(self.stop_optimization)
-        for key, label in [
-            ("load", "Chargement"),
-            ("prep", "Préparation"),
-            ("grid", "Grid Search"),
-            ("overall", "Overall"),
-        ]:
-            self.ui_shell.add_stage(key, label)
-        self.ui_shell.set_status("Idle")
         
         self.running = False
         self.results = {}
@@ -544,54 +550,62 @@ class CVOptimizationGUI:
                 best_params = None
                 all_results = []
                 
-                for combo_idx, params in enumerate(combinations, 1):
-                    if not self.running:
-                        return
-                    
-                    f1_runs = []
-                    
-                    for fold in range(K_FOLD):
-                        try:
-                            X_train, X_test, y_train, y_test = train_test_split(
-                                self.X_scaled, self.y,
-                                test_size=0.2 if name != 'Decision Tree' else 0.3,
-                                random_state=42 + fold,
-                                stratify=self.y
-                            )
-                            
-                            kwargs = params.copy()
-                            if name in ('Logistic Regression', 'Random Forest'):
-                                kwargs['n_jobs'] = int(self.current_workers)
-                            if name != 'Naive Bayes':
-                                kwargs['random_state'] = 42
-                            model = ModelClass(**kwargs)
-                            model.fit(X_train, y_train)
-                            y_pred = model.predict(X_test)
-                            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-                            f1_runs.append(f1)
-                        except:
-                            f1_runs.append(0)
-                        
-                        self.completed_operations += 1
-                        progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
-                        self.ui_shell.set_stage_progress("grid", progress_grid)
-                        self.ui_shell.set_overall_progress(progress_grid)
-                        self.ui_shell.set_stage_progress("overall", progress_grid)
-                        
-                        if not MemoryManager.check_memory():
-                            time.sleep(1)
-                    
-                    mean_f1 = np.mean(f1_runs) if f1_runs else 0
-                    params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
-                    self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
-                    
-                    all_results.append({'params': params, 'f1': mean_f1})
-                    
-                    if mean_f1 > best_score:
-                        best_score = mean_f1
-                        best_params = params
-                    
-                    self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
+            for combo_idx, params in enumerate(combinations, 1):
+                if not self.running:
+                    return
+                
+                def run_fold(fold):
+                    try:
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            self.X_scaled, self.y,
+                            test_size=0.2 if name != 'Decision Tree' else 0.3,
+                            random_state=42 + fold,
+                            stratify=self.y
+                        )
+                        kwargs = params.copy()
+                        if name in ('Logistic Regression', 'Random Forest'):
+                            kwargs['n_jobs'] = int(self.current_workers)
+                        if name != 'Naive Bayes':
+                            kwargs['random_state'] = 42
+                        model = ModelClass(**kwargs)
+                        model.fit(X_train, y_train)
+                        y_pred = model.predict(X_test)
+                        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                        rows_proc = len(X_train) + len(X_test)
+                        return f1, rows_proc
+                    except Exception:
+                        return 0, 0
+
+                results = Parallel(n_jobs=int(self.current_workers))(delayed(run_fold)(fold) for fold in range(K_FOLD))
+                f1_runs = []
+                for f1_val, rows_proc in results:
+                    f1_runs.append(f1_val)
+                    self.completed_operations += 1
+                    progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
+                    self.ui_shell.set_stage_progress("grid", progress_grid)
+                    self.ui_shell.set_overall_progress(progress_grid)
+                    self.ui_shell.set_stage_progress("overall", progress_grid)
+                    self._send_ai_metric(rows_proc, chunk_size=self.current_chunk_size)
+                
+                mean_f1 = np.mean(f1_runs) if f1_runs else 0
+                params_str = ', '.join([f'{k}={v}' for k, v in params.items()])
+                self.log_live(f'    [{combo_idx}/{len(combinations)}] {params_str}: F1={mean_f1:.4f}\n', 'info')
+                all_results.append({'params': params, 'f1': mean_f1})
+                
+                if mean_f1 > best_score:
+                    best_score = mean_f1
+                    best_params = params
+                self.add_alert(f'{name}: {combo_idx}/{len(combinations)} - F1={mean_f1:.4f}')
+                # pull AI recommendation after each combo
+                rec = self.ai_server.get_recommendation(timeout=0.02)
+                if rec:
+                    new_workers = max(1, min(NUM_CORES, self.current_workers + rec.d_workers))
+                    if new_workers != self.current_workers:
+                        self.current_workers = new_workers
+                        self.log_live(f"[AI] workers->{new_workers} (reason: {rec.reason})", "info")
+                    new_chunk = int(self.current_chunk_size * rec.chunk_mult)
+                    self.current_chunk_size = max(20_000, min(1_000_000, new_chunk))
+                    self.log_live(f"[AI] chunk->{self.current_chunk_size:,} (reason: {rec.reason})", "info")
                 
                 self.results[name] = {
                     'all_results': all_results,

@@ -39,6 +39,7 @@ from sklearn.metrics import f1_score, recall_score, precision_score, confusion_m
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import KFold
 import json
+from consolidation_style_shell import ConsolidationStyleShell
 from ai_optimization_server_with_sessions_v4 import AIOptimizationServer, Metrics as AIMetrics
 
 try:
@@ -448,7 +449,17 @@ def main():
         ui = GenericProgressGUI(title="ML Evaluation V3 - ADAPTÉ", 
                                header_info=f"Cores: {NUM_CORES}, RAM: {MemoryManager.get_available_ram_gb():.1f}GB", 
                                max_workers=4)
-        shell = PipelineWindowTemplate(title="ML Evaluation V3", detached=True)
+        shell = ConsolidationStyleShell(
+            title="ML Evaluation V3",
+            stages=[
+                ("overall", "Overall"),
+                ("load", "Load"),
+                ("train", "Train/Eval"),
+                ("reports", "Reports"),
+                ("graphs", "Graphs"),
+            ],
+            thread_slots=4,
+        )
         runner = MLEvaluationRunner(ui=ui, shell=shell)
 
         def job():
@@ -491,7 +502,17 @@ def main():
         return True
     else:
         print("[INFO] Mode console (progress_gui non disponible)\n")
-        shell = PipelineWindowTemplate(title="ML Evaluation V3", detached=True)
+        shell = ConsolidationStyleShell(
+            title="ML Evaluation V3",
+            stages=[
+                ("overall", "Overall"),
+                ("load", "Load"),
+                ("train", "Train/Eval"),
+                ("reports", "Reports"),
+                ("graphs", "Graphs"),
+            ],
+            thread_slots=4,
+        )
         runner = MLEvaluationRunner(ui=None, shell=shell)
         
         def console_job():
