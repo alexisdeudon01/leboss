@@ -50,6 +50,7 @@ import pandas as pd
 import psutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from pipeline_ui_template import PipelineWindowTemplate
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 try:
@@ -993,6 +994,24 @@ class ConsolidationGUIEnhanced:
         self.root.geometry("1500x1050")
         self.root.minsize(1350, 950)
 
+        # Shared UI shell (detached to not disturb existing layout)
+        self.ui_shell = PipelineWindowTemplate(
+            title=APP_TITLE,
+            parent=self.root,
+            detached=True,
+        )
+        self.ui_shell.bind_start(self.start_consolidation)
+        self.ui_shell.bind_stop(self.stop_consolidation)
+        for key, label in [
+            ("overall", "Overall"),
+            ("ton", "TON-IoT"),
+            ("cic", "CIC"),
+            ("finalize", "Finalize"),
+            ("npz", "NPZ"),
+        ]:
+            self.ui_shell.add_stage(key, label)
+        self.ui_shell.set_status("Idle")
+
         self.monitor = AdvancedMonitor()
         self.processor = OptimizedDataProcessor(self.monitor, logger=self.log)
 
@@ -1312,6 +1331,10 @@ class ConsolidationGUIEnhanced:
         colors = {"ERROR": "#ef4444", "WARN": "#f59e0b", "INFO": "#38bdf8", "OK": "#22c55e"}
         color = colors.get(level.upper(), "#e2e8f0")
         self.root.after(0, lambda: self.alert_feed.add(level.upper(), message, color))
+        try:
+            self.ui_shell.add_alert(message, level)
+        except Exception:
+            pass
 
     def log(self, message: str, level: str = "INFO") -> None:
         colors = {"ERROR": "#ef4444", "WARN": "#f59e0b", "INFO": "#e2e8f0", "DEBUG": "#94a3b8", "OK": "#22c55e"}
@@ -1326,6 +1349,10 @@ class ConsolidationGUIEnhanced:
             tag = th.split("-")[-1]
         msg = f"[{tag}] [{ts}] {message}"
         self.root.after(0, lambda: self.log_feed.add(level.upper(), msg, color))
+        try:
+            self.ui_shell.log(msg, level)
+        except Exception:
+            pass
 
     # ---------------- Thread bars ----------------
 
@@ -1391,6 +1418,21 @@ class ConsolidationGUIEnhanced:
             pass
         try:
             self.root.after(0, lambda v=var, x=float(value): v.set(x))
+        except Exception:
+            pass
+        try:
+            v = max(0.0, min(100.0, float(value)))
+            if var is self.progress_overall:
+                self.ui_shell.set_overall_progress(v)
+                self.ui_shell.set_stage_progress("overall", v)
+            elif var is self.progress_ton:
+                self.ui_shell.set_stage_progress("ton", v)
+            elif var is self.progress_cic:
+                self.ui_shell.set_stage_progress("cic", v)
+            elif var is self.progress_finalize:
+                self.ui_shell.set_stage_progress("finalize", v)
+            elif var is self.progress_npz:
+                self.ui_shell.set_stage_progress("npz", v)
         except Exception:
             pass
 
@@ -1483,6 +1525,10 @@ class ConsolidationGUIEnhanced:
 
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        try:
+            self.ui_shell.set_status("Running")
+        except Exception:
+            pass
 
         self.add_alert("Pipeline started (streaming + checkpoint + AI)", "INFO")
         self.log(f"Mode: {'FULL_RUN' if FULL_RUN else 'SAMPLE'} | SAMPLE_ROWS={SAMPLE_ROWS}", "INFO")
@@ -1497,6 +1543,10 @@ class ConsolidationGUIEnhanced:
             return
         self.stop_event.set()
         self.status_var.set("Stopping...")
+        try:
+            self.ui_shell.set_status("Stopping...")
+        except Exception:
+            pass
         self.log("Stop requested: will stop after current chunk/file.", "WARN")
 
     def _pipeline_worker(self) -> None:
@@ -1546,6 +1596,10 @@ class ConsolidationGUIEnhanced:
 
         # stage 1: union columns (schema)
         self.status_var.set("Schema: union columns")
+        try:
+            self.ui_shell.set_status("Schema: union columns")
+        except Exception:
+            pass
         if not self.ckpt.union_cols_ready or not UNION_COLS_FILE.exists():
             self.ckpt.stage = "schema"
             self.ckpt_mgr.save(self.ckpt)
@@ -1563,6 +1617,10 @@ class ConsolidationGUIEnhanced:
 
         # stage 2: stream TON -> parts
         self.status_var.set("TON: streaming to parts")
+        try:
+            self.ui_shell.set_status("TON: streaming to parts")
+        except Exception:
+            pass
         self.ckpt.stage = "ton"
         self.ckpt_mgr.save(self.ckpt)
 
@@ -1585,11 +1643,19 @@ class ConsolidationGUIEnhanced:
 
         if self.stop_event.is_set():
             self.status_var.set("Stopped")
+            try:
+                self.ui_shell.set_status("Stopped")
+            except Exception:
+                pass
             self.add_alert("Stopped by user.", "WARN")
             return
 
         # stage 3: stream CIC in parallel -> parts (dynamic worker cap)
         self.status_var.set("CIC: streaming to parts")
+        try:
+            self.ui_shell.set_status("CIC: streaming to parts")
+        except Exception:
+            pass
         self.ckpt.stage = "cic"
         self.ckpt_mgr.save(self.ckpt)
 
@@ -1689,6 +1755,10 @@ class ConsolidationGUIEnhanced:
 
         if self.stop_event.is_set():
             self.status_var.set("Stopped")
+            try:
+                self.ui_shell.set_status("Stopped")
+            except Exception:
+                pass
             self.add_alert("Stopped by user.", "WARN")
             return
 
@@ -1696,12 +1766,20 @@ class ConsolidationGUIEnhanced:
 
         # stage 4: finalize - concat parts into final train/test
         self.status_var.set("Finalize: assembling final CSVs")
+        try:
+            self.ui_shell.set_status("Finalize: assembling final CSVs")
+        except Exception:
+            pass
         self.ckpt.stage = "finalize"
         self.ckpt_mgr.save(self.ckpt)
         self._finalize_from_parts(union_cols)
 
         # stage 5: NPZ (best effort)
         self.status_var.set("NPZ: building (best effort)")
+        try:
+            self.ui_shell.set_status("NPZ: building (best effort)")
+        except Exception:
+            pass
         self.ckpt.stage = "npz"
         self.ckpt_mgr.save(self.ckpt)
         self._build_npz_best_effort(union_cols)
@@ -1709,6 +1787,10 @@ class ConsolidationGUIEnhanced:
         # done
         self._set_progress_async(self.progress_overall, 100.0)
         self.status_var.set("Completed")
+        try:
+            self.ui_shell.set_status("Completed")
+        except Exception:
+            pass
         self.ckpt.stage = "done"
         self.ckpt_mgr.save(self.ckpt)
 

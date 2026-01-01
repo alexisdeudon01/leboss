@@ -47,6 +47,8 @@ except ImportError:
     HAS_GUI = False
     GenericProgressGUI = None
 
+from pipeline_ui_template import PipelineWindowTemplate
+
 NUM_CORES = multiprocessing.cpu_count()
 
 
@@ -81,8 +83,9 @@ class MemoryManager:
 
 # ============= ML EVALUATION RUNNER =============
 class MLEvaluationRunner:
-    def __init__(self, ui=None):
+    def __init__(self, ui=None, shell=None):
         self.ui = ui
+        self.shell = shell
         self.results = {}
         self.X_train = None
         self.y_train = None
@@ -95,11 +98,23 @@ class MLEvaluationRunner:
             self.ui.add_stage("train", "Entraînement + évaluation holdout")
             self.ui.add_stage("reports", "Rapports")
             self.ui.add_stage("graphs", "Graphiques")
+        if self.shell:
+            for key, label in [
+                ("load", "Chargement"),
+                ("train", "Train/Eval"),
+                ("reports", "Rapports"),
+                ("graphs", "Graphiques"),
+                ("overall", "Overall"),
+            ]:
+                self.shell.add_stage(key, label)
+            self.shell.set_status("Idle")
 
     def log(self, msg, level="INFO"):
         """Log compatible GUI + console"""
         if self.ui:
             self.ui.log(msg, level=level)
+        if self.shell:
+            self.shell.log(msg, level=level)
         else:
             ts = time.strftime("%H:%M:%S")
             print(f"[{ts}] [{level}] {msg}")
@@ -107,6 +122,8 @@ class MLEvaluationRunner:
     def log_alert(self, msg, level="error"):
         if self.ui:
             self.ui.log_alert(msg, level=level)
+        if self.shell:
+            self.shell.add_alert(msg, level)
         else:
             print(f"[ALERT] {msg}")
 
@@ -120,6 +137,9 @@ class MLEvaluationRunner:
             return False
         
         try:
+            if self.shell:
+                self.shell.set_status("Chargement")
+                self.shell.set_stage_progress("load", 0.0)
             t0 = time.time()
             
             # Nettoyer avant charge
@@ -173,6 +193,10 @@ class MLEvaluationRunner:
             if self.ui:
                 self.ui.update_stage("load", 1, 1, "Train/Test chargés")
                 self.ui.update_global(1, 4, f"Train {len(self.X_train):,} | Test {len(self.X_test):,}")
+            if self.shell:
+                self.shell.set_stage_progress("load", 100.0)
+                self.shell.set_overall_progress(25.0)
+                self.shell.set_stage_progress("overall", 25.0)
             
             # Nettoyer
             del df_test, X_test_raw
@@ -186,6 +210,9 @@ class MLEvaluationRunner:
     def train_eval(self):
         """K-Fold evaluation avec gestion RAM"""
         try:
+            if self.shell:
+                self.shell.set_status("Train/Eval")
+                self.shell.set_stage_progress("train", 0.0)
             models = [
                 ("Logistic Regression", LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)),
                 ("Naive Bayes", GaussianNB()),
@@ -198,6 +225,12 @@ class MLEvaluationRunner:
             
             for i, (name, model) in enumerate(models, 1):
                 self.log(f"\n[MODEL {i}/{total}] {name}", level="OK")
+                if self.shell:
+                    progress = i / max(total, 1) * 100.0
+                    self.shell.set_stage_progress("train", progress)
+                    overall = 25.0 + 50.0 * (progress / 100.0)
+                    self.shell.set_overall_progress(overall)
+                    self.shell.set_stage_progress("overall", overall)
                 
                 f1_runs = []
                 recall_runs = []
@@ -260,6 +293,11 @@ class MLEvaluationRunner:
                     self.ui.update_stage("train", i, total, f"{name} F1={mean_f1:.4f}")
                     self.ui.update_global(1 + i / total, 4, f"Modèle {i}/{total}")
             
+            if self.shell:
+                self.shell.set_stage_progress("train", 100.0)
+                self.shell.set_overall_progress(75.0)
+                self.shell.set_stage_progress("overall", 75.0)
+            
             return True
         except Exception as e:
             self.log_alert(f"Erreur train_eval: {e}", level="error")
@@ -291,6 +329,10 @@ class MLEvaluationRunner:
             if self.ui:
                 self.ui.update_stage("reports", 1, 1, "Rapports OK")
                 self.ui.update_global(3, 4, "Rapports")
+            if self.shell:
+                self.shell.set_stage_progress("reports", 100.0)
+                self.shell.set_overall_progress(90.0)
+                self.shell.set_stage_progress("overall", 90.0)
             
             return True
         except Exception as e:
@@ -338,6 +380,11 @@ class MLEvaluationRunner:
             if self.ui:
                 self.ui.update_stage("graphs", 1, 1, "Graphiques OK")
                 self.ui.update_global(4, 4, "Terminé")
+            if self.shell:
+                self.shell.set_stage_progress("graphs", 100.0)
+                self.shell.set_overall_progress(100.0)
+                self.shell.set_stage_progress("overall", 100.0)
+                self.shell.set_status("Completed")
             
             return True
         except Exception as e:
@@ -356,56 +403,80 @@ def main():
         ui = GenericProgressGUI(title="ML Evaluation V3 - ADAPTÉ", 
                                header_info=f"Cores: {NUM_CORES}, RAM: {MemoryManager.get_available_ram_gb():.1f}GB", 
                                max_workers=4)
-        runner = MLEvaluationRunner(ui=ui)
+        shell = PipelineWindowTemplate(title="ML Evaluation V3", detached=True)
+        runner = MLEvaluationRunner(ui=ui, shell=shell)
 
         def job():
             try:
+                shell.set_status("Running")
+                shell.set_overall_progress(0.0)
                 ui.update_global(0, 4, "Initialisation")
                 
                 if not runner.load_data():
                     ui.log_alert("Échec chargement données", level="error")
+                    shell.add_alert("Échec chargement données", level="ERROR")
                     return
                 
                 if not runner.train_eval():
                     ui.log_alert("Échec entraînement", level="error")
+                    shell.add_alert("Échec entraînement", level="ERROR")
                     return
                 
                 if not runner.save_reports():
                     ui.log_alert("Échec rapports", level="error")
+                    shell.add_alert("Échec rapports", level="ERROR")
                     return
                 
                 if not runner.save_graphs():
                     ui.log_alert("Échec graphiques", level="error")
+                    shell.add_alert("Échec graphiques", level="ERROR")
                     return
                 
                 ui.log_alert("Evaluation terminée avec succès!", level="success")
+                shell.add_alert("Evaluation terminée avec succès!", level="OK")
+                shell.set_status("Completed")
             except Exception as e:
                 ui.log_alert(f"Erreur: {e}", level="error")
+                shell.add_alert(f"Erreur: {e}", level="ERROR")
 
+        shell.bind_start(lambda: threading.Thread(target=job, daemon=True).start())
+        shell.bind_stop(lambda: shell.add_alert("Arrêt non implémenté", level="WARN"))
         threading.Thread(target=job, daemon=True).start()
         ui.start()
         return True
     else:
         print("[INFO] Mode console (progress_gui non disponible)\n")
-        runner = MLEvaluationRunner(ui=None)
+        shell = PipelineWindowTemplate(title="ML Evaluation V3", detached=True)
+        runner = MLEvaluationRunner(ui=None, shell=shell)
         
-        if not runner.load_data():
-            print("[ERROR] Chargement données échouée")
-            return False
-        
-        if not runner.train_eval():
-            print("[ERROR] Entraînement échoué")
-            return False
-        
-        if not runner.save_reports():
-            print("[ERROR] Rapports échoué")
-            return False
-        
-        if not runner.save_graphs():
-            print("[ERROR] Graphiques échoué")
-            return False
-        
-        print("\n✅ Evaluation complétée avec succès!")
+        def console_job():
+            shell.set_status("Running")
+            if not runner.load_data():
+                print("[ERROR] Chargement données échouée")
+                shell.add_alert("Chargement données échouée", level="ERROR")
+                return
+            
+            if not runner.train_eval():
+                print("[ERROR] Entraînement échoué")
+                shell.add_alert("Entraînement échoué", level="ERROR")
+                return
+            
+            if not runner.save_reports():
+                print("[ERROR] Rapports échoué")
+                shell.add_alert("Rapports échoué", level="ERROR")
+                return
+            
+            if not runner.save_graphs():
+                print("[ERROR] Graphiques échoué")
+                shell.add_alert("Graphiques échoué", level="ERROR")
+                return
+            
+            print("\n✅ Evaluation complétée avec succès!")
+            shell.add_alert("Evaluation complétée avec succès!", level="OK")
+            shell.set_status("Completed")
+
+        shell.bind_start(lambda: threading.Thread(target=console_job, daemon=True).start())
+        threading.Thread(target=console_job, daemon=True).start()
         return True
 
 

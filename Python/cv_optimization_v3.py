@@ -25,6 +25,7 @@ from itertools import product
 
 import numpy as np
 import pandas as pd
+from pipeline_ui_template import PipelineWindowTemplate
 
 NPZ_FLOAT_DTYPE = np.float64
 
@@ -141,6 +142,23 @@ class CVOptimizationGUI:
         self.root.title('CV Optimization V3 - Grid Search')
         self.root.geometry('1600x1000')
         self.root.configure(bg='#f0f0f0')
+
+        # Shared pipeline UI shell (detached to avoid layout conflicts)
+        self.ui_shell = PipelineWindowTemplate(
+            title='CV Optimization V3',
+            parent=self.root,
+            detached=True,
+        )
+        self.ui_shell.bind_start(self.start_optimization)
+        self.ui_shell.bind_stop(self.stop_optimization)
+        for key, label in [
+            ("load", "Chargement"),
+            ("prep", "Préparation"),
+            ("grid", "Grid Search"),
+            ("overall", "Overall"),
+        ]:
+            self.ui_shell.add_stage(key, label)
+        self.ui_shell.set_status("Idle")
         
         self.running = False
         self.results = {}
@@ -262,6 +280,8 @@ class CVOptimizationGUI:
             self.live_text.insert(tk.END, msg + '\n', tag)
             self.live_text.see(tk.END)
             self.root.update_idletasks()
+            level = "INFO" if tag == "info" else str(tag).upper()
+            self.ui_shell.log(msg, level=level)
         except:
             pass
 
@@ -270,6 +290,7 @@ class CVOptimizationGUI:
             self.alerts_text.insert(tk.END, f'• {msg}\n')
             self.alerts_text.see(tk.END)
             self.root.update_idletasks()
+            self.ui_shell.add_alert(msg, "INFO")
         except:
             pass
 
@@ -293,6 +314,8 @@ class CVOptimizationGUI:
             percent = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
             self.progress_bar['value'] = percent
             self.progress_label.config(text=f'{self.completed_operations}/{self.total_operations}')
+            self.ui_shell.set_overall_progress(percent)
+            self.ui_shell.set_stage_progress("overall", percent)
             
             self.root.after(500, self.update_stats)
         except:
@@ -307,6 +330,10 @@ class CVOptimizationGUI:
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.status_label.config(text='En cours...', fg='#f57f17')
+        self.ui_shell.set_status("Running")
+        for k in ("load", "prep", "grid", "overall"):
+            self.ui_shell.set_stage_progress(k, 0.0)
+        self.ui_shell.set_overall_progress(0.0)
         self.live_text.delete(1.0, tk.END)
         self.alerts_text.delete(1.0, tk.END)
         
@@ -322,6 +349,7 @@ class CVOptimizationGUI:
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_label.config(text='Arrete', fg='#e74c3c')
+        self.ui_shell.set_status("Stopped")
 
     def load_data(self):
         try:
@@ -353,6 +381,7 @@ class CVOptimizationGUI:
             self.df = pd.concat(chunks, ignore_index=True)
             self.df = _normalize_label_column(self.df)
             self.log_live(f'OK: {len(self.df):,} lignes\n\n', 'info')
+            self.ui_shell.set_stage_progress("load", 100.0)
             return True
         except Exception as e:
             self.log_live(f'Erreur: {e}\n', 'info')
@@ -393,6 +422,7 @@ class CVOptimizationGUI:
                                classes=self.label_encoder.classes_)
             
             self.log_live(f'NPZ sauvegarde\n\n', 'info')
+            self.ui_shell.set_stage_progress("prep", 100.0)
             del self.df, X
             gc.collect()
             return True
@@ -472,6 +502,10 @@ class CVOptimizationGUI:
                             f1_runs.append(0)
                         
                         self.completed_operations += 1
+                        progress_grid = (self.completed_operations / self.total_operations * 100) if self.total_operations > 0 else 0
+                        self.ui_shell.set_stage_progress("grid", progress_grid)
+                        self.ui_shell.set_overall_progress(progress_grid)
+                        self.ui_shell.set_stage_progress("overall", progress_grid)
                         
                         if not MemoryManager.check_memory():
                             time.sleep(1)
@@ -509,6 +543,9 @@ class CVOptimizationGUI:
             
             self.status_label.config(text='Succes', fg='#27ae60')
             self.add_alert('GRID SEARCH COMPLETE')
+            self.ui_shell.set_stage_progress("grid", 100.0)
+            self.ui_shell.set_overall_progress(100.0)
+            self.ui_shell.set_status("Completed")
             self.graphs_btn.config(state=tk.NORMAL)
         
         except Exception as e:
